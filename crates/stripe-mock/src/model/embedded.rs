@@ -4,7 +4,6 @@ use serde_json::{Value, json};
 
 /// The first `page_size` children in creation order, with `has_more`, `total_count`
 /// and the `url` of the full sub-list.
-#[allow(dead_code)] // TEMP: used from Task 4 (invoice lines)
 pub(crate) fn embedded_list(children: &[Value], page_size: usize, url: &str) -> Value {
     json!({
         "object": "list",

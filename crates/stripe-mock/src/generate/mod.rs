@@ -9,7 +9,10 @@
 //!   of the action that scheduled them. Their content is drawn when the action
 //!   starts; only `step_delay` is drawn when they are scheduled.
 
+mod billing;
 mod catalog;
+
+pub use billing::InvoiceOutcome;
 
 use std::collections::BTreeMap;
 
@@ -31,6 +34,12 @@ pub enum Action {
     CatalogChange,
     /// Archive a product (`prod_…`) or price (`price_…`) now. Control-only.
     Archive { id: String },
+    /// A manual invoice for the named or a random customer, walked to `outcome`
+    /// (drawn when `None`). A fixed outcome is a control-only hook.
+    OneOffInvoice {
+        customer: Option<String>,
+        outcome: Option<InvoiceOutcome>,
+    },
 }
 
 /// Generated actions, in tie-break order. New kinds are appended, so existing
@@ -45,6 +54,8 @@ enum ActionKind {
     ProductArchive,
     PriceUpdate,
     PriceArchive,
+    OneOffInvoice,
+    InvoiceUpdate,
 }
 
 /// A follow-up step of an action.
@@ -59,6 +70,20 @@ pub(crate) enum Continuation {
     SetDefaultPrice {
         product: String,
         price: String,
+    },
+    DeleteDraft {
+        id: String,
+    },
+    FinalizeOneOff {
+        id: String,
+        outcome: InvoiceOutcome,
+    },
+    SettleOneOff {
+        id: String,
+        outcome: InvoiceOutcome,
+    },
+    VoidInvoice {
+        id: String,
     },
 }
 
@@ -75,11 +100,13 @@ struct Scheduled {
 pub(crate) struct Ctx {
     pub config: ActionsConfig,
     /// `payloads.nested_list_page_size`.
-    #[allow(dead_code)] // TEMP: used from Task 4 (invoice lines)
     pub page_size: usize,
     queue: BTreeMap<(SimTime, u64), (Continuation, Cause)>,
     next_seq: u64,
     lifecycle: SimRng,
+    /// Draws made inside billing flows and continuations: invoice and line IDs,
+    /// payment outcomes.
+    pub billing: SimRng,
 }
 
 impl Ctx {
@@ -159,6 +186,16 @@ impl Generator {
                 c.price.archive,
                 "generate.price.archive",
             ),
+            (
+                ActionKind::OneOffInvoice,
+                a.one_off_invoice,
+                "generate.invoice.one_off",
+            ),
+            (
+                ActionKind::InvoiceUpdate,
+                c.invoice.update,
+                "generate.invoice.update",
+            ),
         ];
         let actions = specs
             .into_iter()
@@ -181,6 +218,7 @@ impl Generator {
                 queue: BTreeMap::new(),
                 next_seq: 0,
                 lifecycle: streams.stream("generate.lifecycle"),
+                billing: streams.stream("generate.billing"),
             },
             control: streams.stream("control.actions"),
             enabled: true,
@@ -267,6 +305,13 @@ impl Generator {
             Action::NewCustomer => new_customer(&mut self.control, engine),
             Action::CatalogChange => catalog::change(&mut self.control, engine, &mut self.ctx),
             Action::Archive { id } => catalog::archive_by_id(engine, &id)?,
+            Action::OneOffInvoice { customer, outcome } => billing::one_off_invoice(
+                &mut self.control,
+                engine,
+                &mut self.ctx,
+                customer,
+                outcome,
+            )?,
         };
         if self.enabled {
             let now = engine.now();
@@ -300,6 +345,7 @@ fn run_continuation(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mu
         Continuation::SetDefaultPrice { product, price } => {
             catalog::set_default_price(engine, &product, &price, &cause);
         }
+        c => billing::run(c, cause, engine, ctx),
     }
 }
 
@@ -370,6 +416,11 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
         ActionKind::ProductArchive => catalog::churn_archive(rng, engine, ObjectType::Product),
         ActionKind::PriceUpdate => catalog::churn_update(rng, engine, ObjectType::Price),
         ActionKind::PriceArchive => catalog::churn_archive(rng, engine, ObjectType::Price),
+        ActionKind::OneOffInvoice => {
+            billing::one_off_invoice(rng, engine, ctx, None, None)
+                .expect("random targets are valid");
+        }
+        ActionKind::InvoiceUpdate => billing::churn_update(rng, engine),
     }
 }
 

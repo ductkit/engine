@@ -84,7 +84,6 @@ pub(crate) fn set_default_price(engine: &mut Engine, product: &str, price: &str,
     );
 }
 
-#[allow(dead_code)] // TEMP: used from Task 4 (prerequisites)
 /// Creates a product, its prices and its default price immediately (used for
 /// prerequisites inside other actions). Returns the price IDs.
 pub(crate) fn create_product_now(

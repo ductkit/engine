@@ -28,7 +28,7 @@ pub use delivery::{
 pub use engine::events::{EventFormat, EventInfo};
 pub use engine::{Cause, ChangeKind, EventRefs, StateUpdate};
 pub use error::MockError;
-pub use generate::Action;
+pub use generate::{Action, InvoiceOutcome};
 pub use handle::MockStripe;
 pub use model::ObjectType;
 pub use model::customer::{CustomerUpdate, NewCustomer};
