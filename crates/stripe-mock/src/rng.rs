@@ -75,13 +75,57 @@ impl SimRng {
 
     /// A Stripe-style ID: `prefix_` plus 14 alphanumerics.
     pub(crate) fn id(&mut self, prefix: &str) -> String {
-        let mut s = String::with_capacity(prefix.len() + 15);
+        self.id_len(prefix, 14)
+    }
+
+    /// `prefix_` plus `len` alphanumerics.
+    pub(crate) fn id_len(&mut self, prefix: &str, len: usize) -> String {
+        let mut s = String::with_capacity(prefix.len() + len + 1);
         s.push_str(prefix);
         s.push('_');
-        for _ in 0..14 {
+        for _ in 0..len {
             s.push(ALNUM[self.below(62) as usize] as char);
         }
         s
+    }
+
+    /// True with probability `p`. Draws nothing when `p == 0`.
+    #[allow(dead_code)] // used from Task 3
+    pub(crate) fn chance(&mut self, p: f64) -> bool {
+        if p <= 0.0 {
+            return false;
+        }
+        self.unit_f64() < p
+    }
+
+    /// Standard normal via Box–Muller (draws `u1` then `u2`).
+    #[allow(dead_code)] // used from Task 3
+    pub(crate) fn normal(&mut self) -> f64 {
+        let u1 = self.unit_f64();
+        let u2 = self.unit_f64();
+        (-2.0 * (1.0 - u1).ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// A delay in ms from `d`. `Fixed` draws nothing.
+    #[allow(dead_code)] // used from Task 3
+    pub(crate) fn sample_ms(&mut self, d: &crate::Distribution) -> i64 {
+        match *d {
+            crate::Distribution::Fixed { ms } => ms,
+            crate::Distribution::Lognormal { median_ms, p99_ms } => {
+                let mu = median_ms.ln();
+                let sigma = (p99_ms.ln() - mu) / 2.326348;
+                ((mu + sigma * self.normal()).exp().round() as i64).max(0)
+            }
+        }
+    }
+
+    /// Uniform in `min..=max` (ms). Draws nothing when `min == max`.
+    #[allow(dead_code)] // used from Task 3
+    pub(crate) fn uniform_ms(&mut self, min: i64, max: i64) -> i64 {
+        if max <= min {
+            return min;
+        }
+        min + self.below((max - min + 1) as u64) as i64
     }
 
     /// `len` characters from `[0-9A-Z]`.
@@ -152,6 +196,49 @@ mod tests {
             / n as f64;
         assert!((57_000.0..63_000.0).contains(&mean), "{mean}");
         assert!((0..1000).all(|_| r.exp_interval_ms(1e12).unwrap() >= 1));
+    }
+
+    #[test]
+    fn id_len_and_golden_unchanged() {
+        let mut r = RngStreams::new(1).stream("ids");
+        let id = r.id_len("evt", 24);
+        assert!(id.starts_with("evt_") && id.len() == 28);
+        assert_eq!(
+            RngStreams::new(42)
+                .stream("generate.customer.create")
+                .next_u64(),
+            GOLDEN
+        );
+    }
+
+    #[test]
+    fn chance_zero_does_not_draw() {
+        let s = RngStreams::new(2);
+        let (mut a, mut b) = (s.stream("c"), s.stream("c"));
+        assert!(!a.chance(0.0));
+        assert_eq!(a.next_u64(), b.next_u64());
+    }
+
+    #[test]
+    fn lognormal_median_and_p99() {
+        let mut r = RngStreams::new(3).stream("ln");
+        let d = crate::Distribution::Lognormal {
+            median_ms: 200.0,
+            p99_ms: 5000.0,
+        };
+        let mut v: Vec<i64> = (0..20_000).map(|_| r.sample_ms(&d)).collect();
+        v.sort();
+        let (median, p99) = (v[10_000], v[19_800]);
+        assert!((180..=220).contains(&median), "{median}");
+        assert!((4000..=6200).contains(&p99), "{p99}");
+        assert_eq!(r.sample_ms(&crate::Distribution::Fixed { ms: 7 }), 7);
+    }
+
+    #[test]
+    fn uniform_bounds() {
+        let mut r = RngStreams::new(4).stream("u");
+        assert!((0..1000).all(|_| (5..=9).contains(&r.uniform_ms(5, 9))));
+        assert_eq!(r.uniform_ms(3, 3), 3);
     }
 
     #[test]
