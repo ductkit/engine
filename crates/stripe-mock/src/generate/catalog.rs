@@ -5,10 +5,11 @@ use serde_json::json;
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::generate::{Continuation, Ctx, pick};
 use crate::model::catalog::{
-    PriceSpec, ProductSpec, price_json, product_json, random_currency, random_price,
+    PriceSpec, ProductSpec, new_price, new_product, random_currency, random_price,
     random_price_change, random_product, random_product_change,
 };
 use crate::rng::SimRng;
+use crate::stripe::{self, Expandable};
 use crate::{MockError, ObjectType};
 
 /// A new product with its prices, all drawn up front.
@@ -39,11 +40,11 @@ fn rng_id(rng: &mut SimRng, t: ObjectType) -> String {
 }
 
 pub(crate) fn create_product(engine: &mut Engine, p: &ProductSpec, cause: &Cause) {
-    let state = product_json(p, engine.now().unix_seconds());
-    engine.create(
+    let product = new_product(p, engine.now().unix_seconds());
+    engine.create_obj(
         ObjectType::Product,
         p.id.clone(),
-        state,
+        &product,
         cause.clone(),
         &["product.created"],
     );
@@ -56,11 +57,11 @@ pub(crate) fn create_prices(
     cause: &Cause,
 ) {
     for p in prices {
-        let state = price_json(p, product, engine.now().unix_seconds());
-        engine.create(
+        let price = new_price(p, product, engine.now().unix_seconds());
+        engine.create_obj(
             ObjectType::Price,
             p.id.clone(),
-            state,
+            &price,
             cause.clone(),
             &["price.created"],
         );
@@ -71,12 +72,12 @@ pub(crate) fn set_default_price(engine: &mut Engine, product: &str, price: &str,
     let now = engine.now().unix_seconds();
     let price = price.to_string();
     // The product may have been archived meanwhile; defaults still apply.
-    let _ = engine.update(
+    let _ = engine.update_obj::<stripe::Product>(
         ObjectType::Product,
         product,
-        |v| {
-            v["default_price"] = json!(price);
-            v["updated"] = json!(now);
+        |p| {
+            p.default_price = Some(Some(Expandable::Id(price)));
+            p.updated = now;
         },
         cause.clone(),
         ChangeKind::Updated,
@@ -162,21 +163,29 @@ fn archive(engine: &mut Engine, t: ObjectType, id: &str, cause: &Cause) {
     } else {
         "price.updated"
     };
-    engine
-        .update(
+    let done = if t == ObjectType::Product {
+        engine.update_obj::<stripe::Product>(
             t,
             id,
-            |v| {
-                v["active"] = json!(false);
-                if t == ObjectType::Product {
-                    v["updated"] = json!(now);
-                }
+            |p| {
+                p.active = false;
+                p.updated = now;
             },
             cause.clone(),
             ChangeKind::Archived,
             &[event],
         )
-        .expect("archiving a live object");
+    } else {
+        engine.update_obj::<stripe::Price>(
+            t,
+            id,
+            |p| p.active = false,
+            cause.clone(),
+            ChangeKind::Archived,
+            &[event],
+        )
+    };
+    done.expect("archiving a live object");
 }
 
 /// The `Archive { id }` control hook.
@@ -219,19 +228,26 @@ pub(crate) fn churn_update(rng: &mut SimRng, engine: &mut Engine, t: ObjectType)
     } else {
         ("price_update", "price.updated")
     };
-    let change: Box<dyn FnOnce(&mut serde_json::Value)> = if t == ObjectType::Product {
-        let f = random_product_change(rng);
-        Box::new(move |v| {
-            f(v);
-            v["updated"] = json!(now);
-        })
+    let done = if t == ObjectType::Product {
+        let change = random_product_change(rng);
+        let cause = engine.begin_action(action);
+        engine.update_obj::<stripe::Product>(
+            t,
+            &id,
+            |p| {
+                change(p);
+                p.updated = now;
+            },
+            cause,
+            ChangeKind::Updated,
+            &[event],
+        )
     } else {
-        Box::new(random_price_change(rng))
+        let change = random_price_change(rng);
+        let cause = engine.begin_action(action);
+        engine.update_obj::<stripe::Price>(t, &id, change, cause, ChangeKind::Updated, &[event])
     };
-    let cause = engine.begin_action(action);
-    engine
-        .update(t, &id, change, cause, ChangeKind::Updated, &[event])
-        .expect("live object");
+    done.expect("live object");
 }
 
 /// `churn.product.archive` / `churn.price.archive`: archive a random active object.

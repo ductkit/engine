@@ -1,11 +1,10 @@
-//! Product and price JSON (hand-written until phase 7 generates it from OpenAPI).
+//! Products and prices, built on the generated [`stripe::Product`] and [`stripe::Price`].
 
 use std::collections::BTreeMap;
 
-use serde_json::{Value, json};
-
 use crate::model::customer::random_metadata_value;
 use crate::rng::SimRng;
+use crate::stripe;
 
 const PRODUCT_NAMES: [&str; 6] = [
     "Basic plan",
@@ -39,60 +38,74 @@ pub(crate) struct PriceSpec {
     pub nickname: Option<String>,
 }
 
-pub(crate) fn product_json(p: &ProductSpec, created: i64) -> Value {
-    json!({
-        "id": p.id,
-        "object": "product",
-        "active": true,
-        "created": created,
-        "default_price": null,
-        "description": p.description,
-        "images": [],
-        "livemode": false,
-        "marketing_features": [],
-        "metadata": p.metadata,
-        "name": p.name,
-        "package_dimensions": null,
-        "shippable": null,
-        "statement_descriptor": null,
-        "tax_code": null,
-        "type": "service",
-        "unit_label": null,
-        "updated": created,
-        "url": null
-    })
+/// A new active product. Presence follows ruling R1: every field is present, `null` when
+/// unset. The hand-written `type: "service"` is gone: the pinned schema has no `type`.
+pub(crate) fn new_product(p: &ProductSpec, created: i64) -> stripe::Product {
+    stripe::Product {
+        active: true,
+        created,
+        default_price: Some(None),
+        description: Some(p.description.clone()),
+        id: p.id.clone(),
+        images: Vec::new(),
+        livemode: false,
+        marketing_features: Vec::new(),
+        metadata: p.metadata.clone(),
+        name: p.name.clone(),
+        object: stripe::ProductObject::Product,
+        package_dimensions: Some(None),
+        shippable: Some(None),
+        statement_descriptor: Some(None),
+        tax_code: Some(None),
+        tax_details: Some(None),
+        unit_label: Some(None),
+        updated: created,
+        url: Some(None),
+    }
 }
 
-pub(crate) fn price_json(p: &PriceSpec, product: &str, created: i64) -> Value {
-    let recurring = p.interval.map(|interval| {
-        json!({
-            "interval": interval,
-            "interval_count": 1,
-            "meter": null,
-            "usage_type": "licensed"
-        })
+/// A new active per-unit price of `product`. Presence follows ruling R1; the includable-only
+/// `currency_options` and `tiers` are absent.
+pub(crate) fn new_price(p: &PriceSpec, product: &str, created: i64) -> stripe::Price {
+    let recurring = p.interval.map(|interval| stripe::Recurring {
+        interval: match interval {
+            "day" => stripe::RecurringInterval::Day,
+            "week" => stripe::RecurringInterval::Week,
+            "month" => stripe::RecurringInterval::Month,
+            "year" => stripe::RecurringInterval::Year,
+            other => panic!("unknown price interval `{other}`"),
+        },
+        interval_count: 1,
+        meter: Some(None),
+        usage_type: stripe::RecurringUsageType::Licensed,
     });
-    json!({
-        "id": p.id,
-        "object": "price",
-        "active": true,
-        "billing_scheme": "per_unit",
-        "created": created,
-        "currency": p.currency,
-        "custom_unit_amount": null,
-        "livemode": false,
-        "lookup_key": null,
-        "metadata": {},
-        "nickname": p.nickname,
-        "product": product,
-        "recurring": recurring,
-        "tax_behavior": "unspecified",
-        "tiers_mode": null,
-        "transform_quantity": null,
-        "type": if p.interval.is_some() { "recurring" } else { "one_time" },
-        "unit_amount": p.unit_amount,
-        "unit_amount_decimal": p.unit_amount.to_string()
-    })
+    stripe::Price {
+        active: true,
+        billing_scheme: stripe::PriceBillingScheme::PerUnit,
+        created,
+        currency: p.currency.to_string(),
+        currency_options: None,
+        custom_unit_amount: Some(None),
+        id: p.id.clone(),
+        livemode: false,
+        lookup_key: Some(None),
+        metadata: BTreeMap::new(),
+        nickname: Some(p.nickname.clone()),
+        object: stripe::PriceObject::Price,
+        product: stripe::Expandable::Id(product.to_string()),
+        recurring: Some(recurring),
+        tax_behavior: Some(Some(stripe::PriceTaxBehavior::Unspecified)),
+        tiers: None,
+        tiers_mode: Some(None),
+        transform_quantity: Some(None),
+        type_: if p.interval.is_some() {
+            stripe::PriceType::Recurring
+        } else {
+            stripe::PriceType::OneTime
+        },
+        unit_amount: Some(Some(p.unit_amount)),
+        unit_amount_decimal: Some(Some(p.unit_amount.to_string())),
+    }
 }
 
 pub(crate) fn random_product(rng: &mut SimRng, id: String) -> ProductSpec {
@@ -144,28 +157,30 @@ pub(crate) fn random_price(
 }
 
 /// A random change for a product: name, description or metadata.
-pub(crate) fn random_product_change(rng: &mut SimRng) -> impl FnOnce(&mut Value) + use<> {
+pub(crate) fn random_product_change(rng: &mut SimRng) -> impl FnOnce(&mut stripe::Product) + use<> {
     let which = rng.below(3);
     let name = rng.choose(&PRODUCT_NAMES).to_string();
     let key = rng.choose(&METADATA_KEYS).to_string();
     let value = random_metadata_value(rng);
-    move |v: &mut Value| match which {
-        0 => v["name"] = json!(name),
-        1 => v["description"] = json!(format!("{name}, updated")),
-        _ => v["metadata"][key] = json!(value),
+    move |p: &mut stripe::Product| match which {
+        0 => p.name = name,
+        1 => p.description = Some(Some(format!("{name}, updated"))),
+        _ => {
+            p.metadata.insert(key, value);
+        }
     }
 }
 
 /// A random change for a price: nickname or metadata (never amounts).
-pub(crate) fn random_price_change(rng: &mut SimRng) -> impl FnOnce(&mut Value) + use<> {
+pub(crate) fn random_price_change(rng: &mut SimRng) -> impl FnOnce(&mut stripe::Price) + use<> {
     let nickname = rng.below(2) == 0;
     let key = rng.choose(&METADATA_KEYS).to_string();
     let value = random_metadata_value(rng);
-    move |v: &mut Value| {
+    move |p: &mut stripe::Price| {
         if nickname {
-            v["nickname"] = json!(format!("Nickname {value:.8}"));
+            p.nickname = Some(Some(format!("Nickname {value:.8}")));
         } else {
-            v["metadata"][key] = json!(value);
+            p.metadata.insert(key, value);
         }
     }
 }

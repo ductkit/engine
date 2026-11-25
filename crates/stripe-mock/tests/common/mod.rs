@@ -17,7 +17,7 @@ pub async fn mock_with(toml: &str) -> MockStripe {
 
 /// `object` values whose payloads `get` and friends check against the pinned schema. Each
 /// task that types an object adds its value here.
-pub const CONFORMANCE_CHECKED: &[&str] = &[];
+pub const CONFORMANCE_CHECKED: &[&str] = &["customer", "product", "price"];
 
 /// Panics unless `v` conforms to the pinned Stripe schema.
 pub fn assert_conforms(v: &Value) {

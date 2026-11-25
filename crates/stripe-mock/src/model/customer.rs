@@ -1,11 +1,12 @@
-//! Customer JSON (hand-written until phase 7 generates it from OpenAPI).
+//! Customers, built on the generated [`stripe::Customer`].
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 
 use crate::rng::SimRng;
+use crate::stripe;
 
 /// Fields for a new customer.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -37,71 +38,83 @@ const NAMES: [&str; 5] = [
 ];
 const METADATA_KEYS: [&str; 4] = ["plan", "tier", "source", "note"];
 
-/// The full customer object at creation.
-pub(crate) fn new_customer_json(
+/// The full customer object at creation. Presence follows ruling R1: every field is present
+/// (`null` when unset) except the includable-only ones (`cash_balance`,
+/// `invoice_credit_balance`, `sources`, `subscriptions`, `tax`, `tax_ids`) and the
+/// non-nullable names (`business_name`, `individual_name`), which Stripe omits until set.
+pub(crate) fn new_customer(
     id: &str,
     created: i64,
     invoice_prefix: &str,
     p: &NewCustomer,
-) -> Value {
-    json!({
-        "id": id,
-        "object": "customer",
-        "address": null,
-        "balance": 0,
-        "created": created,
-        "currency": null,
-        "default_source": null,
-        "delinquent": false,
-        "description": p.description,
-        "discount": null,
-        "email": p.email,
-        "invoice_prefix": invoice_prefix,
-        "invoice_settings": {
-            "custom_fields": null,
-            "default_payment_method": null,
-            "footer": null,
-            "rendering_options": null
-        },
-        "livemode": false,
-        "metadata": p.metadata,
-        "name": p.name,
-        "next_invoice_sequence": 1,
-        "phone": null,
-        "preferred_locales": [],
-        "shipping": null,
-        "tax_exempt": "none",
-        "test_clock": null
-    })
+) -> stripe::Customer {
+    stripe::Customer {
+        address: Some(None),
+        balance: Some(0),
+        business_name: None,
+        cash_balance: None,
+        created,
+        currency: Some(None),
+        customer_account: Some(None),
+        default_source: Some(None),
+        delinquent: Some(Some(false)),
+        description: Some(p.description.clone()),
+        discount: Some(None),
+        email: Some(p.email.clone()),
+        id: id.to_string(),
+        individual_name: None,
+        invoice_credit_balance: None,
+        invoice_prefix: Some(Some(invoice_prefix.to_string())),
+        invoice_settings: Some(stripe::InvoiceSettingCustomerSetting {
+            custom_fields: Some(None),
+            default_payment_method: Some(None),
+            footer: Some(None),
+            rendering_options: Some(None),
+        }),
+        livemode: false,
+        metadata: Some(p.metadata.clone()),
+        name: Some(p.name.clone()),
+        next_invoice_sequence: Some(1),
+        object: stripe::CustomerObject::Customer,
+        phone: Some(None),
+        preferred_locales: Some(Some(Vec::new())),
+        shipping: Some(None),
+        sources: None,
+        subscriptions: None,
+        tax: None,
+        tax_exempt: Some(Some(stripe::CustomerTaxExempt::None)),
+        tax_ids: None,
+        test_clock: Some(None),
+    }
 }
 
 /// Applies one update in place.
-pub(crate) fn apply_update(state: &mut Value, u: &CustomerUpdate) {
+pub(crate) fn apply_update(c: &mut stripe::Customer, u: &CustomerUpdate) {
     match u {
-        CustomerUpdate::SetEmail(v) => state["email"] = json!(v),
-        CustomerUpdate::SetName(v) => state["name"] = json!(v),
-        CustomerUpdate::SetDescription(v) => state["description"] = json!(v),
+        CustomerUpdate::SetEmail(v) => c.email = Some(v.clone()),
+        CustomerUpdate::SetName(v) => c.name = Some(v.clone()),
+        CustomerUpdate::SetDescription(v) => c.description = Some(v.clone()),
         CustomerUpdate::SetMetadata { key, value } => {
-            metadata_mut(state).insert(key.clone(), json!(value));
+            c.metadata
+                .get_or_insert_with(BTreeMap::new)
+                .insert(key.clone(), value.clone());
         }
         CustomerUpdate::RemoveMetadata { key } => {
-            metadata_mut(state).remove(key);
+            if let Some(m) = c.metadata.as_mut() {
+                m.remove(key);
+            }
         }
     }
-}
-
-fn metadata_mut(state: &mut Value) -> &mut Map<String, Value> {
-    if !state["metadata"].is_object() {
-        state["metadata"] = json!({});
-    }
-    state["metadata"]
-        .as_object_mut()
-        .expect("metadata is an object")
 }
 
 /// What Stripe returns for a deleted customer.
 pub(crate) fn deleted_stub(id: &str) -> Value {
-    json!({"id": id, "object": "customer", "deleted": true})
+    serde_json::to_value(stripe::DeletedCustomer {
+        deleted: true,
+        id: id.to_string(),
+        object: stripe::DeletedCustomerObject::Customer,
+    })
+    .expect("a deleted customer serializes")
 }
 
 pub(crate) fn random_metadata_value(rng: &mut SimRng) -> String {
@@ -136,20 +149,18 @@ pub(crate) fn random_new_customer(rng: &mut SimRng) -> NewCustomer {
 }
 
 /// A random update for an existing customer.
-pub(crate) fn random_update(rng: &mut SimRng, state: &Value) -> CustomerUpdate {
-    let has_metadata = state["metadata"].as_object().is_some_and(|m| !m.is_empty());
+pub(crate) fn random_update(rng: &mut SimRng, c: &stripe::Customer) -> CustomerUpdate {
+    let keys: Vec<&String> = c.metadata.iter().flat_map(|m| m.keys()).collect();
+    let has_metadata = !keys.is_empty();
     match rng.below(5) {
         0 => CustomerUpdate::SetEmail(Some(random_email(rng))),
         1 => CustomerUpdate::SetName(Some(rng.choose(&NAMES).to_string())),
         2 => CustomerUpdate::SetDescription(
             (rng.below(2) == 0).then(|| "Updated by ductkit-stripe-mock".to_string()),
         ),
-        4 if has_metadata => {
-            let keys: Vec<&String> = state["metadata"].as_object().unwrap().keys().collect();
-            CustomerUpdate::RemoveMetadata {
-                key: rng.choose(&keys).to_string(),
-            }
-        }
+        4 if has_metadata => CustomerUpdate::RemoveMetadata {
+            key: rng.choose(&keys).to_string(),
+        },
         _ => CustomerUpdate::SetMetadata {
             key: rng.choose(&METADATA_KEYS).to_string(),
             value: random_metadata_value(rng),
@@ -169,35 +180,48 @@ mod tests {
             email: Some("a@example.com".into()),
             ..Default::default()
         };
-        let v = new_customer_json("cus_1", 1767225600, "ABCD1234", &p);
+        let v = serde_json::to_value(new_customer("cus_1", 1767225600, "ABCD1234", &p)).unwrap();
         assert_eq!(v["object"], "customer");
         assert_eq!(v["created"], 1767225600);
         assert_eq!(v["email"], "a@example.com");
         assert_eq!(v["name"], Value::Null);
         assert_eq!(v["livemode"], false);
         assert_eq!(v["metadata"], json!({}));
-        assert_eq!(v.as_object().unwrap().keys().next().unwrap(), "id");
-        assert_eq!(v.as_object().unwrap().len(), 22);
+        assert_eq!(v["customer_account"], Value::Null);
+        for absent in [
+            "sources",
+            "subscriptions",
+            "tax",
+            "tax_ids",
+            "business_name",
+        ] {
+            assert!(v.get(absent).is_none(), "{absent}");
+        }
+        assert_eq!(v.as_object().unwrap().len(), 23);
     }
 
     #[test]
     fn updates_apply() {
-        let mut v = new_customer_json("cus_1", 0, "ABCD1234", &NewCustomer::default());
+        let mut c = new_customer("cus_1", 0, "ABCD1234", &NewCustomer::default());
         apply_update(
-            &mut v,
+            &mut c,
             &CustomerUpdate::SetMetadata {
                 key: "tier".into(),
                 value: "gold".into(),
             },
         );
-        apply_update(&mut v, &CustomerUpdate::SetName(Some("Zoë".into())));
+        apply_update(&mut c, &CustomerUpdate::SetName(Some("Zoë".into())));
+        let v = serde_json::to_value(&c).unwrap();
         assert_eq!(v["metadata"], json!({"tier": "gold"}));
         assert_eq!(v["name"], "Zoë");
         apply_update(
-            &mut v,
+            &mut c,
             &CustomerUpdate::RemoveMetadata { key: "tier".into() },
         );
+        apply_update(&mut c, &CustomerUpdate::SetEmail(None));
+        let v = serde_json::to_value(&c).unwrap();
         assert_eq!(v["metadata"], json!({}));
+        assert_eq!(v["email"], Value::Null);
     }
 
     #[test]

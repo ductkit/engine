@@ -211,13 +211,8 @@ impl Projector {
             _ if snapshot_type.starts_with("account.application.") => {
                 self.application.clone().unwrap_or(Value::Null)
             }
-            (ChangeKind::Deleted, Some(prev)) => {
-                let mut o = prev.clone();
-                if let Some(m) = o.as_object_mut() {
-                    m.insert("deleted".into(), json!(true));
-                }
-                o
-            }
+            // Ruling R2: the last live object, unchanged (no live schema has `deleted`).
+            (ChangeKind::Deleted, Some(prev)) => prev.clone(),
             _ => u.state.clone(),
         };
         let mut data = Map::new();
@@ -484,7 +479,7 @@ mod tests {
         let s = e.events().get(&u.events.snapshot[0]).unwrap();
         assert_eq!(s.event_type, "customer.deleted");
         assert_eq!(s.payload["data"]["object"]["email"], "a@example.com");
-        assert_eq!(s.payload["data"]["object"]["deleted"], true);
+        assert!(s.payload["data"]["object"].get("deleted").is_none());
     }
 
     #[test]

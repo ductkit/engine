@@ -162,13 +162,10 @@ pub(crate) fn finalize(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     );
     if done && let Some(c) = live_customer {
         engine
-            .update(
+            .update_obj::<crate::stripe::Customer>(
                 ObjectType::Customer,
                 &c,
-                |v| {
-                    let n = v["next_invoice_sequence"].as_i64().unwrap_or(1);
-                    v["next_invoice_sequence"] = json!(n + 1);
-                },
+                |c| c.next_invoice_sequence = Some(c.next_invoice_sequence.unwrap_or(1) + 1),
                 cause.clone(),
                 ChangeKind::Updated,
                 &[],

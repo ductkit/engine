@@ -447,8 +447,6 @@ impl Engine {
     }
 
     /// [`create`](Self::create) for a typed object: the generated struct is the only way in.
-    // The model code that uses the typed helpers arrives in later tasks.
-    #[allow(dead_code)]
     pub(crate) fn create_obj<T: Serialize>(
         &mut self,
         t: ObjectType,
@@ -465,7 +463,7 @@ impl Engine {
     /// [`update`](Self::update) through the typed object: the latest state is deserialized
     /// into `T`, `f` changes it, and the result is stored. A state that does not deserialize
     /// is a bug in the mock, so it panics with the type, the ID and the path.
-    #[allow(dead_code, clippy::too_many_arguments)] // every argument is part of the entry
+    #[allow(clippy::too_many_arguments)] // every argument is part of the entry
     pub(crate) fn update_obj<T: Serialize + DeserializeOwned>(
         &mut self,
         t: ObjectType,
@@ -498,7 +496,6 @@ impl Engine {
 
     /// The object's latest state as `T`; `None` if it does not exist. Panics, like
     /// [`update_obj`](Self::update_obj), if the stored state is not a valid `T`.
-    #[allow(dead_code)]
     pub(crate) fn latest_obj<T: DeserializeOwned>(&self, t: ObjectType, id: &str) -> Option<T> {
         let latest = self.latest(t, id)?;
         Some(

@@ -129,3 +129,35 @@ async fn same_second_shuffle_is_seeded() {
     let plain = order_of_twenty("seed = 5").await;
     assert_ne!(a, plain);
 }
+
+/// An unchecked read: the payload is asserted on directly, not through the conformance hook.
+async fn raw_get(m: &MockStripe, path: &str) -> Value {
+    reqwest::Client::new()
+        .get(format!("{}{path}", m.api_url()))
+        .bearer_auth("sk_test_mock")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn customer_deleted_event_object_has_no_deleted_flag() {
+    let m = mock_with("").await;
+    let a = m
+        .create_customer(NewCustomer {
+            email: Some("a@example.com".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    m.update_customer(&a, CustomerUpdate::SetName(Some("Ada".into())))
+        .unwrap();
+    let live = raw_get(&m, &format!("/v1/customers/{a}")).await;
+    m.delete_customer(&a).unwrap();
+    let v = raw_get(&m, "/v1/events?type=customer.deleted").await;
+    let object = &v["data"][0]["data"]["object"];
+    assert!(object.get("deleted").is_none(), "{object:#}");
+    assert_eq!(object, &live);
+}

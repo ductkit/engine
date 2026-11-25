@@ -424,7 +424,7 @@ Every truth-log mutation that Stripe would announce produces **one snapshot even
 
 ### 8.1 Snapshot events (v1)
 
-- `evt_…` with `type` (e.g. `customer.updated`), `created`, `data.object` (snapshot at event time), `data.previous_attributes` (for `*.updated`), `account` (Connect), `api_version` (`2026-11-18.endive`), `livemode: false`, `request {id, idempotency_key}` and `pending_webhooks`.
+- `evt_…` with `type` (e.g. `customer.updated`), `created`, `data.object` (snapshot at event time; for a `*.deleted` event, the last live object, unchanged, with no `deleted` flag), `data.previous_attributes` (for `*.updated`), `account` (Connect), `api_version` (`2026-11-18.endive`), `livemode: false`, `request {id, idempotency_key}` and `pending_webhooks`.
 - **Visibility scheduling**: each event gets a hidden `visible_at = created + visibility_lag (+ late_tail)`. `/v1/events` only returns events whose `visible_at` has passed. An event can therefore become visible *after* a newer one did, so "poll with `ending_before` = last seen" silently misses events. Catching this bug is a primary goal of the fixture.
 - **Same-second ordering**: events sharing a `created` second have no guaranteed relative order (`same_second_shuffle`).
 - **Retention**: events older than `event_retention.window` disappear from the API. A poller that falls further behind must detect the gap (e.g. its cursor event 404s) and fall back to a full backfill.

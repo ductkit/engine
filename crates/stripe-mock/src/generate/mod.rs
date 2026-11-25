@@ -26,8 +26,9 @@ use std::collections::BTreeMap;
 
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::model::catalog::PriceSpec;
-use crate::model::customer::{apply_update, new_customer_json, random_new_customer, random_update};
+use crate::model::customer::{self, apply_update, random_new_customer, random_update};
 use crate::rng::{RngStreams, SimRng};
+use crate::stripe;
 use crate::{ActionsConfig, Config, MockError, ObjectType, SimTime};
 
 /// A business action to run now with [`crate::MockStripe::run_action`] (spec section 11,
@@ -603,8 +604,14 @@ pub(crate) fn create_random_customer(
     let id = rng.id(t.id_prefix());
     let prefix = rng.alnum_upper(8);
     let params = random_new_customer(rng);
-    let state = new_customer_json(&id, engine.now().unix_seconds(), &prefix, &params);
-    engine.create(t, id.clone(), state, cause.clone(), &["customer.created"]);
+    let customer = customer::new_customer(&id, engine.now().unix_seconds(), &prefix, &params);
+    engine.create_obj(
+        t,
+        id.clone(),
+        &customer,
+        cause.clone(),
+        &["customer.created"],
+    );
     id
 }
 
@@ -618,14 +625,14 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
             let Some(id) = pick_live(rng, engine) else {
                 return;
             };
-            let state = &engine.latest(t, &id).expect("live").state;
-            let update = random_update(rng, state);
+            let customer: stripe::Customer = engine.latest_obj(t, &id).expect("live");
+            let update = random_update(rng, &customer);
             let cause = engine.begin_action("customer_update");
             engine
-                .update(
+                .update_obj::<stripe::Customer>(
                     t,
                     &id,
-                    |s| apply_update(s, &update),
+                    |c| apply_update(c, &update),
                     cause,
                     ChangeKind::Updated,
                     &["customer.updated"],

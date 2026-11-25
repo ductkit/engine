@@ -17,7 +17,7 @@ use crate::engine::events::EventInfo;
 use crate::engine::{Cause, ChangeKind, Engine, Scope, StateUpdate};
 use crate::faults::api::ApiFaults;
 use crate::generate::{Action, Generators, delete_customer_cascade};
-use crate::model::customer::{CustomerUpdate, NewCustomer, apply_update, new_customer_json};
+use crate::model::customer::{CustomerUpdate, NewCustomer, apply_update, new_customer};
 use crate::rng::{RngStreams, SimRng};
 use crate::stream::{SubscribeFilter, SubscribeOptions, Subscription};
 use crate::{
@@ -600,12 +600,12 @@ impl MockStripe {
         self.journalled_in(scope, op, |engine, control_rng, _| {
             let id = control_rng.id(ObjectType::Customer.id_prefix());
             let prefix = control_rng.alnum_upper(8);
-            let state = new_customer_json(&id, engine.now().unix_seconds(), &prefix, &p);
+            let customer = new_customer(&id, engine.now().unix_seconds(), &prefix, &p);
             let cause = engine.begin_action("control.create_customer");
-            engine.create(
+            engine.create_obj(
                 ObjectType::Customer,
                 id.clone(),
-                state,
+                &customer,
                 cause,
                 &["customer.created"],
             );
@@ -631,10 +631,10 @@ impl MockStripe {
         };
         self.journalled_in(scope, op, |engine, _, _| {
             let cause = engine.begin_action("control.update_customer");
-            let update = engine.update(
+            let update = engine.update_obj::<crate::stripe::Customer>(
                 ObjectType::Customer,
                 id,
-                |s| apply_update(s, &u),
+                |c| apply_update(c, &u),
                 cause,
                 ChangeKind::Updated,
                 &["customer.updated"],
