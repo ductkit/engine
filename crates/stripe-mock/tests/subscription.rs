@@ -111,7 +111,8 @@ async fn json_shape_matches_spec() {
     assert_eq!(v["account"], Value::Null);
     assert_eq!(v["object_type"], "customer");
     assert_eq!(v["kind"], "created");
-    assert_eq!(v["events"], json!({"snapshot": [], "thin": []}));
+    assert_eq!(v["events"]["snapshot"].as_array().unwrap().len(), 1);
+    assert_eq!(v["events"]["thin"].as_array().unwrap().len(), 1);
     assert_eq!(v["cause"]["action"], "control.create_customer");
     assert_eq!(v["cause"]["action_id"], "act_1");
 }

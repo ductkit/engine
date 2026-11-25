@@ -90,7 +90,6 @@ impl SimRng {
     }
 
     /// True with probability `p`. Draws nothing when `p == 0`.
-    #[allow(dead_code)] // used from Task 3
     pub(crate) fn chance(&mut self, p: f64) -> bool {
         if p <= 0.0 {
             return false;
@@ -99,7 +98,6 @@ impl SimRng {
     }
 
     /// Standard normal via Box–Muller (draws `u1` then `u2`).
-    #[allow(dead_code)] // used from Task 3
     pub(crate) fn normal(&mut self) -> f64 {
         let u1 = self.unit_f64();
         let u2 = self.unit_f64();
@@ -107,7 +105,6 @@ impl SimRng {
     }
 
     /// A delay in ms from `d`. `Fixed` draws nothing.
-    #[allow(dead_code)] // used from Task 3
     pub(crate) fn sample_ms(&mut self, d: &crate::Distribution) -> i64 {
         match *d {
             crate::Distribution::Fixed { ms } => ms,
@@ -120,7 +117,6 @@ impl SimRng {
     }
 
     /// Uniform in `min..=max` (ms). Draws nothing when `min == max`.
-    #[allow(dead_code)] // used from Task 3
     pub(crate) fn uniform_ms(&mut self, min: i64, max: i64) -> i64 {
         if max <= min {
             return min;

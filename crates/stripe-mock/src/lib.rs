@@ -19,6 +19,7 @@ pub use config::{
     EventRetentionConfig, EventsConfig, LateTail, PINNED_API_VERSION, PayloadFormat, RetrySchedule,
     WebhooksConfig,
 };
+pub use engine::events::{EventFormat, EventInfo};
 pub use engine::{Cause, ChangeKind, EventRefs, StateUpdate};
 pub use error::MockError;
 pub use handle::MockStripe;

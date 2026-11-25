@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::engine::events::EventInfo;
 use crate::engine::{Engine, StateUpdate};
 use crate::generate::Generator;
 use crate::model::customer::{
@@ -89,7 +90,7 @@ impl MockStripe {
         let streams = RngStreams::new(config.seed);
         let start = SimTime::from_datetime(config.clock.start);
         let sim = Sim {
-            engine: Engine::new(start),
+            engine: Engine::new(start, &config, &streams),
             generator: Generator::new(&config, &streams, start),
             control_rng: streams.stream("control"),
             api_rng: streams.stream("api.request_ids"),
@@ -230,6 +231,18 @@ impl MockStripe {
     /// The latest truth-log entry for an object, deleted or not.
     pub fn get(&self, t: ObjectType, id: &str) -> Option<StateUpdate> {
         self.shared.lock().engine.latest(t, id).cloned()
+    }
+
+    /// Every event in creation order, with its hidden visibility time.
+    pub fn event_timeline(&self) -> Vec<EventInfo> {
+        self.shared
+            .lock()
+            .engine
+            .events()
+            .all()
+            .iter()
+            .map(EventInfo::from)
+            .collect()
     }
 
     /// A copy of the whole truth log.

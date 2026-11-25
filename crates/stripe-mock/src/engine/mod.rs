@@ -1,12 +1,16 @@
 //! The truth log: every mutation, in order (spec section 2).
 
+pub(crate) mod events;
 pub(crate) mod store;
 
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::rng::RngStreams;
 use crate::stream::{self, SubscribeFilter, SubscribeOptions, Subscriber, Subscription};
-use crate::{MockError, ObjectType, SimTime};
+use crate::{Config, MockError, ObjectType, SimTime};
+
+pub(crate) use events::{EventStore, Projector};
 
 pub(crate) use store::ObjectStore;
 
@@ -28,7 +32,7 @@ pub struct Cause {
     pub action_id: String,
 }
 
-/// Stripe events a mutation produced (always empty until phase 2).
+/// Stripe events a mutation produced.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct EventRefs {
     pub snapshot: Vec<String>,
@@ -62,10 +66,12 @@ pub(crate) struct Engine {
     log: Vec<StateUpdate>,
     store: ObjectStore,
     subscribers: Vec<Subscriber>,
+    projector: Projector,
+    events: EventStore,
 }
 
 impl Engine {
-    pub(crate) fn new(start: SimTime) -> Self {
+    pub(crate) fn new(start: SimTime, config: &Config, streams: &RngStreams) -> Self {
         Engine {
             now: start,
             next_seq: 1,
@@ -73,7 +79,28 @@ impl Engine {
             log: Vec::new(),
             store: ObjectStore::default(),
             subscribers: Vec::new(),
+            projector: Projector::new(config, streams),
+            events: EventStore::default(),
         }
+    }
+
+    pub(crate) fn events(&self) -> &EventStore {
+        &self.events
+    }
+
+    #[allow(dead_code)] // TEMP: used from Task 4
+    pub(crate) fn events_mut(&mut self) -> &mut EventStore {
+        &mut self.events
+    }
+
+    #[allow(dead_code)] // TEMP: used from Task 4
+    pub(crate) fn retention_ms(&self) -> i64 {
+        self.projector.retention_ms
+    }
+
+    #[allow(dead_code)] // TEMP: used from Task 4
+    pub(crate) fn projector_mut(&mut self) -> &mut Projector {
+        &mut self.projector
     }
 
     pub(crate) fn now(&self) -> SimTime {
@@ -103,7 +130,7 @@ impl Engine {
         cause: Cause,
     ) -> StateUpdate {
         let created = state["created"].as_i64().unwrap_or(self.now.unix_seconds());
-        let update = self.record(t, id, 1, ChangeKind::Created, state, cause);
+        let update = self.record(t, id, 1, ChangeKind::Created, state, cause, None);
         self.store.insert(update.clone(), created);
         self.notify(&update);
         update
@@ -124,6 +151,7 @@ impl Engine {
             return Ok(None);
         }
         let version = latest.version + 1;
+        let previous = latest.state.clone();
         let update = self.record(
             t,
             id.to_string(),
@@ -131,6 +159,7 @@ impl Engine {
             ChangeKind::Updated,
             state,
             cause,
+            Some(previous),
         );
         self.store.replace(update.clone());
         self.notify(&update);
@@ -144,7 +173,9 @@ impl Engine {
         tombstone: Value,
         cause: Cause,
     ) -> Result<StateUpdate, MockError> {
-        let version = self.live(t, id)?.version + 1;
+        let latest = self.live(t, id)?;
+        let version = latest.version + 1;
+        let previous = latest.state.clone();
         let update = self.record(
             t,
             id.to_string(),
@@ -152,6 +183,7 @@ impl Engine {
             ChangeKind::Deleted,
             tombstone,
             cause,
+            Some(previous),
         );
         self.store.replace(update.clone());
         self.notify(&update);
@@ -192,8 +224,9 @@ impl Engine {
         kind: ChangeKind,
         state: Value,
         cause: Cause,
+        previous: Option<Value>,
     ) -> StateUpdate {
-        let update = StateUpdate {
+        let mut update = StateUpdate {
             seq: self.next_seq,
             at: self.now,
             account: None,
@@ -206,6 +239,13 @@ impl Engine {
             cause: Some(cause),
         };
         self.next_seq += 1;
+        let (snapshot, thin) = self.projector.project(&update, previous.as_ref());
+        update.events = EventRefs {
+            snapshot: vec![snapshot.id.clone()],
+            thin: vec![thin.id.clone()],
+        };
+        self.events.push(snapshot);
+        self.events.push(thin);
         self.log.push(update.clone());
         update
     }
@@ -258,13 +298,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn test_engine() -> Engine {
+        Engine::new(SimTime(0), &Config::default(), &RngStreams::new(0))
+    }
+
     fn cust(id: &str, created: i64) -> Value {
         json!({"id": id, "object": "customer", "created": created, "email": null})
     }
 
     #[test]
     fn seq_and_versions() {
-        let mut e = Engine::new(SimTime(0));
+        let mut e = test_engine();
         let c = e.begin_action("t");
         let a = e.create(
             ObjectType::Customer,
@@ -311,7 +355,7 @@ mod tests {
 
     #[test]
     fn noop_update_records_nothing() {
-        let mut e = Engine::new(SimTime(0));
+        let mut e = test_engine();
         let c = e.begin_action("t");
         e.create(
             ObjectType::Customer,
@@ -328,7 +372,7 @@ mod tests {
 
     #[test]
     fn mutating_deleted_or_missing_errors() {
-        let mut e = Engine::new(SimTime(0));
+        let mut e = test_engine();
         let c = e.begin_action("t");
         assert!(matches!(
             e.update(ObjectType::Customer, "cus_x", |_| {}, c.clone()),
@@ -351,7 +395,7 @@ mod tests {
 
     #[test]
     fn list_order_breaks_ties_by_creation() {
-        let mut e = Engine::new(SimTime(0));
+        let mut e = test_engine();
         let c = e.begin_action("t");
         for (id, t) in [("cus_1", 5), ("cus_2", 5), ("cus_3", 4)] {
             e.create(ObjectType::Customer, id.into(), cust(id, t), c.clone());
@@ -367,7 +411,7 @@ mod tests {
 
     #[test]
     fn begin_action_ids() {
-        let mut e = Engine::new(SimTime(0));
+        let mut e = test_engine();
         assert_eq!(e.begin_action("a").action_id, "act_1");
         assert_eq!(e.begin_action("b").action_id, "act_2");
     }
