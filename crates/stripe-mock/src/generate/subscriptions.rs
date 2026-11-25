@@ -1,8 +1,6 @@
 //! Subscription lifecycle (spec sections 5.2, 6.1): start, first invoice,
 //! activation and expiry of unpaid starts.
 
-use serde_json::{Value, json};
-
 use crate::engine::store::StoredObject;
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::generate::billing::{
@@ -15,58 +13,75 @@ use crate::model::customer::{deleted_stub, random_metadata_value};
 use crate::model::embedded::embedded_list;
 use crate::model::invoice::{BillingReason, LineSpec};
 use crate::model::subscription::{
-    NewItem, NewSubscription, add_intervals, item_json, items_url, period_end, subscription_json,
+    NewItem, NewSubscription, add_intervals, items_url, new_item, new_subscription, period_end,
+    price_interval,
 };
 use crate::rng::SimRng;
+use crate::stripe::{
+    Expandable, List, Price, Subscription, SubscriptionItem, SubscriptionStatus as Status,
+};
 use crate::{MockError, ObjectType, RenewMode, SimTime};
 
 /// How long an unpaid first invoice keeps a subscription `incomplete`.
 const INCOMPLETE_EXPIRY_MS: i64 = 23 * 3_600_000;
 
-pub(crate) fn sub_status(engine: &Engine, id: &str) -> Option<String> {
+/// A subscription's status, read without deserializing the whole subscription.
+pub(crate) fn sub_status(engine: &Engine, id: &str) -> Option<Status> {
     engine
         .latest(ObjectType::Subscription, id)
-        .and_then(|u| u.state["status"].as_str().map(str::to_string))
+        .and_then(|u| serde_json::from_value(u.state["status"].clone()).ok())
+}
+
+fn latest_sub(engine: &Engine, id: &str) -> Subscription {
+    engine
+        .latest_obj(ObjectType::Subscription, id)
+        .expect("subscriptions are never hard-deleted")
 }
 
 /// Applies `f` to a subscription.
 pub(crate) fn update_sub(
     engine: &mut Engine,
     id: &str,
-    f: impl FnOnce(&mut Value),
+    f: impl FnOnce(&mut Subscription),
     kind: ChangeKind,
     events: &[&str],
     cause: &Cause,
 ) {
     engine
-        .update(ObjectType::Subscription, id, f, cause.clone(), kind, events)
+        .update_obj(ObjectType::Subscription, id, f, cause.clone(), kind, events)
         .expect("subscriptions are never hard-deleted");
 }
 
 /// Live items of a subscription, in creation order.
-pub(crate) fn items(engine: &Engine, sub: &str) -> Vec<Value> {
+pub(crate) fn items(engine: &Engine, sub: &str) -> Vec<SubscriptionItem> {
     engine
         .store()
         .children(ObjectType::SubscriptionItem, "subscription", sub)
         .into_iter()
         .filter(|o| !o.deleted)
-        .map(|o| o.latest.state.clone())
+        .map(|o| {
+            engine
+                .latest_obj(ObjectType::SubscriptionItem, &o.latest.object_id)
+                .expect("listed item exists")
+        })
         .collect()
 }
 
 /// The subscription's `items` list rendered from its item objects.
-pub(crate) fn rendered_items(engine: &Engine, sub: &str, page_size: usize) -> Value {
+pub(crate) fn rendered_items(
+    engine: &Engine,
+    sub: &str,
+    page_size: usize,
+) -> List<SubscriptionItem> {
     embedded_list(&items(engine, sub), page_size, &items_url(sub))
 }
 
-fn price_state(engine: &Engine, id: &str) -> Option<Value> {
-    engine
-        .latest(ObjectType::Price, id)
-        .map(|u| u.state.clone())
+fn price_state(engine: &Engine, id: &str) -> Option<Price> {
+    engine.latest_obj(ObjectType::Price, id)
 }
 
-fn interval(price: &Value) -> Option<&str> {
-    price["recurring"]["interval"].as_str()
+fn interval(price: &Price) -> Option<&'static str> {
+    price_interval(price)
 }
 
 /// Validates named prices: active, recurring, one currency and interval.
@@ -77,12 +92,12 @@ fn check_prices(engine: &Engine, ids: &[String]) -> Result<(), MockError> {
             object_type: ObjectType::Price,
             id: id.clone(),
         })?;
-        if p["active"] != json!(true) || interval(&p).is_none() {
+        if !p.active || interval(&p).is_none() {
             return Err(MockError::InvalidAction(format!(
                 "price {id} must be active and recurring"
             )));
         }
-        let k = (p["currency"].clone(), p["recurring"]["interval"].clone());
+        let k = (p.currency.clone(), interval(&p));
         if key.get_or_insert(k.clone()) != &k {
             return Err(MockError::InvalidAction(
                 "all prices of a subscription need one currency and interval".to_string(),
@@ -117,9 +132,8 @@ fn choose_prices(rng: &mut SimRng, engine: &mut Engine, cause: &Cause) -> Vec<St
     let mut pool: Vec<String> = recurring
         .into_iter()
         .filter(|id| {
-            price_state(engine, id).is_some_and(|p| {
-                p["currency"] == first["currency"] && interval(&p) == interval(&first)
-            })
+            price_state(engine, id)
+                .is_some_and(|p| p.currency == first.currency && interval(&p) == interval(&first))
         })
         .collect();
     let n = if rng.chance(0.05) {
@@ -161,14 +175,14 @@ pub(crate) fn start_subscription(
     let sub_id = rng.id(ObjectType::Subscription.id_prefix());
     let now = engine.now().unix_seconds();
     let mut item_states = Vec::new();
-    let mut currency = Value::Null;
+    let mut currency = String::new();
     for price_id in &prices {
         let price = price_state(engine, price_id).expect("checked price");
-        currency = price["currency"].clone();
+        currency = price.currency.clone();
         let id = rng.id(ObjectType::SubscriptionItem.id_prefix());
         let quantity = 1 + rng.below(5);
         let end = period_end(now, interval(&price).expect("recurring"));
-        let state = item_json(&NewItem {
+        let item = new_item(&NewItem {
             id: &id,
             subscription: &sub_id,
             price: &price,
@@ -176,16 +190,10 @@ pub(crate) fn start_subscription(
             created: now,
             period: (now, end),
         });
-        engine.create(
-            ObjectType::SubscriptionItem,
-            id,
-            state.clone(),
-            cause.clone(),
-            &[],
-        );
-        item_states.push(state);
+        engine.create_obj(ObjectType::SubscriptionItem, id, &item, cause.clone(), &[]);
+        item_states.push(item);
     }
-    let state = subscription_json(&NewSubscription {
+    let sub = new_subscription(&NewSubscription {
         id: &sub_id,
         customer: &customer,
         currency: &currency,
@@ -193,10 +201,10 @@ pub(crate) fn start_subscription(
         created: now,
         page_size: ctx.page_size,
     });
-    engine.create(
+    engine.create_obj(
         ObjectType::Subscription,
         sub_id.clone(),
-        state,
+        &sub,
         cause.clone(),
         &["customer.subscription.created"],
     );
@@ -214,13 +222,10 @@ pub(crate) fn item_lines(engine: &Engine, sub: &str) -> (Vec<LineSpec>, (i64, i6
     let lines: Vec<LineSpec> = items
         .iter()
         .map(|i| LineSpec {
-            price: i["price"]["id"].as_str().expect("item price").to_string(),
-            quantity: i["quantity"].as_u64().unwrap_or(1),
-            subscription_item: i["id"].as_str().map(str::to_string),
-            period: (
-                i["current_period_start"].as_i64().unwrap_or(0),
-                i["current_period_end"].as_i64().unwrap_or(0),
-            ),
+            price: i.price.id.clone(),
+            quantity: i.quantity.unwrap_or(1) as u64,
+            subscription_item: Some(i.id.clone()),
+            period: (i.current_period_start, i.current_period_end),
         })
         .collect();
     let period = lines.first().map_or((0, 0), |l| l.period);
@@ -235,13 +240,7 @@ pub(crate) fn invoice_subscription(
     reason: BillingReason,
     cause: &Cause,
 ) -> String {
-    let customer = engine
-        .latest(ObjectType::Subscription, sub)
-        .expect("sub")
-        .state["customer"]
-        .as_str()
-        .expect("customer id")
-        .to_string();
+    let customer = latest_sub(engine, sub).customer.id().to_string();
     let (lines, period) = item_lines(engine, sub);
     let invoice = create_draft_invoice(
         engine,
@@ -257,7 +256,7 @@ pub(crate) fn invoice_subscription(
     update_sub(
         engine,
         sub,
-        |v| v["latest_invoice"] = json!(id),
+        |s| s.latest_invoice = Some(Some(Expandable::Id(id))),
         ChangeKind::Updated,
         &["customer.subscription.updated"],
         cause,
@@ -266,26 +265,25 @@ pub(crate) fn invoice_subscription(
 }
 
 /// Sets a subscription's status (`customer.subscription.deleted` for terminal ones).
-pub(crate) fn set_status(engine: &mut Engine, sub: &str, status: &str, cause: &Cause) {
+pub(crate) fn set_status(engine: &mut Engine, sub: &str, status: Status, cause: &Cause) {
     let now = engine.now().unix_seconds();
-    let terminal = matches!(status, "canceled" | "incomplete_expired");
+    let terminal = matches!(status, Status::Canceled | Status::IncompleteExpired);
     let event = if terminal {
         "customer.subscription.deleted"
     } else {
         "customer.subscription.updated"
     };
-    let status = status.to_string();
     update_sub(
         engine,
         sub,
-        |v| {
+        |s| {
             if terminal {
-                v["ended_at"] = json!(now);
-                if status == "canceled" {
-                    v["canceled_at"] = json!(now);
+                s.ended_at = Some(Some(now));
+                if status == Status::Canceled {
+                    s.canceled_at = Some(Some(now));
                 }
             }
-            v["status"] = json!(status);
+            s.status = status;
         },
         ChangeKind::StateChanged,
         &[event],
@@ -297,7 +295,7 @@ pub(crate) fn set_status(engine: &mut Engine, sub: &str, status: &str, cause: &C
 pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut Ctx) {
     match c {
         Continuation::SubscriptionInvoice { sub } => {
-            if sub_status(engine, &sub).as_deref() != Some("incomplete") {
+            if sub_status(engine, &sub) != Some(Status::Incomplete) {
                 return;
             }
             let invoice =
@@ -309,7 +307,7 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
             );
         }
         Continuation::FinalizeFirstInvoice { sub, invoice } => {
-            if sub_status(engine, &sub).as_deref() != Some("incomplete") {
+            if sub_status(engine, &sub) != Some(Status::Incomplete) {
                 delete_draft(engine, &invoice, &cause);
                 return;
             }
@@ -322,11 +320,11 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
             }
         }
         Continuation::PayFirstInvoice { sub, invoice } => {
-            if sub_status(engine, &sub).as_deref() != Some("incomplete") {
+            if sub_status(engine, &sub) != Some(Status::Incomplete) {
                 return;
             }
             if attempt_payment(engine, ctx, &invoice, &cause) {
-                set_status(engine, &sub, "active", &cause);
+                set_status(engine, &sub, Status::Active, &cause);
                 schedule_renewal(engine, ctx, &sub, &cause);
             } else {
                 let at = engine.now().plus_ms(INCOMPLETE_EXPIRY_MS);
@@ -334,25 +332,20 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
             }
         }
         Continuation::ExpireIncomplete { sub, invoice } => {
-            if sub_status(engine, &sub).as_deref() != Some("incomplete") {
+            if sub_status(engine, &sub) != Some(Status::Incomplete) {
                 return;
             }
             void(engine, &invoice, &cause);
-            set_status(engine, &sub, "incomplete_expired", &cause);
+            set_status(engine, &sub, Status::IncompleteExpired, &cause);
         }
         Continuation::Renew { sub } => {
             if !renewable(engine, &sub) || ctx.config.renew_subscription_cycle != RenewMode::Natural
             {
                 return;
             }
-            let cancel = engine
-                .latest(ObjectType::Subscription, &sub)
-                .expect("sub")
-                .state["cancel_at_period_end"]
-                .as_bool()
-                == Some(true);
+            let cancel = latest_sub(engine, &sub).cancel_at_period_end;
             if cancel {
-                set_status(engine, &sub, "canceled", &cause);
+                set_status(engine, &sub, Status::Canceled, &cause);
                 return;
             }
             advance_periods(engine, &sub, &cause);
@@ -360,7 +353,7 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
             update_sub(
                 engine,
                 &sub,
-                |v| v["items"] = rendered,
+                |s| s.items = rendered,
                 ChangeKind::Updated,
                 &["customer.subscription.updated"],
                 &cause,
@@ -389,12 +382,12 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
                 return;
             }
             if attempt_payment(engine, ctx, &invoice, &cause) {
-                if sub_status(engine, &sub).as_deref() == Some("past_due") {
-                    set_status(engine, &sub, "active", &cause);
+                if sub_status(engine, &sub) == Some(Status::PastDue) {
+                    set_status(engine, &sub, Status::Active, &cause);
                 }
             } else {
-                if sub_status(engine, &sub).as_deref() == Some("active") {
-                    set_status(engine, &sub, "past_due", &cause);
+                if sub_status(engine, &sub) == Some(Status::Active) {
+                    set_status(engine, &sub, Status::PastDue, &cause);
                 }
                 let at = engine.now().plus_ms(DUNNING_RETRY_MS);
                 ctx.schedule(at, Continuation::DunningRetry { sub, invoice }, cause);
@@ -412,13 +405,13 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
                 return;
             }
             if attempt_payment(engine, ctx, &invoice, &cause) {
-                if sub_status(engine, &sub).as_deref() == Some("past_due") {
-                    set_status(engine, &sub, "active", &cause);
+                if sub_status(engine, &sub) == Some(Status::PastDue) {
+                    set_status(engine, &sub, Status::Active, &cause);
                 }
             } else {
                 mark_uncollectible(engine, &invoice, &cause);
                 if renewable(engine, &sub) {
-                    set_status(engine, &sub, "canceled", &cause);
+                    set_status(engine, &sub, Status::Canceled, &cause);
                 }
             }
         }
@@ -436,10 +429,7 @@ pub(super) fn schedule_renewal(engine: &Engine, ctx: &mut Ctx, sub: &str, cause:
     if ctx.config.renew_subscription_cycle != RenewMode::Natural {
         return;
     }
-    let Some(end) = items(engine, sub)
-        .first()
-        .and_then(|i| i["current_period_end"].as_i64())
-    else {
+    let Some(end) = items(engine, sub).first().map(|i| i.current_period_end) else {
         return;
     };
     ctx.schedule(
@@ -453,39 +443,30 @@ pub(super) fn schedule_renewal(engine: &Engine, ctx: &mut Ctx, sub: &str, cause:
 
 pub(super) fn renewable(engine: &Engine, sub: &str) -> bool {
     matches!(
-        sub_status(engine, sub).as_deref(),
-        Some("active" | "past_due")
+        sub_status(engine, sub),
+        Some(Status::Active | Status::PastDue)
     )
 }
 
 /// Moves every item to its next period (unannounced), counted from the anchor.
 fn advance_periods(engine: &mut Engine, sub: &str, cause: &Cause) {
-    let anchor = engine
-        .latest(ObjectType::Subscription, sub)
-        .expect("sub")
-        .state["billing_cycle_anchor"]
-        .as_i64()
-        .unwrap_or(0);
+    let anchor = latest_sub(engine, sub).billing_cycle_anchor;
     for item in items(engine, sub) {
-        let old_end = item["current_period_end"].as_i64().unwrap_or(anchor);
-        let interval = item["price"]["recurring"]["interval"]
-            .as_str()
-            .unwrap_or("month")
-            .to_string();
+        let old_end = item.current_period_end;
+        let interval = interval(&item.price).unwrap_or("month");
         let mut n = 1;
-        let mut new_end = add_intervals(anchor, &interval, n);
+        let mut new_end = add_intervals(anchor, interval, n);
         while new_end <= old_end {
             n += 1;
-            new_end = add_intervals(anchor, &interval, n);
+            new_end = add_intervals(anchor, interval, n);
         }
-        let id = item["id"].as_str().expect("item id").to_string();
         engine
-            .update(
+            .update_obj::<SubscriptionItem>(
                 ObjectType::SubscriptionItem,
-                &id,
-                |v| {
-                    v["current_period_start"] = json!(old_end);
-                    v["current_period_end"] = json!(new_end);
+                &item.id,
+                |i| {
+                    i.current_period_start = old_end;
+                    i.current_period_end = new_end;
                 },
                 cause.clone(),
                 ChangeKind::Updated,
@@ -534,22 +515,20 @@ pub(crate) fn cancel_subscription(
     let at_period_end = at_period_end.unwrap_or_else(|| rng.below(2) == 0);
     let cause = engine.begin_action("cancel_subscription");
     if at_period_end {
-        let end = items(engine, &sub)
-            .first()
-            .and_then(|i| i["current_period_end"].as_i64());
+        let end = items(engine, &sub).first().map(|i| i.current_period_end);
         update_sub(
             engine,
             &sub,
-            |v| {
-                v["cancel_at_period_end"] = json!(true);
-                v["cancel_at"] = json!(end);
+            |s| {
+                s.cancel_at_period_end = true;
+                s.cancel_at = Some(end);
             },
             ChangeKind::Updated,
             &["customer.subscription.updated"],
             &cause,
         );
     } else {
-        set_status(engine, &sub, "canceled", &cause);
+        set_status(engine, &sub, Status::Canceled, &cause);
     }
     Ok(Some(cause))
 }
@@ -583,9 +562,11 @@ pub(crate) fn delete_customer_cascade(
         .map(|o| o.latest.object_id.clone())
         .collect();
     for sub in subs {
-        match sub_status(engine, &sub).as_deref() {
-            Some("active" | "past_due") => set_status(engine, &sub, "canceled", cause),
-            Some("incomplete") => set_status(engine, &sub, "incomplete_expired", cause),
+        match sub_status(engine, &sub) {
+            Some(Status::Active | Status::PastDue) => {
+                set_status(engine, &sub, Status::Canceled, cause)
+            }
+            Some(Status::Incomplete) => set_status(engine, &sub, Status::IncompleteExpired, cause),
             _ => {}
         }
     }
@@ -641,7 +622,9 @@ pub(crate) fn churn_update(rng: &mut SimRng, engine: &mut Engine) {
     update_sub(
         engine,
         &sub,
-        |v| v["metadata"]["note"] = json!(value),
+        |s| {
+            s.metadata.insert("note".to_string(), value);
+        },
         ChangeKind::Updated,
         &["customer.subscription.updated"],
         &cause,

@@ -4,15 +4,15 @@
 //! status and does nothing (returning `false`) when it no longer applies, so a
 //! continuation that lost a race (e.g. its invoice was voided meanwhile) is a no-op.
 
-use serde_json::{Value, json};
-
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::generate::catalog::{active_ids, create_product_now, draw_new_product};
 use crate::generate::{Continuation, Ctx, create_random_customer, pick};
 use crate::model::invoice::{
-    BillingReason, LineSpec, NewInvoice, NewLine, invoice_json, line_json,
+    BillingReason, LineSpec, NewInvoice, NewLine, deleted_invoice, deleted_line, new_invoice,
+    new_line,
 };
 use crate::rng::SimRng;
+use crate::stripe::{Customer, Invoice, InvoiceStatus, Price};
 use crate::{MockError, ObjectType};
 
 /// How a one-off invoice ends.
@@ -48,22 +48,19 @@ pub(crate) fn create_draft_invoice(
 ) -> String {
     let id = ctx.billing.id(ObjectType::Invoice.id_prefix());
     let now = engine.now().unix_seconds();
-    let mut states = Vec::new();
+    let mut lines_out = Vec::new();
     for spec in lines {
         let line_id = ctx.billing.id(ObjectType::InvoiceLineItem.id_prefix());
         let invoice_item = subscription.is_none().then(|| ctx.billing.id("ii"));
-        let price = engine
-            .latest(ObjectType::Price, &spec.price)
-            .expect("billed price exists")
-            .state
-            .clone();
-        let product_name = price["product"]
-            .as_str()
-            .and_then(|p| engine.latest(ObjectType::Product, p))
+        let price: Price = engine
+            .latest_obj(ObjectType::Price, &spec.price)
+            .expect("billed price exists");
+        let product_name = engine
+            .latest(ObjectType::Product, price.product.id())
             .and_then(|p| p.state["name"].as_str())
             .unwrap_or("Item")
             .to_string();
-        let state = line_json(&NewLine {
+        let line = new_line(&NewLine {
             id: &line_id,
             invoice: &id,
             spec,
@@ -72,38 +69,36 @@ pub(crate) fn create_draft_invoice(
             subscription,
             invoice_item: invoice_item.as_deref(),
         });
-        engine.create(
+        engine.create_obj(
             ObjectType::InvoiceLineItem,
             line_id,
-            state.clone(),
+            &line,
             cause.clone(),
             &[],
         );
-        states.push(state);
+        lines_out.push(line);
     }
-    let customer_state = engine
-        .latest(ObjectType::Customer, customer)
-        .expect("billed customer exists")
-        .state
-        .clone();
-    let currency = states
+    let customer: Customer = engine
+        .latest_obj(ObjectType::Customer, customer)
+        .expect("billed customer exists");
+    let currency = lines_out
         .first()
-        .map_or(Value::Null, |l| l["currency"].clone());
-    let state = invoice_json(&NewInvoice {
+        .map_or(String::new(), |l| l.currency.clone());
+    let invoice = new_invoice(&NewInvoice {
         id: &id,
-        customer: &customer_state,
+        customer: &customer,
         currency: &currency,
-        lines: &states,
+        lines: &lines_out,
         reason,
         subscription,
         period,
         created: now,
         page_size: ctx.page_size,
     });
-    engine.create(
+    engine.create_obj(
         ObjectType::Invoice,
         id.clone(),
-        state,
+        &invoice,
         cause.clone(),
         &["invoice.created"],
     );
@@ -114,7 +109,7 @@ fn transition(
     engine: &mut Engine,
     id: &str,
     from: &[&str],
-    f: impl FnOnce(&mut Value),
+    f: impl FnOnce(&mut Invoice),
     kind: ChangeKind,
     events: &[&str],
     cause: &Cause,
@@ -123,7 +118,7 @@ fn transition(
         return false;
     }
     engine
-        .update(ObjectType::Invoice, id, f, cause.clone(), kind, events)
+        .update_obj(ObjectType::Invoice, id, f, cause.clone(), kind, events)
         .expect("live invoice")
         .is_some()
 }
@@ -150,11 +145,12 @@ pub(crate) fn finalize(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
         engine,
         id,
         &["draft"],
-        |v| {
-            v["status"] = json!("open");
-            v["number"] = json!(number);
-            v["effective_at"] = json!(now);
-            v["status_transitions"]["finalized_at"] = json!(now);
+        |i| {
+            i.status = Some(Some(InvoiceStatus::Open));
+            i.number = Some(Some(number));
+            i.effective_at = Some(Some(now));
+            i.ending_balance = Some(Some(i.starting_balance));
+            i.status_transitions.finalized_at = Some(Some(now));
         },
         ChangeKind::StateChanged,
         &["invoice.finalized"],
@@ -182,13 +178,13 @@ pub(crate) fn pay(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
         engine,
         id,
         &["open"],
-        |v| {
-            v["status"] = json!("paid");
-            v["amount_paid"] = v["total"].clone();
-            v["amount_remaining"] = json!(0);
-            v["attempted"] = json!(true);
-            v["attempt_count"] = json!(v["attempt_count"].as_i64().unwrap_or(0) + 1);
-            v["status_transitions"]["paid_at"] = json!(now);
+        |i| {
+            i.status = Some(Some(InvoiceStatus::Paid));
+            i.amount_paid = i.total;
+            i.amount_remaining = 0;
+            i.attempted = true;
+            i.attempt_count += 1;
+            i.status_transitions.paid_at = Some(Some(now));
         },
         ChangeKind::StateChanged,
         &["invoice.paid", "invoice.payment_succeeded"],
@@ -202,9 +198,9 @@ pub(crate) fn fail_payment(engine: &mut Engine, id: &str, cause: &Cause) -> bool
         engine,
         id,
         &["open"],
-        |v| {
-            v["attempted"] = json!(true);
-            v["attempt_count"] = json!(v["attempt_count"].as_i64().unwrap_or(0) + 1);
+        |i| {
+            i.attempted = true;
+            i.attempt_count += 1;
         },
         ChangeKind::Updated,
         &["invoice.payment_failed"],
@@ -219,9 +215,9 @@ pub(crate) fn void(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
         engine,
         id,
         &["open"],
-        |v| {
-            v["status"] = json!("void");
-            v["status_transitions"]["voided_at"] = json!(now);
+        |i| {
+            i.status = Some(Some(InvoiceStatus::Void));
+            i.status_transitions.voided_at = Some(Some(now));
         },
         ChangeKind::StateChanged,
         &["invoice.voided"],
@@ -236,9 +232,9 @@ pub(crate) fn mark_uncollectible(engine: &mut Engine, id: &str, cause: &Cause) -
         engine,
         id,
         &["open"],
-        |v| {
-            v["status"] = json!("uncollectible");
-            v["status_transitions"]["marked_uncollectible_at"] = json!(now);
+        |i| {
+            i.status = Some(Some(InvoiceStatus::Uncollectible));
+            i.status_transitions.marked_uncollectible_at = Some(Some(now));
         },
         ChangeKind::StateChanged,
         &["invoice.marked_uncollectible"],
@@ -263,7 +259,7 @@ pub(crate) fn delete_draft(engine: &mut Engine, id: &str, cause: &Cause) -> bool
             .delete(
                 ObjectType::InvoiceLineItem,
                 &line,
-                json!({"id": line, "object": "line_item", "deleted": true}),
+                deleted_line(&line),
                 cause.clone(),
                 &[],
             )
@@ -273,7 +269,7 @@ pub(crate) fn delete_draft(engine: &mut Engine, id: &str, cause: &Cause) -> bool
         .delete(
             ObjectType::Invoice,
             id,
-            json!({"id": id, "object": "invoice", "deleted": true}),
+            deleted_invoice(id),
             cause.clone(),
             &["invoice.deleted"],
         )
@@ -435,10 +431,15 @@ pub(crate) fn churn_update(rng: &mut SimRng, engine: &mut Engine) {
     let value = crate::model::customer::random_metadata_value(rng);
     let cause = engine.begin_action("invoice_update");
     engine
-        .update(
+        .update_obj::<Invoice>(
             ObjectType::Invoice,
             &id,
-            |v| v["metadata"]["note"] = json!(value),
+            |i| {
+                i.metadata
+                    .get_or_insert_with(|| Some(Default::default()))
+                    .get_or_insert_with(Default::default)
+                    .insert("note".to_string(), value);
+            },
             cause,
             ChangeKind::Updated,
             &["invoice.updated"],
