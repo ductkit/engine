@@ -148,7 +148,7 @@ mod tests {
         config.errors.reset = 0.1;
         let mut f = ApiFaults::new(&config, &RngStreams::new(1));
         let now = Instant::now();
-        let (mut server, mut reset, mut ok) = (0, 0, 0);
+        let (mut server, mut reset, mut ok) = (0i32, 0i32, 0i32);
         for _ in 0..10_000 {
             match f.decide(now).0 {
                 Some(Fault::ServerError) => server += 1,
