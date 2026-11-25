@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::engine::{ChangeKind, StateUpdate};
+use crate::engine::{ChangeKind, Scope, StateUpdate};
 use crate::rng::{RngStreams, SimRng};
 use crate::{Config, EventsConfig, ObjectType, PINNED_API_VERSION, SimTime};
 
@@ -27,6 +27,11 @@ pub(crate) struct EventRecord {
     pub created: SimTime,
     pub visible_at: SimTime,
     pub tiebreak: u64,
+    /// Where the event's object lives (`None` is the platform).
+    pub scope: Scope,
+    /// The Connect label the event carries (`account` / `context`); `None` for the platform.
+    #[allow(dead_code)] // read by the Connect tasks
+    pub account: Option<String>,
     pub object_type: ObjectType,
     pub object_id: String,
     pub object_version: u64,
@@ -201,7 +206,10 @@ impl Projector {
             );
             changes = before_after(prev, &u.state);
         }
-        let snapshot_payload = json!({
+        // The one place an event's Connect label is assigned: it defaults to the
+        // scope its object lives in.
+        let account: Option<String> = u.account.clone();
+        let mut snapshot_payload = json!({
             "id": snapshot_id,
             "object": "event",
             "api_version": PINNED_API_VERSION,
@@ -212,13 +220,16 @@ impl Projector {
             "request": {"id": null, "idempotency_key": null},
             "type": snapshot_type,
         });
+        if let Some(acct) = &account {
+            snapshot_payload["account"] = json!(acct);
+        }
         let thin_payload = json!({
             "id": thin_id,
             "object": "v2.core.event",
             "type": thin_type,
             "created": u.at.to_string(),
             "livemode": false,
-            "context": null,
+            "context": account,
             "reason": null,
             "related_object": {
                 "id": u.object_id,
@@ -236,6 +247,8 @@ impl Projector {
             created: u.at,
             visible_at,
             tiebreak,
+            scope: u.account.clone(),
+            account: account.clone(),
             object_type: u.object_type,
             object_id: u.object_id.clone(),
             object_version: u.version,

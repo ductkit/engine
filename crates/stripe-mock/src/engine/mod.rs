@@ -3,6 +3,9 @@
 pub(crate) mod events;
 pub(crate) mod store;
 
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
 use serde::Serialize;
 use serde_json::Value;
 
@@ -16,6 +19,10 @@ use crate::{Config, MockError, ObjectType, SimTime};
 pub(crate) use events::{EventStore, Projector};
 
 pub(crate) use store::ObjectStore;
+
+/// Which account an object belongs to: `None` is the platform, `Some(acct_...)` a
+/// connected account.
+pub type Scope = Option<String>;
 
 /// What kind of change a [`StateUpdate`] records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -71,7 +78,10 @@ pub(crate) struct Engine {
     next_seq: u64,
     next_action: u64,
     log: Vec<StateUpdate>,
-    store: ObjectStore,
+    /// One object store per account scope; the platform's is keyed `None`.
+    stores: BTreeMap<Scope, ObjectStore>,
+    /// The scope mutations and reads currently apply to.
+    scope: Scope,
     subscribers: Vec<Subscriber>,
     projector: Projector,
     events: EventStore,
@@ -86,7 +96,8 @@ impl Engine {
             next_seq: 1,
             next_action: 1,
             log: Vec::new(),
-            store: ObjectStore::default(),
+            stores: BTreeMap::new(),
+            scope: None,
             subscribers: Vec::new(),
             projector: Projector::new(config, streams),
             events: EventStore::default(),
@@ -143,7 +154,7 @@ impl Engine {
         let latest_version = self
             .events
             .get(&a.event_id)
-            .and_then(|ev| self.store.get(ev.object_type, &ev.object_id))
+            .and_then(|ev| self.store_in(&ev.scope)?.get(ev.object_type, &ev.object_id))
             .map_or(a.object_version, |o| o.latest.version);
         self.deliveries.record_outcome(
             a,
@@ -254,8 +265,8 @@ impl Engine {
     ) -> StateUpdate {
         let created = state["created"].as_i64().unwrap_or(self.now.unix_seconds());
         let update = self.record(t, id, 1, ChangeKind::Created, state, cause, None, events);
-        self.store
-            .insert(update.clone(), created, self.log.len() - 1);
+        let pos = self.log.len() - 1;
+        self.store_mut().insert(update.clone(), created, pos);
         self.notify(&update);
         update
     }
@@ -294,7 +305,8 @@ impl Engine {
             Some(previous),
             events,
         );
-        self.store.replace(update.clone(), self.log.len() - 1);
+        let pos = self.log.len() - 1;
+        self.store_mut().replace(update.clone(), pos);
         self.notify(&update);
         Ok(Some(update))
     }
@@ -320,14 +332,15 @@ impl Engine {
             Some(previous),
             events,
         );
-        self.store.replace(update.clone(), self.log.len() - 1);
+        let pos = self.log.len() - 1;
+        self.store_mut().replace(update.clone(), pos);
         self.notify(&update);
         Ok(update)
     }
 
     /// The object's latest version with `at <= at`; `None` if it did not exist yet.
     pub(crate) fn as_of(&self, t: ObjectType, id: &str, at: SimTime) -> Option<&StateUpdate> {
-        self.store
+        self.store()
             .get(t, id)?
             .versions
             .iter()
@@ -337,19 +350,44 @@ impl Engine {
     }
 
     pub(crate) fn latest(&self, t: ObjectType, id: &str) -> Option<&StateUpdate> {
-        self.store.get(t, id).map(|o| &o.latest)
+        self.store().get(t, id).map(|o| &o.latest)
     }
 
     pub(crate) fn log(&self) -> &[StateUpdate] {
         &self.log
     }
 
+    /// The current scope's store (an empty one if the scope has no objects yet).
     pub(crate) fn store(&self) -> &ObjectStore {
-        &self.store
+        static EMPTY: OnceLock<ObjectStore> = OnceLock::new();
+        self.store_in(&self.scope)
+            .unwrap_or_else(|| EMPTY.get_or_init(ObjectStore::default))
+    }
+
+    pub(crate) fn store_in(&self, scope: &Scope) -> Option<&ObjectStore> {
+        self.stores.get(scope)
+    }
+
+    fn store_mut(&mut self) -> &mut ObjectStore {
+        self.stores.entry(self.scope.clone()).or_default()
+    }
+
+    #[allow(dead_code)] // used by the Connect tasks
+    pub(crate) fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    /// Runs `f` with `scope` as the current scope, then restores the previous one.
+    #[allow(dead_code)] // used by the Connect tasks
+    pub(crate) fn in_scope<R>(&mut self, scope: Scope, f: impl FnOnce(&mut Engine) -> R) -> R {
+        let previous = std::mem::replace(&mut self.scope, scope);
+        let result = f(self);
+        self.scope = previous;
+        result
     }
 
     fn live(&self, t: ObjectType, id: &str) -> Result<&StateUpdate, MockError> {
-        match self.store.get(t, id) {
+        match self.store().get(t, id) {
             None => Err(MockError::NoSuchObject {
                 object_type: t,
                 id: id.to_string(),
@@ -377,7 +415,7 @@ impl Engine {
         let mut update = StateUpdate {
             seq: self.next_seq,
             at: self.now,
-            account: None,
+            account: self.scope.clone(),
             object_type: t,
             object_id: id,
             version,
@@ -407,16 +445,18 @@ impl Engine {
         filter: SubscribeFilter,
         options: &SubscribeOptions,
     ) -> Subscription {
-        let mut types: Vec<ObjectType> = self
-            .store
-            .all_types()
-            .into_iter()
-            .filter(|t| filter.matches(*t))
-            .collect();
-        types.sort();
-        let snapshot = types
-            .into_iter()
-            .flat_map(|t| self.store.in_creation_order(t))
+        let snapshot = self
+            .stores
+            .values()
+            .flat_map(|store| {
+                let mut types: Vec<ObjectType> = store
+                    .all_types()
+                    .into_iter()
+                    .filter(|t| filter.matches(*t))
+                    .collect();
+                types.sort();
+                types.into_iter().flat_map(|t| store.in_creation_order(t))
+            })
             .map(|o| StateUpdate {
                 kind: if o.deleted {
                     ChangeKind::Deleted
@@ -637,6 +677,88 @@ mod tests {
             .map(|o| o.latest.object_id.clone())
             .collect();
         assert_eq!(ids, ["cus_3", "cus_2", "cus_1"]);
+    }
+
+    fn make_customer(e: &mut Engine, id: &str) {
+        let c = e.begin_action("t");
+        e.create(
+            ObjectType::Customer,
+            id.into(),
+            cust(id, 0),
+            c,
+            &["customer.created"],
+        );
+    }
+
+    #[test]
+    fn scoped_writes_are_isolated() {
+        let mut e = test_engine();
+        make_customer(&mut e, "cus_p");
+        e.in_scope(Some("acct_1".into()), |e| make_customer(e, "cus_c"));
+        assert!(e.latest(ObjectType::Customer, "cus_p").is_some());
+        assert!(e.latest(ObjectType::Customer, "cus_c").is_none());
+        e.in_scope(Some("acct_1".into()), |e| {
+            assert!(e.latest(ObjectType::Customer, "cus_c").is_some());
+            assert!(e.latest(ObjectType::Customer, "cus_p").is_none());
+        });
+        let accounts: Vec<_> = e.log().iter().map(|u| u.account.clone()).collect();
+        assert_eq!(accounts, [None, Some("acct_1".to_string())]);
+    }
+
+    #[test]
+    fn in_scope_restores() {
+        let mut e = test_engine();
+        e.in_scope(Some("a".into()), |e| {
+            assert_eq!(e.scope(), &Some("a".to_string()));
+            e.in_scope(Some("b".into()), |e| {
+                assert_eq!(e.scope(), &Some("b".to_string()));
+            });
+            assert_eq!(e.scope(), &Some("a".to_string()));
+        });
+        assert_eq!(e.scope(), &None);
+    }
+
+    #[test]
+    fn connected_event_payloads_carry_account() {
+        let mut e = test_engine();
+        make_customer(&mut e, "cus_p");
+        e.in_scope(Some("acct_1".into()), |e| make_customer(e, "cus_c"));
+        let payload = |id: &str, format: events::EventFormat| {
+            let r = e
+                .events()
+                .all()
+                .iter()
+                .find(|r| r.object_id == id && r.format == format)
+                .unwrap();
+            r.payload.clone()
+        };
+        let snap = payload("cus_c", events::EventFormat::Snapshot);
+        assert_eq!(snap["account"], "acct_1");
+        let thin = payload("cus_c", events::EventFormat::Thin);
+        assert_eq!(thin["context"], "acct_1");
+        let snap = payload("cus_p", events::EventFormat::Snapshot);
+        assert!(snap.get("account").is_none());
+        let thin = payload("cus_p", events::EventFormat::Thin);
+        assert_eq!(thin["context"], Value::Null);
+        let rec = e
+            .events()
+            .all()
+            .iter()
+            .find(|r| r.object_id == "cus_c")
+            .unwrap();
+        assert_eq!(rec.scope, Some("acct_1".to_string()));
+        assert_eq!(rec.account, Some("acct_1".to_string()));
+    }
+
+    #[test]
+    fn as_of_is_scoped() {
+        let mut e = test_engine();
+        e.in_scope(Some("acct_1".into()), |e| make_customer(e, "cus_c"));
+        let at = SimTime(1_000);
+        assert!(e.as_of(ObjectType::Customer, "cus_c", at).is_none());
+        e.in_scope(Some("acct_1".into()), |e| {
+            assert!(e.as_of(ObjectType::Customer, "cus_c", at).is_some());
+        });
     }
 
     #[test]
