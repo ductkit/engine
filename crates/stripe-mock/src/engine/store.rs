@@ -62,6 +62,20 @@ impl ObjectStore {
         }
     }
 
+    /// Objects of `t` (deleted included) whose `parent_field` is `parent_id`,
+    /// in creation order.
+    pub(crate) fn children(
+        &self,
+        t: ObjectType,
+        parent_field: &str,
+        parent_id: &str,
+    ) -> Vec<&StoredObject> {
+        self.in_creation_order(t)
+            .into_iter()
+            .filter(|o| o.latest.state[parent_field].as_str() == Some(parent_id))
+            .collect()
+    }
+
     /// Types that have at least one object.
     pub(crate) fn all_types(&self) -> Vec<ObjectType> {
         self.types.keys().copied().collect()

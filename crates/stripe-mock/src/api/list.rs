@@ -7,6 +7,13 @@ use crate::engine::events::EventRecord;
 use crate::engine::store::StoredObject;
 
 /// Something a list cursor can name.
+/// Decodes a raw query string into ordered pairs.
+pub(crate) fn decode(query: Option<String>) -> Vec<(String, String)> {
+    form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+        .into_owned()
+        .collect()
+}
+
 pub(crate) trait Cursorable {
     fn cursor_id(&self) -> &str;
 }

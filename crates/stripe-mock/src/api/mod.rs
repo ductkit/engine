@@ -1,10 +1,10 @@
 //! Read-only Stripe-compatible HTTP API (spec section 7).
 
-mod customers;
 mod destinations;
 mod events_v1;
 mod events_v2;
 mod list;
+mod resources;
 
 use std::sync::Arc;
 
@@ -87,9 +87,19 @@ impl IntoResponse for ApiError {
 
 /// The router with every route and the request gate.
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
-    Router::new()
-        .route("/v1/customers", get(customers::list))
-        .route("/v1/customers/{id}", get(customers::retrieve))
+    let mut router = Router::new();
+    for r in [
+        &resources::CUSTOMERS,
+        &resources::PRODUCTS,
+        &resources::PRICES,
+        &resources::SUBSCRIPTIONS,
+        &resources::SUBSCRIPTION_ITEMS,
+        &resources::INVOICES,
+    ] {
+        router = resources::routes(router, r);
+    }
+    router
+        .route("/v1/invoices/{id}/lines", get(resources::invoice_lines))
         .route("/v1/events", get(events_v1::list))
         .route("/v1/events/{id}", get(events_v1::retrieve))
         .route("/v1/webhook_endpoints", get(destinations::list_v1))

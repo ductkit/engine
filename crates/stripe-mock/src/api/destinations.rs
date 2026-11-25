@@ -7,7 +7,7 @@ use axum::extract::{RawQuery, State};
 use serde_json::{Value, json};
 
 use crate::api::ApiError;
-use crate::api::customers::decode;
+use crate::api::list::decode;
 use crate::api::list::{Cursorable, paginate, parse_list_params};
 use crate::delivery::Destination;
 use crate::handle::Shared;
