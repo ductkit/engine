@@ -56,6 +56,8 @@ pub struct EventInfo {
     /// The other format's event ID; empty for a thin-only (`v2.`) event.
     pub pair_id: String,
     /// The Connect label: the account the event is about, `None` for the platform's own.
+    /// An Account object's v1 events carry the account here even though its truth-log
+    /// entries (`StateUpdate::account`) are platform scope (spec 10.3).
     pub account: Option<String>,
 }
 
@@ -93,13 +95,19 @@ impl EventStore {
         self.index.get(id).map(|i| &self.records[*i])
     }
 
-    /// Events of `f`, newest `created` first, then tiebreak, then later insertion first.
-    pub(crate) fn list_order(&self, f: EventFormat) -> Vec<&EventRecord> {
+    /// Events of `f` that satisfy `keep`, newest `created` first, then tiebreak, then
+    /// later insertion first. `keep` runs before the sort, so only the events a request
+    /// can see are ordered.
+    pub(crate) fn list_order(
+        &self,
+        f: EventFormat,
+        keep: impl Fn(&EventRecord) -> bool,
+    ) -> Vec<&EventRecord> {
         let mut v: Vec<(usize, &EventRecord)> = self
             .records
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.format == f)
+            .filter(|(_, r)| r.format == f && keep(r))
             .collect();
         v.sort_by(|(ia, a), (ib, b)| {
             b.created
@@ -246,6 +254,21 @@ impl Projector {
         if let Some(acct) = &account {
             snapshot_payload["account"] = json!(acct);
         }
+        // Thin-only `v2.core.account.*` events point at the v2 account resource, which
+        // still serves the account after it closes; the v1 URL would 404.
+        let related = if thin_only && u.object_type == ObjectType::Account {
+            json!({
+                "id": u.object_id,
+                "type": "v2.core.account",
+                "url": format!("/v2/core/accounts/{}", u.object_id),
+            })
+        } else {
+            json!({
+                "id": u.object_id,
+                "type": name,
+                "url": u.object_type.api_path(&u.object_id),
+            })
+        };
         let thin_payload = json!({
             "id": thin_id,
             "object": "v2.core.event",
@@ -254,11 +277,7 @@ impl Projector {
             "livemode": false,
             "context": account,
             "reason": null,
-            "related_object": {
-                "id": u.object_id,
-                "type": name,
-                "url": u.object_type.api_path(&u.object_id),
-            },
+            "related_object": related,
             "snapshot_event": (!thin_only).then_some(&snapshot_id),
             "changes": changes,
             "data": null,

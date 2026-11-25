@@ -29,7 +29,7 @@ pub use delivery::{
     SignatureFault,
 };
 pub use engine::events::{EventFormat, EventInfo};
-pub use engine::{Cause, ChangeKind, EventRefs, StateUpdate};
+pub use engine::{Cause, ChangeKind, EventRefs, Scope, StateUpdate};
 pub use error::MockError;
 pub use generate::{Action, InvoiceOutcome};
 pub use handle::{AccountHandle, AccountInfo, MockStripe};

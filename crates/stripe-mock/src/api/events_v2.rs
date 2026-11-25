@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::SimTime;
 use crate::api::events_v1::type_matches;
 use crate::api::list::decode;
-use crate::api::{ApiError, RequestScope};
+use crate::api::{ApiError, RequestScope, ensure_connected};
 use crate::engine::events::{EventFormat, EventRecord};
 use crate::handle::Shared;
 
@@ -179,13 +179,12 @@ pub(crate) async fn list(
     let q = parse_query(decode(query))?;
     let sim = shared.lock();
     let engine = &sim.engine;
+    ensure_connected(engine, &scope)?;
     let (now, retention) = (engine.now(), engine.retention_ms());
     let store = engine.events();
-    let filtered: Vec<&EventRecord> = store
-        .list_order(EventFormat::Thin)
-        .into_iter()
-        .filter(|r| r.account == scope && store.is_listed(r, now, retention) && matches(&q, r))
-        .collect();
+    let filtered: Vec<&EventRecord> = store.list_order(EventFormat::Thin, |r| {
+        r.account == scope && store.is_listed(r, now, retention) && matches(&q, r)
+    });
     let ids: Vec<&str> = filtered.iter().map(|r| r.id.as_str()).collect();
     let (start, end) =
         window(&ids, q.limit, q.dir.as_deref(), q.cursor.as_deref()).ok_or_else(|| {
@@ -218,6 +217,7 @@ pub(crate) async fn retrieve(
 ) -> Result<Json<Value>, ApiError> {
     let sim = shared.lock();
     let engine = &sim.engine;
+    ensure_connected(engine, &scope)?;
     let store = engine.events();
     match store.get(&id) {
         Some(r)

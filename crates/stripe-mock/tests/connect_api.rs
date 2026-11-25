@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use common::{get, get_as, get_ctx, get_with, mock_with};
 use ductkit_stripe_mock::{
-    AccountApi, AccountKind, Action, Configuration, MockStripe, NewCustomer,
+    AccountApi, AccountKind, Action, Configuration, EventFormat, MockStripe, NewCustomer,
 };
 use serde_json::Value;
 
@@ -439,4 +439,124 @@ async fn destinations_are_platform_only() {
     assert_eq!(s, 200);
     assert!(ids(&v).is_empty(), "{v}");
     assert!(v["next_page_url"].is_null());
+}
+
+const LATENCY: &str =
+    "[accounts]\nconnect = true\n[api]\nlatency = { distribution = \"fixed\", ms = 300 }";
+
+/// Starts `GET path` scoped to `acct` (`ctx` picks `Stripe-Context`) in a task, then
+/// disconnects `acct` 100 ms in, inside the 300 ms latency window. Returns the response.
+async fn disconnect_during_latency(
+    m: &MockStripe,
+    path: &str,
+    acct: &str,
+    ctx: bool,
+) -> (u16, Value) {
+    let header = if ctx {
+        "Stripe-Context"
+    } else {
+        "Stripe-Account"
+    };
+    let req = reqwest::Client::new()
+        .get(format!("{}{path}", m.api_url()))
+        .bearer_auth("sk_test_mock")
+        .header(header, acct);
+    let task = tokio::spawn(async move { req.send().await.expect("request sent") });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    m.disconnect_account(acct).unwrap();
+    json_of(task.await.unwrap()).await
+}
+
+#[tokio::test]
+async fn disconnect_during_latency_is_403() {
+    let m = mock_with(LATENCY).await;
+    let a = m.connect_account(AccountApi::V1).unwrap();
+    let c = customer(&m, &a);
+    let (s, v) = disconnect_during_latency(&m, "/v1/events", &a, false).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (403, Some("account_invalid"))
+    );
+
+    let b = m.connect_account(AccountApi::V1).unwrap();
+    let _ = customer(&m, &b);
+    let (s, v) = disconnect_during_latency(&m, "/v2/core/events", &b, true).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (403, Some("account_invalid"))
+    );
+
+    let d = m.connect_account(AccountApi::V1).unwrap();
+    let dc = customer(&m, &d);
+    let (s, v) = disconnect_during_latency(&m, &format!("/v1/customers/{dc}"), &d, false).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (403, Some("account_invalid"))
+    );
+
+    let e = m.connect_account(AccountApi::V1).unwrap();
+    let ev = m
+        .event_timeline()
+        .into_iter()
+        .find(|x| x.account.as_deref() == Some(&*e) && x.format == EventFormat::Snapshot)
+        .unwrap();
+    let (s, v) = disconnect_during_latency(&m, &format!("/v1/events/{}", ev.id), &e, false).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (403, Some("account_invalid"))
+    );
+
+    let f = m.connect_account(AccountApi::V1).unwrap();
+    let ev = m
+        .event_timeline()
+        .into_iter()
+        .find(|x| x.account.as_deref() == Some(&*f) && x.format == EventFormat::Thin)
+        .unwrap();
+    let (s, v) =
+        disconnect_during_latency(&m, &format!("/v2/core/events/{}", ev.id), &f, true).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (403, Some("account_invalid"))
+    );
+    let _ = c;
+}
+
+#[tokio::test]
+async fn events_pages_after_disconnect_are_403() {
+    let m = mock_with(CONNECT).await;
+    let a = m.connect_account(AccountApi::V1).unwrap();
+    for _ in 0..4 {
+        customer(&m, &a);
+    }
+    let (s, v) = json_of(get_as(&m, "/v1/events?limit=2", &a).await).await;
+    assert_eq!((s, v["has_more"].clone()), (200, Value::from(true)));
+    let last = ids(&v).pop().unwrap();
+    let (s, v) = json_of(get_ctx(&m, "/v2/core/events?limit=2", &a).await).await;
+    assert_eq!(s, 200);
+    let next = v["next_page_url"].as_str().unwrap().to_string();
+    m.disconnect_account(&a).unwrap();
+    let r = get_as(&m, &format!("/v1/events?limit=2&starting_after={last}"), &a).await;
+    assert_eq!(r.status(), 403);
+    let r = get_ctx(&m, &next, &a).await;
+    assert_eq!(r.status(), 403);
+}
+
+#[tokio::test]
+async fn v2_accounts_cursor_survives_disconnect() {
+    let m = mock_with(CONNECT).await;
+    let made: Vec<String> = (0..4)
+        .map(|_| m.connect_account(AccountApi::V2).unwrap())
+        .collect();
+    let (s, v) = json_of(get(&m, "/v2/core/accounts?limit=2").await).await;
+    assert_eq!(s, 200);
+    let page1 = ids(&v);
+    assert_eq!(page1, vec![made[3].clone(), made[2].clone()]);
+    let next = v["next_page_url"].as_str().unwrap().to_string();
+    m.disconnect_account(&made[2]).unwrap();
+    let (s, v) = json_of(get(&m, &next).await).await;
+    assert_eq!(s, 200);
+    assert_eq!(ids(&v), vec![made[1].clone(), made[0].clone()]);
+    // Walking back from the closed cursor works too.
+    let (s, v) = json_of(get(&m, "/v2/core/accounts?limit=2").await).await;
+    assert_eq!((s, ids(&v)), (200, vec![made[3].clone(), made[1].clone()]));
 }

@@ -342,6 +342,7 @@ async fn retrieve(
         paths.push(value);
     }
     let mut sim = shared.lock();
+    ensure_connected(&sim.engine, &scope)?;
     let at = stale_at(&mut sim);
     let view = View {
         engine: &sim.engine,
@@ -362,6 +363,7 @@ pub(crate) async fn invoice_lines(
 ) -> Result<Json<Value>, ApiError> {
     let p = parse_list_params(decode(query), &[], &["expand"])?;
     let mut sim = shared.lock();
+    ensure_connected(&sim.engine, &scope)?;
     let at = stale_at(&mut sim);
     let view = View {
         engine: &sim.engine,

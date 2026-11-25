@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::api::list::decode;
 use crate::api::list::{paginate, parse_list_params};
-use crate::api::{ApiError, RequestScope};
+use crate::api::{ApiError, RequestScope, ensure_connected};
 use crate::engine::Engine;
 use crate::engine::events::{EventFormat, EventRecord};
 use crate::handle::Shared;
@@ -72,6 +72,7 @@ pub(crate) async fn list(
     };
     let sim = shared.lock();
     let engine = &sim.engine;
+    ensure_connected(engine, &scope)?;
     let (now, retention) = (engine.now(), engine.retention_ms());
     let store = engine.events();
     for (param, cursor) in [
@@ -89,13 +90,13 @@ pub(crate) async fn list(
             }
         }
     }
-    let ordered = store.list_order(EventFormat::Snapshot);
+    let ordered = store.list_order(EventFormat::Snapshot, |r| {
+        r.account == scope && store.is_listed(r, now, retention)
+    });
     let (page, has_more) = paginate(
         &ordered,
         |r| {
-            r.account == scope
-                && store.is_listed(r, now, retention)
-                && p.created.matches(r.created.unix_seconds())
+            p.created.matches(r.created.unix_seconds())
                 && single
                     .as_deref()
                     .is_none_or(|t| type_matches(t, &r.event_type))
@@ -122,6 +123,7 @@ pub(crate) async fn retrieve(
 ) -> Result<Json<Value>, ApiError> {
     let sim = shared.lock();
     let engine = &sim.engine;
+    ensure_connected(engine, &scope)?;
     let store = engine.events();
     match store.get(&id) {
         Some(r)

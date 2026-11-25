@@ -11,7 +11,7 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::api::events_v2::{decode_token, encode_token, window};
+use crate::api::events_v2::{decode_token, encode_token};
 use crate::api::list::decode;
 use crate::api::resources::{View, stale_at};
 use crate::api::{ApiError, RequestScope};
@@ -167,43 +167,61 @@ pub(crate) async fn list_v2(
         at,
         scope,
     };
-    let mut items: Vec<(&str, &StateUpdate, &AccountMeta, bool)> = Vec::new();
+    // Every account in list order; `item` is set for those this view shows and the
+    // filters keep. The cursor is located among all accounts, so it survives the
+    // account closing or the view predating it.
+    type Item<'a> = (&'a StateUpdate, &'a AccountMeta, bool);
+    let mut entries: Vec<(&str, Option<Item>)> = Vec::new();
     for o in view.store().list_order(ObjectType::Account) {
-        let (Some((u, closed)), Some(meta)) = (
-            live_version(&view, o),
-            view.engine.account_meta(&o.latest.object_id),
-        ) else {
-            continue;
+        let id = o.latest.object_id.as_str();
+        let item = match (live_version(&view, o), view.engine.account_meta(id)) {
+            (Some((u, closed)), Some(meta)) => {
+                let configured = q.applied_configurations.is_empty()
+                    || meta
+                        .configurations
+                        .iter()
+                        .any(|c| q.applied_configurations.iter().any(|w| w == c.as_str()));
+                (closed == q.closed && configured).then_some((u, meta, closed))
+            }
+            _ => None,
         };
-        let configured = q.applied_configurations.is_empty()
-            || meta
-                .configurations
-                .iter()
-                .any(|c| q.applied_configurations.iter().any(|w| w == c.as_str()));
-        if closed == q.closed && configured {
-            items.push((&o.latest.object_id, u, meta, closed));
-        }
+        entries.push((id, item));
     }
-    let ids: Vec<&str> = items.iter().map(|(id, ..)| *id).collect();
-    let (start, end) =
-        window(&ids, q.limit, q.dir.as_deref(), q.cursor.as_deref()).ok_or_else(|| {
-            let cursor = q.cursor.as_deref().unwrap_or_default();
+    let pos = match q.cursor.as_deref() {
+        None => None,
+        Some(c) => Some(entries.iter().position(|(id, _)| *id == c).ok_or_else(|| {
             bad(
-                format!("No such account: '{cursor}'"),
+                format!("No such account: '{c}'"),
                 "resource_missing",
                 "page",
             )
-        })?;
-    let page = &items[start..end];
-    let next = (end < items.len())
-        .then(|| page.last().map(|(id, ..)| page_url(&q, "after", id)))
-        .flatten();
-    let previous = (q.cursor.is_some() && start > 0)
-        .then(|| page.first().map(|(id, ..)| page_url(&q, "before", id)))
-        .flatten();
+        })?),
+    };
+    let kept = |range: std::ops::Range<usize>| -> Vec<usize> {
+        range.filter(|i| entries[*i].1.is_some()).collect()
+    };
+    let n = entries.len();
+    let picked: Vec<usize> = match (q.dir.as_deref(), pos) {
+        (Some("before"), Some(p)) => {
+            let before = kept(0..p);
+            before[before.len().saturating_sub(q.limit)..].to_vec()
+        }
+        (Some(_), Some(p)) => kept(p + 1..n).into_iter().take(q.limit).collect(),
+        _ => kept(0..n).into_iter().take(q.limit).collect(),
+    };
+    let page: Vec<(&StateUpdate, &AccountMeta, bool)> =
+        picked.iter().filter_map(|i| entries[*i].1).collect();
+    let next = picked
+        .last()
+        .filter(|last| !kept(**last + 1..n).is_empty())
+        .map(|last| page_url(&q, "after", entries[*last].0));
+    let previous = picked
+        .first()
+        .filter(|first| !kept(0..**first).is_empty())
+        .map(|first| page_url(&q, "before", entries[*first].0));
     let data: Vec<Value> = page
         .iter()
-        .map(|(_, u, meta, closed)| account::v2_view(&u.state, meta, *closed))
+        .map(|(u, meta, closed)| account::v2_view(&u.state, meta, *closed))
         .collect();
     Ok(Json(json!({
         "data": data,

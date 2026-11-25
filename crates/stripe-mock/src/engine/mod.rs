@@ -60,7 +60,9 @@ pub struct StateUpdate {
     /// Global, gap-free, starting at 1.
     pub seq: u64,
     pub at: SimTime,
-    /// `None` for the platform account.
+    /// The scope the object lives in; `None` for the platform account. An Account
+    /// object's own entries are platform scope (`None`), although its v1 events carry
+    /// the account as their `EventInfo::account` label (spec 10.3).
     pub account: Option<String>,
     pub object_type: ObjectType,
     pub object_id: String,

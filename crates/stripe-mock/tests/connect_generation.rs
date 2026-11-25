@@ -425,3 +425,33 @@ async fn account_handle_scopes_writes() {
         Err(MockError::UnknownAccount(_))
     ));
 }
+
+#[tokio::test]
+async fn v2_account_events_point_at_the_v2_resource() {
+    let m = mock_with(CONNECT).await;
+    let id = m.connect_account(AccountApi::V2).unwrap();
+    // v1-prefixed account events keep the v1 resource (fetched while connected).
+    let auth = events_of(&m, &id)
+        .into_iter()
+        .find(|e| e.event_type == "v1.account.application.authorized")
+        .unwrap();
+    let body = payload(get_ctx(&m, &format!("/v2/core/events/{}", auth.id), &id).await).await;
+    assert_eq!(body["related_object"]["type"], "account");
+    assert_eq!(
+        body["related_object"]["url"],
+        format!("/v1/accounts/{id}").as_str()
+    );
+    m.disconnect_account(&id).unwrap();
+    let evs = events_of(&m, &id);
+    let url = format!("/v2/core/accounts/{id}");
+    for ty in ["v2.core.account.created", "v2.core.account.closed"] {
+        let e = evs.iter().find(|e| e.event_type == ty).unwrap();
+        let body = payload(common::get(&m, &format!("/v2/core/events/{}", e.id)).await).await;
+        let rel = &body["related_object"];
+        assert_eq!(rel["id"], id.as_str(), "{ty}");
+        assert_eq!(rel["type"], "v2.core.account", "{ty}");
+        assert_eq!(rel["url"], url.as_str(), "{ty}");
+        let acct = payload(common::get(&m, rel["url"].as_str().unwrap()).await).await;
+        assert_eq!(acct["closed"], true, "{ty}");
+    }
+}
