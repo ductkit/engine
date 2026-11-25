@@ -10,40 +10,38 @@ use crate::MockError;
 /// The only Stripe API version the mock serves (spec section 7.1).
 pub const PINNED_API_VERSION: &str = "2026-11-18.endive";
 
-/// Top-level spec sections that phase 1 does not implement yet.
-const UNIMPLEMENTED_SECTIONS: [&str; 3] = ["accounts", "history", "payloads"];
+/// Top-level spec sections that are not implemented yet.
+const UNIMPLEMENTED_SECTIONS: [&str; 2] = ["accounts", "history"];
 
-/// Spec keys inside sections phase 1 does support, but that phase 1 does not implement.
-const UNIMPLEMENTED_KEYS: [(&str, &[&str]); 3] = [
-    ("api", &["latency", "rate_limit", "errors", "stale_read"]),
+/// Spec keys inside supported sections that are not implemented yet, with an
+/// optional reason appended to the error.
+const UNIMPLEMENTED_KEYS: [(&str, &[&str], &str); 2] = [
+    (
+        "api",
+        &["latency", "rate_limit", "errors", "stale_read"],
+        "",
+    ),
     (
         "actions",
-        &[
-            "start_subscription",
-            "cancel_subscription",
-            "renew_subscription_cycle",
-            "one_off_payment",
-            "refund",
-            "dispute",
-            "catalog_change",
-        ],
+        &["one_off_payment", "refund", "dispute"],
+        " (needs payment objects, phase 7)",
     ),
-    ("churn", &["product", "price", "subscription", "invoice"]),
 ];
 
-/// The first spec section or key that phase 1 does not implement, e.g. `[webhooks]` or `api.latency`.
+/// The first spec section or key that is not implemented, e.g. `[history]` or
+/// `api.latency`, with its reason.
 fn first_unimplemented(table: &toml::Table) -> Option<String> {
     if let Some(section) = UNIMPLEMENTED_SECTIONS
         .iter()
         .find(|s| table.contains_key(**s))
     {
-        return Some(format!("[{section}]"));
+        return Some(format!("`[{section}]` is not implemented yet"));
     }
-    for (section, keys) in UNIMPLEMENTED_KEYS {
+    for (section, keys, reason) in UNIMPLEMENTED_KEYS {
         if let Some(inner) = table.get(section).and_then(|v| v.as_table())
             && let Some(key) = keys.iter().find(|k| inner.contains_key(**k))
         {
-            return Some(format!("{section}.{key}"));
+            return Some(format!("`{section}.{key}` is not implemented yet{reason}"));
         }
     }
     None
@@ -65,6 +63,7 @@ pub struct Config {
     pub event_retention: EventRetentionConfig,
     pub webhooks: WebhooksConfig,
     pub destinations: Vec<DestinationConfig>,
+    pub payloads: PayloadsConfig,
 }
 
 /// How simulated time moves.
@@ -97,11 +96,50 @@ pub struct ApiConfig {
     pub keys: Vec<String>,
 }
 
-/// Business action rates.
+/// Business action rates (per simulated hour) and action shaping (spec section 6).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ActionsConfig {
     pub new_customer: f64,
+    pub start_subscription: f64,
+    pub cancel_subscription: f64,
+    pub catalog_change: f64,
+    pub one_off_invoice: f64,
+    pub renew_subscription_cycle: RenewMode,
+    /// Gap between consecutive steps of one action.
+    pub step_delay: Distribution,
+    /// Chance that an invoice payment attempt fails.
+    pub payment_failure_probability: f64,
+}
+
+impl ActionsConfig {
+    pub(crate) fn validate(&self) -> Result<(), MockError> {
+        for (name, rate) in [
+            ("actions.new_customer", self.new_customer),
+            ("actions.start_subscription", self.start_subscription),
+            ("actions.cancel_subscription", self.cancel_subscription),
+            ("actions.catalog_change", self.catalog_change),
+            ("actions.one_off_invoice", self.one_off_invoice),
+        ] {
+            check_rate(name, rate)?;
+        }
+        self.step_delay.validate("actions.step_delay")?;
+        check_probability(
+            "actions.payment_failure_probability",
+            self.payment_failure_probability,
+        )
+    }
+}
+
+/// Whether subscriptions renew at the end of each billing period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RenewMode {
+    /// Renew at each period end.
+    #[default]
+    Natural,
+    /// Never renew.
+    Off,
 }
 
 /// Per-type churn rates.
@@ -109,6 +147,41 @@ pub struct ActionsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ChurnConfig {
     pub customer: CustomerChurn,
+    pub product: CatalogChurn,
+    pub price: CatalogChurn,
+    pub subscription: UpdateChurn,
+    pub invoice: UpdateChurn,
+}
+
+/// Churn for catalog objects, which archive instead of deleting.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CatalogChurn {
+    pub update: f64,
+    pub archive: f64,
+}
+
+/// Churn that only updates (metadata).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateChurn {
+    pub update: f64,
+}
+
+/// Shape of rendered payloads.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PayloadsConfig {
+    /// Embedded lists show at most this many entries (1..=100).
+    pub nested_list_page_size: usize,
+}
+
+impl Default for PayloadsConfig {
+    fn default() -> Self {
+        PayloadsConfig {
+            nested_list_page_size: 10,
+        }
+    }
 }
 
 /// Customer churn rates.
@@ -132,6 +205,7 @@ impl Default for Config {
             event_retention: EventRetentionConfig::default(),
             webhooks: WebhooksConfig::default(),
             destinations: Vec::new(),
+            payloads: PayloadsConfig::default(),
         }
     }
 }
@@ -158,10 +232,8 @@ impl Config {
     /// Parses and validates a TOML config.
     pub fn from_toml_str(s: &str) -> Result<Config, MockError> {
         let table: toml::Table = s.parse().map_err(|e| MockError::Config(format!("{e}")))?;
-        if let Some(path) = first_unimplemented(&table) {
-            return Err(MockError::Config(format!(
-                "`{path}` is not implemented yet"
-            )));
+        if let Some(message) = first_unimplemented(&table) {
+            return Err(MockError::Config(message));
         }
         let config: Config = toml::from_str(s).map_err(|e| MockError::Config(format!("{e}")))?;
         config.validate()?;
@@ -182,14 +254,25 @@ impl Config {
                 self.api_version
             ));
         }
+        self.actions.validate()?;
+        let ch = &self.churn;
         for (name, rate) in [
-            ("actions.new_customer", self.actions.new_customer),
-            ("churn.customer.update", self.churn.customer.update),
-            ("churn.customer.delete", self.churn.customer.delete),
+            ("churn.customer.update", ch.customer.update),
+            ("churn.customer.delete", ch.customer.delete),
+            ("churn.product.update", ch.product.update),
+            ("churn.product.archive", ch.product.archive),
+            ("churn.price.update", ch.price.update),
+            ("churn.price.archive", ch.price.archive),
+            ("churn.subscription.update", ch.subscription.update),
+            ("churn.invoice.update", ch.invoice.update),
         ] {
-            if !rate.is_finite() || rate < 0.0 {
-                return err(format!("{name} must be a finite rate >= 0, got {rate}"));
-            }
+            check_rate(name, rate)?;
+        }
+        if !(1..=100).contains(&self.payloads.nested_list_page_size) {
+            return err(format!(
+                "payloads.nested_list_page_size must be between 1 and 100, got {}",
+                self.payloads.nested_list_page_size
+            ));
         }
         if !self.clock.speed.is_finite() || self.clock.speed <= 0.0 {
             return err(format!("clock.speed must be > 0, got {}", self.clock.speed));
@@ -215,6 +298,13 @@ impl Config {
 
 fn config_err<T>(m: impl Into<String>) -> Result<T, MockError> {
     Err(MockError::Config(m.into()))
+}
+
+fn check_rate(name: &str, rate: f64) -> Result<(), MockError> {
+    if !rate.is_finite() || rate < 0.0 {
+        return config_err(format!("{name} must be a finite rate >= 0, got {rate}"));
+    }
+    Ok(())
 }
 
 fn check_probability(name: &str, p: f64) -> Result<(), MockError> {
@@ -641,13 +731,8 @@ latency = { median_ms = 40 }",
             ),
             (
                 "[actions]
-start_subscription = 4.0",
-                "actions.start_subscription",
-            ),
-            (
-                "[churn.product]
-update = 0.5",
-                "churn.product",
+dispute = 0.05",
+                "actions.dispute",
             ),
         ] {
             let msg = Config::from_toml_str(toml).unwrap_err().to_string();
@@ -804,5 +889,53 @@ update = 0.5",
         ] {
             assert!(Config::from_toml_str(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn phase3_keys_parse() {
+        let c = Config::from_toml_str(
+            "[actions]\nstart_subscription = 4.0\nrenew_subscription_cycle = \"natural\"\nstep_delay = { distribution = \"fixed\", ms = 250 }\n[churn.product]\nupdate = 0.5\narchive = 0.1\n[payloads]\nnested_list_page_size = 3",
+        )
+        .unwrap();
+        assert_eq!(c.actions.start_subscription, 4.0);
+        assert_eq!(c.actions.renew_subscription_cycle, RenewMode::Natural);
+        assert_eq!(c.actions.step_delay, Distribution::Fixed { ms: 250 });
+        assert_eq!(
+            (c.churn.product.update, c.churn.product.archive),
+            (0.5, 0.1)
+        );
+        assert_eq!(c.payloads.nested_list_page_size, 3);
+        let d = Config::default();
+        assert_eq!(d.payloads.nested_list_page_size, 10);
+        assert_eq!(d.actions.renew_subscription_cycle, RenewMode::Natural);
+        let off = Config::from_toml_str("[actions]\nrenew_subscription_cycle = \"off\"").unwrap();
+        assert_eq!(off.actions.renew_subscription_cycle, RenewMode::Off);
+    }
+
+    #[test]
+    fn payment_objects_not_implemented() {
+        let msg = Config::from_toml_str("[actions]\nrefund = 0.4")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("`actions.refund`") && msg.contains("phase 7"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn page_size_bounds() {
+        for bad in ["0", "101"] {
+            let msg = Config::from_toml_str(&format!("[payloads]\nnested_list_page_size = {bad}"))
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("payloads.nested_list_page_size"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn failure_probability_bounds() {
+        assert!(Config::from_toml_str("[actions]\npayment_failure_probability = 1.5").is_err());
+        assert!(Config::from_toml_str("[churn.invoice]\nupdate = -1.0").is_err());
     }
 }
