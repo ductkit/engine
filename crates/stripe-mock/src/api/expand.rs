@@ -16,7 +16,10 @@ fn allowed(t: ObjectType) -> &'static [&'static str] {
         ObjectType::Invoice => &["customer", "parent.subscription_details.subscription"],
         ObjectType::Price => &["product"],
         ObjectType::SubscriptionItem => &["price.product"],
-        ObjectType::Customer | ObjectType::Product | ObjectType::InvoiceLineItem => &[],
+        ObjectType::Customer
+        | ObjectType::Product
+        | ObjectType::InvoiceLineItem
+        | ObjectType::Account => &[],
     }
 }
 

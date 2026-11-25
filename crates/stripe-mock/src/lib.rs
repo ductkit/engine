@@ -16,8 +16,9 @@ mod stream;
 mod time;
 
 pub use config::{
-    ActionsConfig, ApiConfig, ApiErrors, CatalogChurn, ChurnConfig, ClockConfig, ClockMode,
-    ClockSkew, Config, CustomerChurn, DestinationConfig, DisableAfter, Distribution, DurationStr,
+    AccountApiMix, AccountTypeMix, AccountsConfig, ActionsConfig, ApiConfig, ApiErrors,
+    CatalogChurn, ChurnConfig, ClockConfig, ClockMode, ClockSkew, Config, ConnectedAccounts,
+    CustomerChurn, DestinationConfig, DisableAfter, Distribution, DurationStr,
     EventRetentionConfig, EventsConfig, HistoryConfig, LateTail, PINNED_API_VERSION,
     PaginationWrites, PayloadFormat, PayloadsConfig, RateLimit, RenewMode, RetrySchedule,
     StaleRead, UpdateChurn, WebhooksConfig,
@@ -31,8 +32,9 @@ pub use engine::events::{EventFormat, EventInfo};
 pub use engine::{Cause, ChangeKind, EventRefs, StateUpdate};
 pub use error::MockError;
 pub use generate::{Action, InvoiceOutcome};
-pub use handle::MockStripe;
+pub use handle::{AccountInfo, MockStripe};
 pub use model::ObjectType;
+pub use model::account::{AccountApi, AccountKind, Configuration};
 pub use model::customer::{CustomerUpdate, NewCustomer};
 pub use stream::{SubscribeFilter, SubscribeOptions, Subscription, SubscriptionItem};
 pub use time::SimTime;

@@ -10,9 +10,6 @@ use crate::MockError;
 /// The only Stripe API version the mock serves (spec section 7.1).
 pub const PINNED_API_VERSION: &str = "2026-11-18.endive";
 
-/// Top-level spec sections that are not implemented yet.
-const UNIMPLEMENTED_SECTIONS: [&str; 1] = ["accounts"];
-
 /// Spec keys inside supported sections that are not implemented yet, with an
 /// optional reason appended to the error.
 const UNIMPLEMENTED_KEYS: [(&str, &[&str], &str); 1] = [(
@@ -24,12 +21,6 @@ const UNIMPLEMENTED_KEYS: [(&str, &[&str], &str); 1] = [(
 /// The first spec section or key that is not implemented, e.g. `[history]` or
 /// `api.latency`, with its reason.
 fn first_unimplemented(table: &toml::Table) -> Option<String> {
-    if let Some(section) = UNIMPLEMENTED_SECTIONS
-        .iter()
-        .find(|s| table.contains_key(**s))
-    {
-        return Some(format!("`[{section}]` is not implemented yet"));
-    }
     for (section, keys, reason) in UNIMPLEMENTED_KEYS {
         if let Some(inner) = table.get(section).and_then(|v| v.as_table())
             && let Some(key) = keys.iter().find(|k| inner.contains_key(**k))
@@ -58,6 +49,123 @@ pub struct Config {
     pub webhooks: WebhooksConfig,
     pub destinations: Vec<DestinationConfig>,
     pub payloads: PayloadsConfig,
+    pub accounts: AccountsConfig,
+}
+
+/// Connect: the platform and its connected accounts (spec section 4).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountsConfig {
+    /// Only `1` is implemented.
+    pub platforms: u32,
+    /// Whether the platform has connected accounts.
+    pub connect: bool,
+    pub connected_accounts: ConnectedAccounts,
+    /// Share of connected accounts created through each Accounts API.
+    pub account_api: AccountApiMix,
+    /// Type mix of v1 accounts.
+    pub account_types: AccountTypeMix,
+}
+
+/// How many connected accounts exist and how often they come and go.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConnectedAccounts {
+    /// Accounts connected at the start of history.
+    pub initial: u32,
+    /// New connections per simulated hour.
+    pub connect_rate: f64,
+    /// Disconnections per simulated hour.
+    pub deauthorize_rate: f64,
+}
+
+/// Share of new accounts created through each Accounts API; sums to 1.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountApiMix {
+    pub v1: f64,
+    pub v2: f64,
+}
+
+/// Share of v1 accounts of each type; sums to 1.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountTypeMix {
+    pub standard: f64,
+    pub express: f64,
+    pub custom: f64,
+}
+
+impl Default for AccountsConfig {
+    fn default() -> Self {
+        AccountsConfig {
+            platforms: 1,
+            connect: false,
+            connected_accounts: ConnectedAccounts::default(),
+            account_api: AccountApiMix::default(),
+            account_types: AccountTypeMix::default(),
+        }
+    }
+}
+
+impl Default for AccountApiMix {
+    fn default() -> Self {
+        AccountApiMix { v1: 0.5, v2: 0.5 }
+    }
+}
+
+impl Default for AccountTypeMix {
+    fn default() -> Self {
+        AccountTypeMix {
+            standard: 0.5,
+            express: 0.3,
+            custom: 0.2,
+        }
+    }
+}
+
+impl AccountsConfig {
+    pub(crate) fn validate(&self) -> Result<(), MockError> {
+        if self.platforms != 1 {
+            return config_err("`accounts.platforms` other than 1 is not implemented yet");
+        }
+        let c = &self.connected_accounts;
+        check_rate("accounts.connected_accounts.connect_rate", c.connect_rate)?;
+        check_rate(
+            "accounts.connected_accounts.deauthorize_rate",
+            c.deauthorize_rate,
+        )?;
+        if !self.connect && (c.initial != 0 || c.connect_rate != 0.0 || c.deauthorize_rate != 0.0) {
+            return config_err("`accounts.connected_accounts` needs `accounts.connect = true`");
+        }
+        check_mix(
+            "accounts.account_api",
+            &[("v1", self.account_api.v1), ("v2", self.account_api.v2)],
+        )?;
+        let t = &self.account_types;
+        check_mix(
+            "accounts.account_types",
+            &[
+                ("standard", t.standard),
+                ("express", t.express),
+                ("custom", t.custom),
+            ],
+        )
+    }
+}
+
+/// Weights must be finite, not negative and sum to 1.
+fn check_mix(name: &str, weights: &[(&str, f64)]) -> Result<(), MockError> {
+    for (key, w) in weights {
+        if !w.is_finite() || *w < 0.0 {
+            return config_err(format!("{name}.{key} must be a number >= 0, got {w}"));
+        }
+    }
+    let sum: f64 = weights.iter().map(|(_, w)| w).sum();
+    if (sum - 1.0).abs() > 1e-9 {
+        return config_err(format!("{name} must sum to 1, got {sum}"));
+    }
+    Ok(())
 }
 
 /// How simulated time moves.
@@ -266,6 +374,7 @@ pub struct ChurnConfig {
     pub price: CatalogChurn,
     pub subscription: UpdateChurn,
     pub invoice: UpdateChurn,
+    pub account: UpdateChurn,
 }
 
 /// Churn for catalog objects, which archive instead of deleting.
@@ -322,6 +431,7 @@ impl Default for Config {
             webhooks: WebhooksConfig::default(),
             destinations: Vec::new(),
             payloads: PayloadsConfig::default(),
+            accounts: AccountsConfig::default(),
         }
     }
 }
@@ -376,6 +486,7 @@ impl Config {
             ));
         }
         self.actions.validate()?;
+        self.accounts.validate()?;
         let scale = self.history.scale;
         if !scale.is_finite() || scale < 0.0 {
             return err(format!(
@@ -395,6 +506,7 @@ impl Config {
             ("churn.price.archive", ch.price.archive),
             ("churn.subscription.update", ch.subscription.update),
             ("churn.invoice.update", ch.invoice.update),
+            ("churn.account.update", ch.account.update),
         ] {
             check_rate(name, rate)?;
         }
@@ -821,10 +933,10 @@ mod tests {
 
     #[test]
     fn unimplemented_section_is_named() {
-        let e = Config::from_toml_str("[accounts]\nplatforms = 1").unwrap_err();
+        let e = Config::from_toml_str("[actions]\none_off_payment = 1").unwrap_err();
         let msg = e.to_string();
         assert!(
-            msg.contains("[accounts]") && msg.contains("not implemented"),
+            msg.contains("`actions.one_off_payment`") && msg.contains("not implemented"),
             "{msg}"
         );
     }
@@ -841,7 +953,7 @@ mod tests {
             .unwrap();
         let msg = Config::from_toml_str(toml).unwrap_err().to_string();
         assert!(
-            msg.contains("[accounts]") && msg.contains("not implemented"),
+            msg.contains("`actions.one_off_payment`") && msg.contains("not implemented"),
             "{msg}"
         );
     }
@@ -853,31 +965,6 @@ mod tests {
             .to_string();
         assert!(
             msg.contains("actions.dispute") && msg.contains("not implemented"),
-            "{msg}"
-        );
-    }
-
-    #[test]
-    fn spec_example_without_top_level_sections_fails_clearly() {
-        let spec = include_str!("../../../docs/stripe-mock-spec.md");
-        let toml = spec
-            .split(
-                "```toml
-",
-            )
-            .nth(1)
-            .unwrap()
-            .split("```")
-            .next()
-            .unwrap();
-        let mut table: toml::Table = toml.parse().unwrap();
-        for section in UNIMPLEMENTED_SECTIONS {
-            table.remove(section);
-        }
-        let stripped = toml::to_string(&table).unwrap();
-        let msg = Config::from_toml_str(&stripped).unwrap_err().to_string();
-        assert!(
-            msg.contains("`actions.one_off_payment`") && msg.contains("not implemented"),
             "{msg}"
         );
     }
@@ -916,7 +1003,12 @@ scale = 0.5",
 
     #[test]
     fn not_implemented_message_is_tidy() {
-        let msg = Config::from_toml_str("[accounts]").unwrap_err().to_string();
+        let msg = Config::from_toml_str(
+            "[actions]
+one_off_payment = 1",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(!msg.contains("  "), "{msg:?}");
     }
 
@@ -1083,5 +1175,127 @@ scale = 0.5",
     fn failure_probability_bounds() {
         assert!(Config::from_toml_str("[actions]\npayment_failure_probability = 1.5").is_err());
         assert!(Config::from_toml_str("[churn.invoice]\nupdate = -1.0").is_err());
+    }
+
+    #[test]
+    fn accounts_defaults() {
+        let a = Config::default().accounts;
+        assert_eq!(a.platforms, 1);
+        assert!(!a.connect);
+        assert_eq!(
+            (
+                a.connected_accounts.initial,
+                a.connected_accounts.connect_rate,
+                a.connected_accounts.deauthorize_rate
+            ),
+            (0, 0.0, 0.0)
+        );
+        assert_eq!((a.account_api.v1, a.account_api.v2), (0.5, 0.5));
+        assert_eq!(
+            (
+                a.account_types.standard,
+                a.account_types.express,
+                a.account_types.custom
+            ),
+            (0.5, 0.3, 0.2)
+        );
+        assert_eq!(Config::default().churn.account.update, 0.0);
+        let c = Config::from_toml_str(
+            "[accounts]
+connect = true",
+        )
+        .unwrap();
+        assert!(c.accounts.connect);
+    }
+
+    #[test]
+    fn accounts_mix_must_sum_to_one() {
+        for bad in [
+            "account_api = { v1 = 0.5, v2 = 0.4 }",
+            "account_api = { v1 = 1.5, v2 = -0.5 }",
+            "account_types = { standard = 0.5, express = 0.5, custom = 0.5 }",
+        ] {
+            let msg = Config::from_toml_str(&format!(
+                "[accounts]
+connect = true
+{bad}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(msg.contains("accounts.account_"), "{bad}: {msg}");
+        }
+        let ok = "[accounts]
+account_api = { v1 = 1.0, v2 = 0.0 }
+account_types = { standard = 1.0, express = 0.0, custom = 0.0 }";
+        assert!(Config::from_toml_str(ok).is_ok());
+    }
+
+    #[test]
+    fn accounts_need_connect() {
+        for bad in [
+            "initial = 2",
+            "connect_rate = 0.5",
+            "deauthorize_rate = 0.1",
+        ] {
+            let msg = Config::from_toml_str(&format!(
+                "[accounts]
+connected_accounts = {{ {bad} }}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                msg.contains("`accounts.connected_accounts` needs `accounts.connect = true`"),
+                "{bad}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn platforms_other_than_one_not_implemented() {
+        let msg = Config::from_toml_str(
+            "[accounts]
+platforms = 2",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.contains("`accounts.platforms` other than 1 is not implemented yet"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn spec_example_accounts_section_parses() {
+        let spec = include_str!("../../../docs/stripe-mock-spec.md");
+        let toml = spec
+            .split(
+                "```toml
+",
+            )
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap();
+        let start = toml.find("[accounts]").unwrap();
+        let block: String = toml[start..]
+            .lines()
+            .take_while(|l| !l.starts_with("[history]"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        let c = Config::from_toml_str(&format!(
+            "{block}
+[history]
+"
+        ))
+        .unwrap();
+        assert!(c.accounts.connect);
+        assert_eq!(c.accounts.connected_accounts.initial, 20);
+        assert_eq!(c.accounts.connected_accounts.connect_rate, 0.5);
+        assert_eq!(c.accounts.connected_accounts.deauthorize_rate, 0.1);
+        assert_eq!(c.accounts.account_types.express, 0.3);
     }
 }

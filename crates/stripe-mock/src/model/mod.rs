@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod account;
 pub mod catalog;
 pub mod customer;
 pub mod embedded;
@@ -19,11 +20,13 @@ pub enum ObjectType {
     SubscriptionItem,
     Invoice,
     InvoiceLineItem,
+    /// A connected account. Lives in the platform scope.
+    Account,
 }
 
 impl ObjectType {
     /// Every type, in declaration order.
-    pub const ALL: [ObjectType; 7] = [
+    pub const ALL: [ObjectType; 8] = [
         ObjectType::Customer,
         ObjectType::Product,
         ObjectType::Price,
@@ -31,6 +34,7 @@ impl ObjectType {
         ObjectType::SubscriptionItem,
         ObjectType::Invoice,
         ObjectType::InvoiceLineItem,
+        ObjectType::Account,
     ];
 
     /// The Stripe `object` name.
@@ -43,6 +47,7 @@ impl ObjectType {
             ObjectType::SubscriptionItem => "subscription_item",
             ObjectType::Invoice => "invoice",
             ObjectType::InvoiceLineItem => "line_item",
+            ObjectType::Account => "account",
         }
     }
 
@@ -56,6 +61,7 @@ impl ObjectType {
             ObjectType::SubscriptionItem => "si",
             ObjectType::Invoice => "in",
             ObjectType::InvoiceLineItem => "il",
+            ObjectType::Account => "acct",
         }
     }
 
@@ -69,6 +75,7 @@ impl ObjectType {
             ObjectType::Subscription => "subscriptions",
             ObjectType::SubscriptionItem => "subscription_items",
             ObjectType::Invoice => "invoices",
+            ObjectType::Account => "accounts",
             ObjectType::InvoiceLineItem => return None,
         };
         Some(format!("/v1/{collection}/{id}"))

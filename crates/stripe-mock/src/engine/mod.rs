@@ -7,14 +7,15 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::delivery::{
     AbandonReason, AttemptOutcome, Deliveries, DeliveryRecord, Destinations, PreparedAttempt,
 };
-use crate::rng::RngStreams;
+use crate::model::account::{self, AccountContent, AccountMeta};
+use crate::rng::{RngStreams, SimRng};
 use crate::stream::{self, SubscribeFilter, SubscribeOptions, Subscriber, Subscription};
-use crate::{Config, MockError, ObjectType, SimTime};
+use crate::{AccountApi, AccountKind, Config, Configuration, MockError, ObjectType, SimTime};
 
 pub(crate) use events::{EventStore, Projector};
 
@@ -87,10 +88,24 @@ pub(crate) struct Engine {
     events: EventStore,
     destinations: Destinations,
     deliveries: Deliveries,
+    /// Every account ever connected, in connection order.
+    accounts: Vec<AccountMeta>,
+    /// Draws account IDs.
+    account_ids: SimRng,
 }
 
 impl Engine {
     pub(crate) fn new(start: SimTime, config: &Config, streams: &RngStreams) -> Self {
+        // The platform application, present when `accounts.connect` is on.
+        let application = config.accounts.connect.then(|| {
+            json!({
+                "id": streams.stream("platform.application").id("ca"),
+                "object": "application",
+                "name": "Ductkit Mock Platform",
+            })
+        });
+        let mut projector = Projector::new(config, streams);
+        projector.application = application;
         Engine {
             now: start,
             next_seq: 1,
@@ -99,11 +114,115 @@ impl Engine {
             stores: BTreeMap::new(),
             scope: None,
             subscribers: Vec::new(),
-            projector: Projector::new(config, streams),
+            projector,
             events: EventStore::default(),
             destinations: Destinations::new(streams),
             deliveries: Deliveries::new(&config.webhooks, streams),
+            accounts: Vec::new(),
+            account_ids: streams.stream("accounts.ids"),
         }
+    }
+
+    /// What the mock knows about an account ever connected.
+    #[allow(dead_code)] // used by the account endpoints and generators (Tasks 3-4)
+    pub(crate) fn account_meta(&self, id: &str) -> Option<&AccountMeta> {
+        self.accounts.iter().find(|a| a.id == id)
+    }
+
+    /// Every account ever connected, in connection order.
+    #[allow(dead_code)] // used by the account endpoints and generators (Tasks 3-4)
+    pub(crate) fn account_metas(&self) -> &[AccountMeta] {
+        &self.accounts
+    }
+
+    /// IDs of accounts that are still connected, in connection order.
+    pub(crate) fn connected_ids(&self) -> Vec<String> {
+        self.accounts
+            .iter()
+            .filter(|a| a.connected)
+            .map(|a| a.id.clone())
+            .collect()
+    }
+
+    /// Connects a new account to the platform now; returns its ID. Accounts live in
+    /// the platform scope.
+    pub(crate) fn connect_account(
+        &mut self,
+        api: AccountApi,
+        kind: AccountKind,
+        configurations: Vec<Configuration>,
+        content: AccountContent,
+    ) -> String {
+        let id = self.account_ids.id(ObjectType::Account.id_prefix());
+        let state = account::v1_state(&id, kind, self.now.unix_seconds(), &content);
+        let events: &[&str] = match api {
+            AccountApi::V1 => &["account.application.authorized"],
+            AccountApi::V2 => &["account.application.authorized", "v2.core.account.created"],
+        };
+        let cause = self.begin_action("connect_account");
+        self.in_scope(None, |e| {
+            e.create(ObjectType::Account, id.clone(), state, cause, events);
+        });
+        self.accounts.push(AccountMeta {
+            id: id.clone(),
+            api,
+            kind,
+            configurations,
+            connected: true,
+        });
+        id
+    }
+
+    /// Disconnects an account now: a delete in the store. An unknown or already
+    /// disconnected ID is `UnknownAccount`.
+    pub(crate) fn disconnect_account(&mut self, id: &str) -> Result<(), MockError> {
+        let api = self.connected_api(id)?;
+        let events: &[&str] = match api {
+            AccountApi::V1 => &["account.application.deauthorized"],
+            AccountApi::V2 => &["account.application.deauthorized", "v2.core.account.closed"],
+        };
+        let tombstone = json!({"id": id, "object": "account", "deleted": true});
+        let cause = self.begin_action("disconnect_account");
+        self.in_scope(None, |e| {
+            e.delete(ObjectType::Account, id, tombstone, cause, events)
+        })?;
+        if let Some(meta) = self.accounts.iter_mut().find(|a| a.id == id) {
+            meta.connected = false;
+        }
+        Ok(())
+    }
+
+    /// Changes a connected account's fields now.
+    pub(crate) fn update_account(
+        &mut self,
+        id: &str,
+        content: AccountContent,
+    ) -> Result<(), MockError> {
+        let api = self.connected_api(id)?;
+        let events: &[&str] = match api {
+            AccountApi::V1 => &["account.updated"],
+            AccountApi::V2 => &["account.updated", "v2.core.account.updated"],
+        };
+        let cause = self.begin_action("account_update");
+        self.in_scope(None, |e| {
+            e.update(
+                ObjectType::Account,
+                id,
+                |s| account::apply_content(s, &content),
+                cause,
+                ChangeKind::Updated,
+                events,
+            )
+        })?;
+        Ok(())
+    }
+
+    fn connected_api(&self, id: &str) -> Result<AccountApi, MockError> {
+        self.accounts
+            .iter()
+            .find(|a| a.id == id && a.connected)
+            .map(|a| a.api)
+            .ok_or_else(|| MockError::UnknownAccount(id.to_string()))
     }
 
     /// Adds the configured destinations at the current time (after history).
@@ -378,7 +497,6 @@ impl Engine {
     }
 
     /// Runs `f` with `scope` as the current scope, then restores the previous one.
-    #[allow(dead_code)] // used by the Connect tasks
     pub(crate) fn in_scope<R>(&mut self, scope: Scope, f: impl FnOnce(&mut Engine) -> R) -> R {
         let previous = std::mem::replace(&mut self.scope, scope);
         let result = f(self);
@@ -426,13 +544,15 @@ impl Engine {
         };
         self.next_seq += 1;
         for (snapshot, thin) in self.projector.project(&update, previous.as_ref(), events) {
-            update.events.snapshot.push(snapshot.id.clone());
+            if let Some(snapshot) = snapshot {
+                update.events.snapshot.push(snapshot.id.clone());
+                self.deliveries
+                    .schedule_for_event(&snapshot, &self.destinations);
+                self.events.push(snapshot);
+            }
             update.events.thin.push(thin.id.clone());
             self.deliveries
-                .schedule_for_event(&snapshot, &self.destinations);
-            self.deliveries
                 .schedule_for_event(&thin, &self.destinations);
-            self.events.push(snapshot);
             self.events.push(thin);
         }
         self.log.push(update.clone());

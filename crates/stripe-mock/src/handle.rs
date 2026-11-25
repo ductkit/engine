@@ -12,14 +12,14 @@ use crate::delivery::{DeliveryRecord, DestinationInfo, PreparedAttempt};
 use crate::engine::events::EventInfo;
 use crate::engine::{Cause, ChangeKind, Engine, StateUpdate};
 use crate::faults::api::ApiFaults;
-use crate::generate::Generator;
+use crate::generate::{self, AccountsGenerator, Generator};
 use crate::generate::{Action, delete_customer_cascade};
 use crate::model::customer::{CustomerUpdate, NewCustomer, apply_update, new_customer_json};
 use crate::rng::{RngStreams, SimRng};
 use crate::stream::{SubscribeFilter, SubscribeOptions, Subscription};
 use crate::{
-    ActionsConfig, ApiConfig, ClockMode, Config, DestinationConfig, EventsConfig, MockError,
-    ObjectType, SimTime, WebhooksConfig,
+    AccountApi, AccountKind, ActionsConfig, ApiConfig, ClockMode, Config, Configuration,
+    DestinationConfig, EventsConfig, MockError, ObjectType, SimTime, WebhooksConfig,
 };
 
 /// Everything behind the lock.
@@ -27,6 +27,8 @@ use crate::{
 pub(crate) struct Sim {
     pub engine: Engine,
     pub generator: Generator,
+    /// Connects, disconnects and updates connected accounts.
+    pub accounts: AccountsGenerator,
     pub control_rng: SimRng,
     /// Draws `Request-Id` values.
     pub api_rng: SimRng,
@@ -74,9 +76,12 @@ impl Shared {
         let mut sim = self.lock();
         if target > sim.engine.now() {
             let Sim {
-                engine, generator, ..
+                engine,
+                generator,
+                accounts,
+                ..
             } = &mut *sim;
-            generator.run_until(engine, target);
+            generate::run_until(generator, accounts, engine, target);
         }
         let now = sim.engine.now();
         let mut due = Vec::new();
@@ -152,6 +157,17 @@ impl Shared {
     }
 }
 
+/// A connected account, as the control API shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountInfo {
+    pub id: String,
+    pub api: AccountApi,
+    pub kind: AccountKind,
+    pub configurations: Vec<Configuration>,
+    /// `false` once the account has been disconnected.
+    pub connected: bool,
+}
+
 /// A running mock. Drop it or call `shutdown` to stop it.
 #[derive(Debug)]
 pub struct MockStripe {
@@ -173,13 +189,24 @@ impl MockStripe {
         let history_start = start.plus_ms(-config.history.duration.ms());
         let mut engine = Engine::new(history_start, &config, &streams);
         let mut generator = Generator::new(&config, &streams, history_start);
+        let mut accounts = AccountsGenerator::new(
+            &config.accounts,
+            &config.churn.account,
+            config.seed,
+            history_start,
+        );
+        // Initial accounts are connected at history start, so they get history too.
+        accounts.connect_initial(&mut engine, config.accounts.connected_accounts.initial);
         generator.scale_rates(config.history.scale, history_start);
-        generator.run_until(&mut engine, start);
+        accounts.scale_rates(config.history.scale, history_start);
+        generate::run_until(&mut generator, &mut accounts, &mut engine, start);
         generator.scale_rates(1.0, start);
+        accounts.scale_rates(1.0, start);
         engine.add_config_destinations(&config);
         let sim = Sim {
             engine,
             generator,
+            accounts,
             control_rng: streams.stream("control"),
             api_rng: streams.stream("api.request_ids"),
             api: ApiFaults::new(&config.api, &streams),
@@ -298,18 +325,21 @@ impl MockStripe {
             let (due, batch) = {
                 let mut sim = self.shared.lock();
                 let Sim {
-                    engine, generator, ..
+                    engine,
+                    generator,
+                    accounts,
+                    ..
                 } = &mut *sim;
-                let action = generator.next_due().filter(|g| *g <= t);
+                let action = generate::next_due(generator, accounts).filter(|g| *g <= t);
                 let delivery = engine.next_delivery_due().filter(|d| *d <= t);
                 match (action, delivery) {
                     (None, None) => {
-                        generator.run_until(engine, t);
+                        generate::run_until(generator, accounts, engine, t);
                         return Ok(());
                     }
                     // Actions first on ties, so a zero-delay event joins the batch.
                     (Some(g), d) if d.is_none_or(|d| g <= d) => {
-                        generator.run_until(engine, g);
+                        generate::run_until(generator, accounts, engine, g);
                         continue;
                     }
                     (_, Some(d)) => {
@@ -370,6 +400,49 @@ impl MockStripe {
         delete_customer_cascade(&mut sim.engine, id, &cause)
     }
 
+    /// Connects a new account through the given Accounts API now and returns its ID.
+    /// The v1 type, or the v2 configurations, are drawn from the config mixes.
+    pub fn connect_account(&self, api: AccountApi) -> Result<String, MockError> {
+        self.require_connect()?;
+        let mut sim = self.shared.lock();
+        let Sim {
+            engine, accounts, ..
+        } = &mut *sim;
+        let (api, kind, configurations, content) = accounts.draw_new_with(Some(api));
+        Ok(engine.connect_account(api, kind, configurations, content))
+    }
+
+    /// Disconnects a connected account now (the platform loses access to it).
+    pub fn disconnect_account(&self, id: &str) -> Result<(), MockError> {
+        self.require_connect()?;
+        self.shared.lock().engine.disconnect_account(id)
+    }
+
+    /// Every account ever connected, in connection order.
+    pub fn accounts(&self) -> Vec<AccountInfo> {
+        self.shared
+            .lock()
+            .engine
+            .account_metas()
+            .iter()
+            .map(|a| AccountInfo {
+                id: a.id.clone(),
+                api: a.api,
+                kind: a.kind,
+                configurations: a.configurations.clone(),
+                connected: a.connected,
+            })
+            .collect()
+    }
+
+    fn require_connect(&self) -> Result<(), MockError> {
+        if self.shared.config.accounts.connect {
+            Ok(())
+        } else {
+            Err(MockError::ConnectDisabled)
+        }
+    }
+
     /// Runs a business action now, plus every follow-up step due by now
     /// (spec section 11, "Triggers"). Returns the action's cause.
     pub fn run_action(&self, a: Action) -> Result<Cause, MockError> {
@@ -408,6 +481,7 @@ impl MockStripe {
             let mut sim = self.shared.lock();
             let now = sim.engine.now();
             sim.generator.set_enabled(false, now);
+            sim.accounts.set_enabled(false, now);
             sim.engine.begin_quiesce();
         }
         let _quiescing = QuiesceGuard(&self.shared);
@@ -438,6 +512,7 @@ impl MockStripe {
         let mut sim = self.shared.lock();
         let now = sim.engine.now();
         sim.generator.set_enabled(true, now);
+        sim.accounts.set_enabled(true, now);
     }
 
     /// Whether generated traffic is running.

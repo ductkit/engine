@@ -31,6 +31,12 @@ pub enum MockError {
     /// No destination with this ID exists.
     #[error("no such destination: {0}")]
     NoSuchDestination(String),
+    /// Connect is off (`accounts.connect = false`).
+    #[error("connected accounts are not enabled (set `accounts.connect = true`)")]
+    ConnectDisabled,
+    /// No connected account with this ID.
+    #[error("no such connected account: {0}")]
+    UnknownAccount(String),
     /// Reading a config file failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

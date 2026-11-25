@@ -36,7 +36,7 @@ fn parent_fields(t: ObjectType) -> &'static [&'static str] {
         ObjectType::InvoiceLineItem => &["invoice"],
         ObjectType::Subscription | ObjectType::Invoice => &["customer"],
         ObjectType::Price => &["product"],
-        ObjectType::Customer | ObjectType::Product => &[],
+        ObjectType::Customer | ObjectType::Product | ObjectType::Account => &[],
     }
 }
 

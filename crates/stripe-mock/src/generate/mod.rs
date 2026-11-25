@@ -9,9 +9,12 @@
 //!   of the action that scheduled them. Their content is drawn when the action
 //!   starts; only `step_delay` is drawn when they are scheduled.
 
+mod accounts;
 mod billing;
 mod catalog;
 mod subscriptions;
+
+pub(crate) use accounts::{AccountChange, AccountsGenerator};
 
 pub(crate) use subscriptions::delete_customer_cascade;
 
@@ -182,6 +185,37 @@ impl Ctx {
     fn next_due(&self) -> Option<SimTime> {
         self.queue.keys().next().map(|(t, _)| *t)
     }
+}
+
+/// The earlier of the platform and the accounts generator next due time.
+pub(crate) fn next_due(platform: &Generator, accounts: &AccountsGenerator) -> Option<SimTime> {
+    platform
+        .next_due()
+        .into_iter()
+        .chain(accounts.next_due())
+        .min()
+}
+
+/// Runs the platform generator and the accounts generator up to `target` in time
+/// order. Ties go to the platform. Sets the time to `target`.
+pub(crate) fn run_until(
+    platform: &mut Generator,
+    accounts: &mut AccountsGenerator,
+    engine: &mut Engine,
+    target: SimTime,
+) -> Vec<AccountChange> {
+    let mut changes = Vec::new();
+    loop {
+        let p = platform.next_due().filter(|t| *t <= target);
+        let a = accounts.next_due().filter(|t| *t <= target);
+        match (p, a) {
+            (Some(p), a) if a.is_none_or(|a| p <= a) => platform.run_until(engine, p),
+            (_, Some(a)) => changes.extend(accounts.run_due(engine, a)),
+            _ => break,
+        }
+    }
+    platform.run_until(engine, target);
+    changes
 }
 
 /// Schedules and performs generated actions and continuations.
@@ -519,7 +553,9 @@ impl Generator {
                 ActionKind::CancelSubscription,
             ],
             ObjectType::Invoice => &[ActionKind::OneOffInvoice, ActionKind::InvoiceUpdate],
-            ObjectType::SubscriptionItem | ObjectType::InvoiceLineItem => return,
+            ObjectType::SubscriptionItem | ObjectType::InvoiceLineItem | ObjectType::Account => {
+                return;
+            }
         };
         let kind = *pick(&mut self.pagination_rng, kinds);
         perform(kind, &mut self.pagination_rng, engine, &mut self.ctx);

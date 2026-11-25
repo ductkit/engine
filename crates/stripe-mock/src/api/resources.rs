@@ -182,7 +182,7 @@ fn matches(
                     s["parent"]["subscription_details"]["subscription"].as_str() == Some(want)
                 })
         }
-        ObjectType::InvoiceLineItem => true,
+        ObjectType::InvoiceLineItem | ObjectType::Account => true,
     }
 }
 

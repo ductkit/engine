@@ -30,7 +30,6 @@ pub(crate) struct EventRecord {
     /// Where the event's object lives (`None` is the platform).
     pub scope: Scope,
     /// The Connect label the event carries (`account` / `context`); `None` for the platform.
-    #[allow(dead_code)] // read by the Connect tasks
     pub account: Option<String>,
     pub object_type: ObjectType,
     pub object_id: String,
@@ -38,7 +37,7 @@ pub(crate) struct EventRecord {
     pub truth_seq: u64,
     /// The full event as served by the API.
     pub payload: Value,
-    /// The other format's event ID.
+    /// The other format's event ID; empty for a thin-only (`v2.`) event.
     pub pair_id: String,
 }
 
@@ -54,8 +53,10 @@ pub struct EventInfo {
     pub object_version: u64,
     /// The truth-log entry this event was projected from.
     pub truth_seq: u64,
-    /// The other format's event ID.
+    /// The other format's event ID; empty for a thin-only (`v2.`) event.
     pub pair_id: String,
+    /// The Connect label: the account the event is about, `None` for the platform's own.
+    pub account: Option<String>,
 }
 
 impl From<&EventRecord> for EventInfo {
@@ -70,6 +71,7 @@ impl From<&EventRecord> for EventInfo {
             object_version: r.object_version,
             truth_seq: r.truth_seq,
             pair_id: r.pair_id.clone(),
+            account: r.account.clone(),
         }
     }
 }
@@ -134,6 +136,8 @@ pub(crate) struct Projector {
     ids: SimRng,
     visibility: SimRng,
     shuffle: SimRng,
+    /// The platform's application, the `data.object` of `account.application.*` events.
+    pub application: Option<Value>,
 }
 
 impl Projector {
@@ -144,17 +148,19 @@ impl Projector {
             ids: streams.stream("events.ids"),
             visibility: streams.stream("events.visibility"),
             shuffle: streams.stream("events.shuffle"),
+            application: None,
         }
     }
 
-    /// One snapshot and one thin event per snapshot type in `types`, in order.
-    /// `previous` is the state before the mutation. Draws nothing for an empty `types`.
+    /// One snapshot and one thin event per snapshot type in `types`, in order; a
+    /// `v2.` type gets its thin event only. `previous` is the state before the
+    /// mutation. Draws nothing for an empty `types`.
     pub(crate) fn project(
         &mut self,
         u: &StateUpdate,
         previous: Option<&Value>,
         types: &[&str],
-    ) -> Vec<(EventRecord, EventRecord)> {
+    ) -> Vec<(Option<EventRecord>, EventRecord)> {
         types
             .iter()
             .map(|t| self.project_one(u, previous, t))
@@ -166,8 +172,13 @@ impl Projector {
         u: &StateUpdate,
         previous: Option<&Value>,
         snapshot_type: &str,
-    ) -> (EventRecord, EventRecord) {
-        let snapshot_id = self.ids.id_len("evt", 24);
+    ) -> (Option<EventRecord>, EventRecord) {
+        let thin_only = snapshot_type.starts_with("v2.");
+        let snapshot_id = if thin_only {
+            String::new()
+        } else {
+            self.ids.id_len("evt", 24)
+        };
         let thin_id = self.ids.id_len("evt_test", 46);
         let mut lag = self.visibility.sample_ms(&self.config.visibility_lag);
         let tail = &self.config.late_tail;
@@ -182,9 +193,16 @@ impl Projector {
         };
         let name = u.object_type.as_str();
         let snapshot_type = snapshot_type.to_string();
-        let thin_type = format!("v1.{snapshot_type}");
+        let thin_type = if thin_only {
+            snapshot_type.clone()
+        } else {
+            format!("v1.{snapshot_type}")
+        };
 
         let object = match (u.kind, previous) {
+            _ if snapshot_type.starts_with("account.application.") => {
+                self.application.clone().unwrap_or(Value::Null)
+            }
             (ChangeKind::Deleted, Some(prev)) => {
                 let mut o = prev.clone();
                 if let Some(m) = o.as_object_mut() {
@@ -206,9 +224,14 @@ impl Projector {
             );
             changes = before_after(prev, &u.state);
         }
-        // The one place an event's Connect label is assigned: it defaults to the
-        // scope its object lives in.
-        let account: Option<String> = u.account.clone();
+        // The one place an event's Connect label is assigned. An account's own events
+        // are labelled with the account, except thin-only `v2.` events, which are
+        // platform events. Every other event carries the scope it was recorded in.
+        let account: Option<String> = if u.object_type == ObjectType::Account {
+            (!thin_only).then(|| u.object_id.clone())
+        } else {
+            u.account.clone()
+        };
         let mut snapshot_payload = json!({
             "id": snapshot_id,
             "object": "event",
@@ -236,7 +259,7 @@ impl Projector {
                 "type": name,
                 "url": u.object_type.api_path(&u.object_id),
             },
-            "snapshot_event": snapshot_id,
+            "snapshot_event": (!thin_only).then_some(&snapshot_id),
             "changes": changes,
             "data": null,
         });
@@ -257,13 +280,15 @@ impl Projector {
             pair_id: pair.to_string(),
         };
         (
-            record(
-                &snapshot_id,
-                &thin_id,
-                EventFormat::Snapshot,
-                snapshot_type.clone(),
-                snapshot_payload,
-            ),
+            (!thin_only).then(|| {
+                record(
+                    &snapshot_id,
+                    &thin_id,
+                    EventFormat::Snapshot,
+                    snapshot_type.clone(),
+                    snapshot_payload,
+                )
+            }),
             record(
                 &thin_id,
                 &snapshot_id,
