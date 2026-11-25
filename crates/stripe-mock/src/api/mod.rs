@@ -8,8 +8,10 @@ mod list;
 mod resources;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -18,7 +20,11 @@ use axum::routing::get;
 use serde_json::{Map, Value, json};
 
 use crate::PINNED_API_VERSION;
+use crate::faults::api::Fault;
 use crate::handle::Shared;
+
+/// How long a `timeout` fault holds the response: Stripe's own request limit.
+const TIMEOUT_HOLD: Duration = Duration::from_secs(80);
 
 /// A Stripe-style error response.
 #[derive(Debug, Clone)]
@@ -120,12 +126,24 @@ async fn fallback(req: Request) -> ApiError {
     ))
 }
 
-/// Checks that apply to every request, in spec order, and sets `Request-Id`.
+/// Checks that apply to every request, in spec order, then the injected faults
+/// (rate limit, error, latency) for requests that pass, and sets `Request-Id`.
 async fn gate(State(shared): State<Arc<Shared>>, req: Request, next: Next) -> Response {
-    let request_id = shared.lock().api_rng.id("req");
-    let mut response = match check(&shared, &req) {
-        Ok(()) => next.run(req).await,
+    let (request_id, decision) = {
+        let mut sim = shared.lock();
+        let request_id = sim.api_rng.id("req");
+        let decision = check(&sim.api.config().keys, &req).map(|()| sim.api.decide(Instant::now()));
+        (request_id, decision)
+    };
+    let mut response = match decision {
         Err(e) => e.into_response(),
+        Ok((Some(fault), _)) => fault_response(fault, &shared),
+        Ok((None, latency_ms)) => {
+            if latency_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(latency_ms)).await;
+            }
+            next.run(req).await
+        }
     };
     response.headers_mut().insert(
         "request-id",
@@ -134,14 +152,71 @@ async fn gate(State(shared): State<Arc<Shared>>, req: Request, next: Next) -> Re
     response
 }
 
-fn check(shared: &Shared, req: &Request) -> Result<(), ApiError> {
+/// The response for an injected fault.
+fn fault_response(fault: Fault, shared: &Shared) -> Response {
+    let retryable = |status: StatusCode, error_type, code, message: &str| {
+        let mut r = ApiError {
+            status,
+            error_type,
+            message: message.to_string(),
+            code,
+            param: None,
+        }
+        .into_response();
+        r.headers_mut()
+            .insert("stripe-should-retry", HeaderValue::from_static("true"));
+        r
+    };
+    let broken = |body: Body| {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(body)
+            .expect("static response")
+    };
+    let reset = || std::io::Error::new(std::io::ErrorKind::ConnectionReset, "injected fault");
+    match fault {
+        Fault::RateLimited => retryable(
+            StatusCode::TOO_MANY_REQUESTS,
+            "invalid_request_error",
+            Some("rate_limit"),
+            "Too many requests hit the API too quickly. We recommend an exponential backoff of your requests.",
+        ),
+        Fault::ServerError => retryable(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            None,
+            "An unknown error occurred.",
+        ),
+        Fault::Unavailable => retryable(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            None,
+            "The server is temporarily unavailable. Please retry.",
+        ),
+        Fault::Reset => broken(Body::from_stream(futures_util::stream::once(async move {
+            Err::<Bytes, _>(reset())
+        }))),
+        Fault::Timeout => {
+            let mut shutdown = shared.shutdown.subscribe();
+            broken(Body::from_stream(futures_util::stream::once(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(TIMEOUT_HOLD) => {}
+                    _ = shutdown.wait_for(|stopping| *stopping) => {}
+                }
+                Err::<Bytes, _>(reset())
+            })))
+        }
+    }
+}
+
+fn check(keys: &[String], req: &Request) -> Result<(), ApiError> {
     let headers = req.headers();
     let key = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(ApiError::unauthorized)?;
-    if !shared.config.api.keys.iter().any(|k| k == key) {
+    if !keys.iter().any(|k| k == key) {
         return Err(ApiError::unauthorized());
     }
     if let Some(v) = headers.get("stripe-version")

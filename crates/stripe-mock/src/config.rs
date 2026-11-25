@@ -16,11 +16,7 @@ const UNIMPLEMENTED_SECTIONS: [&str; 1] = ["accounts"];
 /// Spec keys inside supported sections that are not implemented yet, with an
 /// optional reason appended to the error.
 const UNIMPLEMENTED_KEYS: [(&str, &[&str], &str); 2] = [
-    (
-        "api",
-        &["latency", "rate_limit", "errors", "stale_read"],
-        "",
-    ),
+    ("api", &["stale_read"], ""),
     (
         "actions",
         &["one_off_payment", "refund", "dispute"],
@@ -114,6 +110,69 @@ impl Default for HistoryConfig {
 pub struct ApiConfig {
     /// Accepted secret keys; each must start with `sk_test_`.
     pub keys: Vec<String>,
+    /// Real (wall) delay before each response; never moves simulated time.
+    pub latency: Distribution,
+    /// Token bucket on wall time; `None` (the default) means no limit.
+    pub rate_limit: Option<RateLimit>,
+    /// Probabilities of injected failures per request.
+    pub errors: ApiErrors,
+}
+
+/// A token bucket: `burst` requests at once, refilled at `requests_per_second`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimit {
+    pub requests_per_second: f64,
+    pub burst: u32,
+}
+
+/// Per-request failure probabilities; their sum is at most 1.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApiErrors {
+    /// 500 `api_error`.
+    #[serde(rename = "500")]
+    pub e500: f64,
+    /// 503 `api_error`.
+    #[serde(rename = "503")]
+    pub e503: f64,
+    /// No response until the client gives up.
+    pub timeout: f64,
+    /// The connection is dropped without a complete response.
+    pub reset: f64,
+}
+
+impl ApiConfig {
+    pub(crate) fn validate(&self) -> Result<(), MockError> {
+        if self.keys.is_empty() {
+            return config_err("api.keys must contain at least one key");
+        }
+        if let Some(k) = self.keys.iter().find(|k| !k.starts_with("sk_test_")) {
+            return config_err(format!("api key `{k}` must start with `sk_test_`"));
+        }
+        self.latency.validate("api.latency")?;
+        if let Some(r) = &self.rate_limit
+            && !(r.requests_per_second > 0.0 && r.requests_per_second.is_finite() && r.burst > 0)
+        {
+            return config_err("api.rate_limit needs requests_per_second > 0 and burst > 0");
+        }
+        let e = &self.errors;
+        for (name, p) in [
+            ("api.errors.500", e.e500),
+            ("api.errors.503", e.e503),
+            ("api.errors.timeout", e.timeout),
+            ("api.errors.reset", e.reset),
+        ] {
+            check_probability(name, p)?;
+        }
+        let sum = e.e500 + e.e503 + e.timeout + e.reset;
+        if sum > 1.0 {
+            return config_err(format!(
+                "api.errors probabilities must sum to at most 1, got {sum}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Business action rates (per simulated hour) and action shaping (spec section 6).
@@ -245,6 +304,9 @@ impl Default for ApiConfig {
     fn default() -> Self {
         ApiConfig {
             keys: vec!["sk_test_mock".to_string()],
+            latency: Distribution::default(),
+            rate_limit: None,
+            errors: ApiErrors::default(),
         }
     }
 }
@@ -307,12 +369,7 @@ impl Config {
         if !self.clock.speed.is_finite() || self.clock.speed <= 0.0 {
             return err(format!("clock.speed must be > 0, got {}", self.clock.speed));
         }
-        if self.api.keys.is_empty() {
-            return err("api.keys must contain at least one key".to_string());
-        }
-        if let Some(k) = self.api.keys.iter().find(|k| !k.starts_with("sk_test_")) {
-            return err(format!("api key `{k}` must start with `sk_test_`"));
-        }
+        self.api.validate()?;
         self.events.validate()?;
         self.webhooks.validate()?;
         let mut names = std::collections::BTreeSet::new();
@@ -756,8 +813,8 @@ mod tests {
         for (toml, path) in [
             (
                 "[api]
-latency = { median_ms = 40 }",
-                "api.latency",
+stale_read = { probability = 0.0 }",
+                "api.stale_read",
             ),
             (
                 "[actions]
@@ -793,8 +850,24 @@ dispute = 0.05",
         let stripped = toml::to_string(&table).unwrap();
         let msg = Config::from_toml_str(&stripped).unwrap_err().to_string();
         assert!(
-            msg.contains("`api.latency`") && msg.contains("not implemented"),
+            msg.contains("`api.stale_read`") && msg.contains("not implemented"),
             "{msg}"
+        );
+    }
+
+    #[test]
+    fn api_fault_probabilities_validated() {
+        let toml = "[api]\nerrors = { \"500\" = 0.7, \"503\" = 0.5 }";
+        let msg = Config::from_toml_str(toml).unwrap_err().to_string();
+        assert!(msg.contains("api.errors"), "{msg}");
+        let c = Config::from_toml_str(
+            "[api]\nerrors = { \"500\" = 0.5, timeout = 0.25 }\nrate_limit = { requests_per_second = 25, burst = 25 }",
+        )
+        .unwrap();
+        assert_eq!((c.api.errors.e500, c.api.errors.timeout), (0.5, 0.25));
+        assert!(
+            Config::from_toml_str("[api]\nrate_limit = { requests_per_second = 0, burst = 1 }")
+                .is_err()
         );
     }
 

@@ -7,6 +7,7 @@ mod config;
 mod delivery;
 mod engine;
 mod error;
+mod faults;
 mod generate;
 mod handle;
 mod model;
@@ -15,10 +16,10 @@ mod stream;
 mod time;
 
 pub use config::{
-    ActionsConfig, ApiConfig, CatalogChurn, ChurnConfig, ClockConfig, ClockMode, ClockSkew, Config,
-    CustomerChurn, DestinationConfig, DisableAfter, Distribution, DurationStr,
+    ActionsConfig, ApiConfig, ApiErrors, CatalogChurn, ChurnConfig, ClockConfig, ClockMode,
+    ClockSkew, Config, CustomerChurn, DestinationConfig, DisableAfter, Distribution, DurationStr,
     EventRetentionConfig, EventsConfig, HistoryConfig, LateTail, PINNED_API_VERSION, PayloadFormat,
-    PayloadsConfig, RenewMode, RetrySchedule, UpdateChurn, WebhooksConfig,
+    PayloadsConfig, RateLimit, RenewMode, RetrySchedule, UpdateChurn, WebhooksConfig,
 };
 pub use delivery::signing::verify_signature;
 pub use delivery::{

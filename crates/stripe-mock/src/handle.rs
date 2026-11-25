@@ -11,14 +11,15 @@ use crate::delivery::sender::send;
 use crate::delivery::{DeliveryRecord, DestinationInfo, PreparedAttempt};
 use crate::engine::events::EventInfo;
 use crate::engine::{Cause, ChangeKind, Engine, StateUpdate};
+use crate::faults::api::ApiFaults;
 use crate::generate::Generator;
 use crate::generate::{Action, delete_customer_cascade};
 use crate::model::customer::{CustomerUpdate, NewCustomer, apply_update, new_customer_json};
 use crate::rng::{RngStreams, SimRng};
 use crate::stream::{SubscribeFilter, SubscribeOptions, Subscription};
 use crate::{
-    ActionsConfig, ClockMode, Config, DestinationConfig, EventsConfig, MockError, ObjectType,
-    SimTime, WebhooksConfig,
+    ActionsConfig, ApiConfig, ClockMode, Config, DestinationConfig, EventsConfig, MockError,
+    ObjectType, SimTime, WebhooksConfig,
 };
 
 /// Everything behind the lock.
@@ -29,6 +30,8 @@ pub(crate) struct Sim {
     pub control_rng: SimRng,
     /// Draws `Request-Id` values.
     pub api_rng: SimRng,
+    /// Runtime `[api]` settings and fault state.
+    pub api: ApiFaults,
 }
 
 /// State shared by the handle, the HTTP server and the wall-clock ticker.
@@ -42,6 +45,8 @@ pub(crate) struct Shared {
     pub wall: Mutex<WallState>,
     /// Sends webhooks.
     pub client: reqwest::Client,
+    /// Set to `true` on shutdown, so held (`timeout`) responses end.
+    pub shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 /// Maps real time to simulated time in wall mode.
@@ -177,6 +182,7 @@ impl MockStripe {
             generator,
             control_rng: streams.stream("control"),
             api_rng: streams.stream("api.request_ids"),
+            api: ApiFaults::new(&config.api, &streams),
         };
         let shared = Arc::new(Shared {
             sim: Mutex::new(sim),
@@ -193,6 +199,7 @@ impl MockStripe {
                 .no_proxy()
                 .build()
                 .map_err(|e| MockError::Config(format!("HTTP client: {e}")))?,
+            shutdown: tokio::sync::watch::Sender::new(false),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let api_addr = listener.local_addr()?;
@@ -235,6 +242,7 @@ impl MockStripe {
             ticker.abort();
         }
         self.shared.lock().engine.clear_subscribers();
+        self.shared.shutdown.send_replace(true);
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -448,6 +456,22 @@ impl MockStripe {
         cfg.validate()?;
         sim.engine.set_webhooks_config(cfg);
         Ok(())
+    }
+
+    /// Changes `[api]` settings (validated) for requests from now on. A changed
+    /// `rate_limit` starts with a full bucket.
+    pub fn update_api_config(&self, f: impl FnOnce(&mut ApiConfig)) -> Result<(), MockError> {
+        let mut sim = self.shared.lock();
+        let mut cfg = sim.api.config().clone();
+        f(&mut cfg);
+        cfg.validate()?;
+        sim.api.set_config(cfg, Instant::now());
+        Ok(())
+    }
+
+    /// A rate-limit storm: every Stripe API request gets 429 for `d` of wall time.
+    pub fn force_rate_limit(&self, d: Duration) {
+        self.shared.lock().api.storm(Instant::now() + d);
     }
 
     /// Changes `[actions]` settings (validated). Changed rates redraw their next
