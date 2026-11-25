@@ -22,6 +22,17 @@ pub enum ObjectType {
 }
 
 impl ObjectType {
+    /// Every type, in declaration order.
+    pub const ALL: [ObjectType; 7] = [
+        ObjectType::Customer,
+        ObjectType::Product,
+        ObjectType::Price,
+        ObjectType::Subscription,
+        ObjectType::SubscriptionItem,
+        ObjectType::Invoice,
+        ObjectType::InvoiceLineItem,
+    ];
+
     /// The Stripe `object` name.
     pub fn as_str(&self) -> &'static str {
         match self {

@@ -10,7 +10,8 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 
 use crate::api::ApiError;
-use crate::api::list::{ListParams, decode, paginate, parse_list_params};
+use crate::api::expand::expand;
+use crate::api::list::{ListParams, array_base, decode, paginate, parse_list_params};
 use crate::engine::Engine;
 use crate::engine::store::StoredObject;
 use crate::handle::Shared;
@@ -175,7 +176,7 @@ async fn list(
     State(shared): State<Arc<Shared>>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
-    let p = parse_list_params(decode(query), r.filters, &[])?;
+    let p = parse_list_params(decode(query), r.filters, &["expand"])?;
     if let Some(name) = r.required
         && !p.extra.contains_key(name)
     {
@@ -202,12 +203,18 @@ async fn list(
         Some(name) => format!("{}?{name}={}", r.path, p.extra[name]),
         None => r.path.to_string(),
     };
-    Ok(Json(json!({
+    let mut out = json!({
         "object": "list",
         "url": url,
         "has_more": has_more,
         "data": page.iter().map(|o| o.latest.state.clone()).collect::<Vec<_>>(),
-    })))
+    });
+    expand(engine, r.t, &mut out, expand_paths(&p))?;
+    Ok(Json(out))
+}
+
+fn expand_paths(p: &ListParams) -> &[String] {
+    p.extra_multi.get("expand").map_or(&[], Vec::as_slice)
 }
 
 fn no_such(t: ObjectType, id: &str) -> ApiError {
@@ -235,17 +242,21 @@ async fn retrieve(
     Path(id): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
-    if let Some((key, _)) = decode(query).into_iter().next() {
-        return Err(ApiError::bad_request(
-            format!("Received unknown parameter: {key}"),
-            Some("parameter_unknown"),
-            Some(&key),
-        ));
+    let mut paths = Vec::new();
+    for (key, value) in decode(query) {
+        if array_base(&key) != Some("expand") {
+            return Err(ApiError::bad_request(
+                format!("Received unknown parameter: {key}"),
+                Some("parameter_unknown"),
+                Some(&key),
+            ));
+        }
+        paths.push(value);
     }
     let sim = shared.lock();
-    visible(&sim.engine, r.t, &id)
-        .map(Json)
-        .ok_or_else(|| no_such(r.t, &id))
+    let mut obj = visible(&sim.engine, r.t, &id).ok_or_else(|| no_such(r.t, &id))?;
+    expand(&sim.engine, r.t, &mut obj, &paths)?;
+    Ok(Json(obj))
 }
 
 /// `GET /v1/invoices/{id}/lines`.
@@ -254,7 +265,7 @@ pub(crate) async fn invoice_lines(
     Path(id): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
-    let p = parse_list_params(decode(query), &[], &[])?;
+    let p = parse_list_params(decode(query), &[], &["expand"])?;
     let sim = shared.lock();
     let engine = &sim.engine;
     if visible(engine, ObjectType::Invoice, &id).is_none() {
@@ -264,10 +275,17 @@ pub(crate) async fn invoice_lines(
         .store()
         .children(ObjectType::InvoiceLineItem, "invoice", &id);
     let (page, has_more) = paginate(&lines, |o| !o.deleted, &p)?;
-    Ok(Json(json!({
+    let mut out = json!({
         "object": "list",
         "url": format!("/v1/invoices/{id}/lines"),
         "has_more": has_more,
         "data": page.iter().map(|o| o.latest.state.clone()).collect::<Vec<_>>(),
-    })))
+    });
+    expand(
+        engine,
+        ObjectType::InvoiceLineItem,
+        &mut out,
+        expand_paths(&p),
+    )?;
+    Ok(Json(out))
 }

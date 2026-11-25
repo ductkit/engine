@@ -3,6 +3,7 @@
 mod destinations;
 mod events_v1;
 mod events_v2;
+mod expand;
 mod list;
 mod resources;
 

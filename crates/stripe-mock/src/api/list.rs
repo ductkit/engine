@@ -136,7 +136,7 @@ pub(crate) fn parse_list_params(
 }
 
 /// `types` for `types[]` or `types[3]`.
-fn array_base(key: &str) -> Option<&str> {
+pub(crate) fn array_base(key: &str) -> Option<&str> {
     let (base, rest) = key.split_once('[')?;
     let inner = rest.strip_suffix(']')?;
     (inner.is_empty() || inner.bytes().all(|b| b.is_ascii_digit())).then_some(base)
