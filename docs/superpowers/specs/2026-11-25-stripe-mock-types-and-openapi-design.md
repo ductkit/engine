@@ -64,8 +64,8 @@ Three ways of tying the mock to the OpenAPI spec:
 
 ### 6.1 The vendored spec
 
-- **File:** `crates/stripe-mock/openapi/spec3.json`, copied verbatim from `stripe/openapi`, path `latest/openapi.spec3.json`. It covers v1 and v2 and is about 5.2 MB. The source is the commit "Update OpenAPI for 2026-11-18.endive" (`0f6d4dfa…`), release `v2602`.
-- **Provenance:** `crates/stripe-mock/openapi/README.md` records the source repo, path, commit, release tag, SHA-256 of the file, and how to update it (replace the file, regenerate, fix what breaks).
+- **File:** `crates/stripe-mock/openapi/spec3.json`, copied verbatim from `stripe/openapi`, path `latest/openapi.spec3.json`, at commit `0f6d4dfafe157c10df393ce8a27d00b186ab3955` ("Update OpenAPI for 2026-11-18.endive"). That file covers v1 and v2, is 5,190,895 bytes, has `info.version` `2026-11-18.endive`, and has SHA-256 `e1fd0c9ed163b6ec53594ac30d60b251d7cef5a0ee911760bc89cdceafbe227b`. Do **not** take it from tag `v2602`: that tag's copy reports `2026-10-28.endive`.
+- **Provenance:** `crates/stripe-mock/openapi/README.md` records the source repo, path, commit, SHA-256 of the file, and how to update it (replace the file, regenerate, fix what breaks).
 - **`.gitattributes`:** marks the file `-diff linguist-generated`, with LF line endings.
 - **Version test:** a test asserts the file's `info.version` equals the pinned version. The constant the API serves (`Stripe-Version` check) must equal it too.
 
@@ -83,7 +83,7 @@ Three ways of tying the mock to the OpenAPI spec:
     ```
   - This keeps the generator out of the runtime library and out of the binary, adds no crate, and makes freshness part of `cargo test --workspace`.
   - Generator-only dependencies (`syn`, `quote`, `prettyplease`, `proc-macro2`) are dev-dependencies.
-- **Allowlist:** a single list in the generator names the root schemas to generate (section 6.5 lists them per phase). The generator emits each root plus the transitive closure of **non-expandable** `$ref`s.
+- **Allowlist:** a single list in the generator names the root schemas to generate (section 6.5 lists them per phase). Measured against the vendored file, the roots of all three phases plus their non-expandable closure come to about 800 of the spec's 1,987 schemas, with about 3,700 properties in total. The generator emits that closure in full and never prunes branches to `serde_json::Value` to save compile time: field fidelity outranks build time. The plan records the clean `cargo build -p ductkit-stripe-mock` time before and after each phase's generation and reports it. The generator emits each root plus the transitive closure of **non-expandable** `$ref`s.
   - An expandable reference to a type that is not allowlisted is generated as ID-only. The mock can never serve it expanded, and expanding it in a request gets the same error as any field that isn't expandable.
 - **Type mapping:**
   - An object schema becomes a struct, with fields in spec order and serde renames where a field name isn't a valid Rust identifier.
@@ -144,7 +144,7 @@ The sync situation each type adds is the reason it is there. ID prefixes below a
 |---|---|---|---|
 | `payment_intent` | `pi_` | `canceled` status | fast status churn (`requires_payment_method → processing → succeeded`, failures) |
 | `charge` | `ch_` (`py_` on connected accounts for destination charges) | none (`refunded`, `disputed` flags) | updated by children (refunds, disputes) |
-| `refund` | `re_` | `canceled` / `failed` status | appears standalone (`/v1/refunds`) and nested (`charge.refunds`, if the pinned schema still embeds it) |
+| `refund` | `re_` | `canceled` / `failed` status | appears standalone (`/v1/refunds`) and nested (`charge.refunds`, embedded in the pinned schema); `refund.created/updated/failed` events |
 | `dispute` | `dp_` | `closed` statuses (`won`, `lost`, …) | lives for weeks of simulated time, with many updates; `charge.dispute.*` events |
 | `balance_transaction` | `txn_` | none | **no events of its own**: found only by listing; `status` changes `pending → available` silently on `available_on` |
 | `payment_method` | `pm_` | **detach** (`customer` becomes null, stays retrievable) | listing needs a customer (`/v1/payment_methods?customer=`, `/v1/customers/{id}/payment_methods`) |
@@ -152,13 +152,12 @@ The sync situation each type adds is the reason it is there. ID prefixes below a
 | `checkout.session` | `cs_` | **expires** (`status: expired`) | dotted object name; `checkout.session.*` events; creates payment intent or subscription |
 | `invoice_payment` | `inpay_` | none | the invoice-to-payment link in the pinned API (invoices list their `payments`); without it, invoice payment fan-out is wrong |
 
-New fan-out for paying an invoice (replaces the single mutation in spec section 6.1), using the event names the pinned spec lists:
-1. `invoice.finalized`
-2. `payment_intent.created`
-3. `charge.succeeded`, with its `balance_transaction` (no event)
-4. `payment_intent.succeeded`
-5. `invoice_payment.paid`
-6. `invoice.paid` and `invoice.payment_succeeded`
+New fan-out for paying an invoice (replaces the single mutation in spec section 6.1), using the event names the pinned spec lists. Finalizing stays a separate step with today's timing; the payment flow starts where today's single payment mutation is:
+1. `payment_intent.created`
+2. `charge.succeeded`, with its `balance_transaction` (no event)
+3. `payment_intent.succeeded`
+4. `invoice_payment.paid`
+5. `invoice.paid` and `invoice.payment_succeeded`
 
 On failure (`payment_failure_probability`), the flow is `charge.failed` → `payment_intent.payment_failed` → `invoice.payment_failed`, followed by the existing retry or past-due logic.
 
@@ -184,10 +183,15 @@ Endpoints: retrieve and list for each type, plus the sub-lists above. `balance_t
 | external account: `bank_account`, `card` | `ba_`, `card_` | **hard delete** | polymorphic list (`/v1/accounts/{id}/external_accounts`); `account.external_account.*` events |
 | `person` | `person_` | **hard delete** | sub-list only (`/v1/accounts/{id}/persons`); `person.*` events; changes `account.requirements` |
 
-**Connect charge patterns.** New config `accounts.charge_patterns = { direct, destination, separate }`, a mix that sums to 1 and defaults to `{ direct = 1.0 }`. It sets how payments on connected accounts move money:
-- **direct:** the charge lives on the connected account, and an `application_fee` lives on the platform.
-- **destination:** the charge lives on the platform with `transfer_data`, a `transfer` goes to the connected account, and a `py_` payment lands on the connected account.
-- **separate charges and transfers:** the charge lives on the platform; later, an independent `transfer` goes out with a `transfer_group`.
+**Connect charge patterns** (decided by the user: patterns apply to platform payments).
+- **Connected accounts keep direct charges.** Each connected account's generator keeps creating its own customers, invoices and payments in its own scope, which is a direct charge by construction. New config `accounts.application_fee = { probability, percent }` (default `{ probability = 0.0, percent = 10.0 }`) sets how often such a charge carries an `application_fee`, which lives on the platform.
+- **The platform's own payments can route money to a connected account.** New config `accounts.platform_payments = { own, destination, separate }` is a mix that sums to 1 and defaults to `{ own = 1.0 }`. For each platform payment (invoice payment, `one_off_payment` and `checkout` alike), a pattern is drawn, and for a non-`own` pattern a random connected account is drawn as the recipient:
+  - **own:** a plain platform charge, as without Connect.
+  - **destination:** the charge carries `transfer_data.destination`. A `transfer` goes to the account, and a `py_` payment with its balance transaction lands in the account's scope.
+  - **separate:** the charge carries a `transfer_group`. Later, after a drawn delay, an independent `transfer` with the same group goes to the account.
+- **Symmetry holds.** Platform and connected accounts keep identical coverage of business actions. The only scope-specific objects are the transfers and `py_` payments caused by platform payments, and the application fees caused by connected-account charges.
+- **With `connect = false`,** `platform_payments` other than `{ own = 1.0 }` and `application_fee.probability > 0` are config errors.
+- **If no connected account is connected** when a non-`own` pattern is drawn, the payment falls back to `own`.
 
 Each pattern's objects land in the right scope, and events go to the right destinations (spec section 5.4 rules unchanged).
 
@@ -220,7 +224,13 @@ Each phase updates `docs/stripe-mock-spec.md` as it lands:
 - section 14: how generation and conformance are tested;
 - section 16: phases 7, 8 and 9 as defined here.
 
-## 7. Left to the builder
+## 7. Calls made after the builder check
+
+- **The pinned schema wins over documented behavior.** If the generated type for an object disagrees with something the project spec documents or an existing test asserts, the mock follows the schema. The test and the project spec section are updated in the same task. There is no schema-override mechanism. A check of the vendored file found the shapes that looked most at risk all present: v1 `account.type` includes `none`, `account.controller` exists, `v2.core.account.closed` exists, `application` is `{id, name, object}`, and `deleted_account` is `{deleted, id, object}`.
+- **Thin events** are generated from `v2.core.event`. The file has no separate `v1.*` thin-event schemas.
+- **Event names** come from the 276-value `enabled_events` enum of `POST /v1/webhook_endpoints` in the vendored file. It includes `invoice_payment.paid` and `refund.created`, `refund.updated` and `refund.failed`.
+
+## 8. Left to the builder
 
 These are the builder's calls. The plan settles them and states them:
 - Exact generator internals (module split, how names are de-collided, how to emit `Expandable`).
