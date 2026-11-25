@@ -8,6 +8,7 @@ The ductkit engine, organised as a multi-crate Rust workspace.
 |-------|------|---------|
 | [`ductkit-core`](crates/core) | library | Core engine logic |
 | [`ductkit-sync`](crates/sync) | binary | `sync` command-line tool |
+| [`ductkit-stripe-mock`](crates/stripe-mock) | library | Stateful Stripe API mock for testing sync |
 
 ## Docs
 

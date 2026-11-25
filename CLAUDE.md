@@ -8,6 +8,7 @@ Guidance for Claude Code when working in this repository.
 
 - `crates/core` (package `ductkit-core`, imported as `ductkit_core`) — library with the core logic. Other crates depend on it.
 - `crates/sync` (package `ductkit-sync`) — the `sync` CLI binary, built on `ductkit-core`.
+- `crates/stripe-mock` (package `ductkit-stripe-mock`) — the Stripe mock test fixture; see `docs/stripe-mock-spec.md`.
 
 Packages are prefixed `ductkit-` because bare `core` clashes with Rust's built-in `core` crate; directory names stay short.
 

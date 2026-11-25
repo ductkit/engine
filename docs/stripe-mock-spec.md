@@ -93,7 +93,7 @@ Configuration is a TOML file (or the equivalent Rust struct). All rates are per 
 ```toml
 seed = 42
 api_version = "2026-11-18.endive"   # pinned; the only version the mock serves (section 7.1)
-clock = { mode = "virtual", start = "2026-01-01T00:00:00Z", speed = 60.0 }  # speed only for wall-paced virtual time
+clock = { mode = "virtual", start = "2026-01-01T00:00:00Z", speed = 60.0 }  # mode: virtual (time moves only when advanced) | wall (real time × speed)
 
 [accounts]
 platforms = 1
@@ -132,6 +132,7 @@ update = 0.5
 archive = 0.1
 
 [api]
+keys = ["sk_test_mock"]   # accepted API keys (section 7.1)
 latency = { distribution = "lognormal", median_ms = 40, p99_ms = 400 }
 rate_limit = { requests_per_second = 25, burst = 25 }
 errors = { "500" = 0.001, "503" = 0.001, timeout = 0.0005, reset = 0.0005 }
