@@ -11,6 +11,10 @@ Guidance for Claude Code when working in this repository.
 
 Packages are prefixed `ductkit-` because bare `core` clashes with Rust's built-in `core` crate; directory names stay short.
 
+## Design docs
+
+Specs live in `docs/`. The Stripe mock test fixture (planned crate `crates/stripe-mock`) is specified in `docs/stripe-mock-spec.md`; read it before working on the mock or on sync tests.
+
 ## Commands
 
 ```sh
