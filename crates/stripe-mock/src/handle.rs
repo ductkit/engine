@@ -118,6 +118,7 @@ impl Shared {
             return;
         }
         let elapsed_ms = wall.anchor_real.elapsed().as_secs_f64() * 1000.0;
+        // `as i64` saturates; `plus_ms` clamps to chrono's range, so no input panics.
         let target = wall.anchor_sim.plus_ms((elapsed_ms * wall.speed) as i64);
         let mut sim = self.lock();
         if target > sim.engine.now() {
@@ -1027,6 +1028,12 @@ impl MockStripe {
         if !speed.is_finite() || speed <= 0.0 {
             return Err(MockError::Config(format!(
                 "speed must be a finite number > 0, got {speed}"
+            )));
+        }
+        if speed > crate::MAX_SPEED {
+            return Err(MockError::Config(format!(
+                "speed must be at most {}, got {speed}",
+                crate::MAX_SPEED
             )));
         }
         // Catch up at the old speed first, then re-anchor like `resume`.

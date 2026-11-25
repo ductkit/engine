@@ -218,6 +218,8 @@ Destination rules:
 - A thin destination receives unlabelled events for `"@self"` and labelled events for `"@accounts"` (carrying `context`). `events_from` defaults to `["@self"]`. `connect` on a thin destination is a config error.
 - `@organization_members…` values are rejected as not implemented (organizations are out of scope).
 
+Limits (config files and the runtime `set_*_config` ops alike; a violation is a config error, 400 `config` on the control API): Every duration must be at most 100 years; `clock.speed` at most 1e6. That covers each duration string, each retry-schedule entry, the `ms` and `p99_ms` of every distribution, `api.stale_read.max_lag`, `history.duration` and `event_retention.window`. The error names the key and the limit. `POST /control/speed` applies the same speed cap.
+
 Configuration can be changed at runtime through the control API (section 11). Changes are recorded in the truth log, so replays reproduce them.
 
 ## 5. Entities and lifecycles

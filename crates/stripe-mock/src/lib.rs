@@ -21,9 +21,9 @@ pub use config::{
     AccountApiMix, AccountTypeMix, AccountsConfig, ActionsConfig, ApiConfig, ApiErrors,
     CatalogChurn, ChurnConfig, ClockConfig, ClockMode, ClockSkew, Config, ConnectedAccounts,
     CustomerChurn, DestinationConfig, DisableAfter, Distribution, DurationStr,
-    EventRetentionConfig, EventsConfig, HistoryConfig, LateTail, PINNED_API_VERSION,
-    PaginationWrites, PayloadFormat, PayloadsConfig, RateLimit, RenewMode, RetrySchedule,
-    StaleRead, UpdateChurn, WebhooksConfig,
+    EventRetentionConfig, EventsConfig, HistoryConfig, LateTail, MAX_DURATION_MS, MAX_SPEED,
+    PINNED_API_VERSION, PaginationWrites, PayloadFormat, PayloadsConfig, RateLimit, RenewMode,
+    RetrySchedule, StaleRead, UpdateChurn, WebhooksConfig,
 };
 pub use control::{
     ControlOp, JournalEntry, OpResult, RUN_FORMAT, ReplayGuard, ReplayOptions, RunExport,

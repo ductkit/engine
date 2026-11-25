@@ -191,7 +191,7 @@ impl Deliveries {
     fn schedule_one(&mut self, ev: &EventRecord, destination_id: &str, duplicate: bool) {
         let delay = self.delay.sample_ms(&self.config.delivery_delay);
         let jitter = self.reorder.uniform_ms(0, self.config.reorder_window.ms());
-        let attempt_at = ev.created.plus_ms(delay + jitter);
+        let attempt_at = ev.created.plus_ms(delay.saturating_add(jitter));
         let index = self.list.len();
         self.list.push(Delivery {
             id: format!("dlv_{}", index + 1),
@@ -291,7 +291,7 @@ impl Deliveries {
         let skew = &self.config.clock_skew;
         if self.faults.chance(skew.probability) {
             let negative = self.faults.below(2) == 0;
-            let min = self.config.signature_tolerance.ms() + 1000;
+            let min = self.config.signature_tolerance.ms().saturating_add(1000);
             let secs = self.faults.uniform_ms(min, skew.max.ms()) / 1000;
             SignatureFault::Skewed {
                 secs: if negative { -secs } else { secs },
@@ -361,7 +361,7 @@ impl Deliveries {
             Some(d) if !d.info.enabled => abandon = Some(AbandonReason::DestinationDisabled),
             Some(d) => {
                 let since = *d.first_failure_since_success.get_or_insert(effective);
-                if effective.0 - since.0 >= self.config.disable_after_failures.ms() {
+                if effective.0.saturating_sub(since.0) >= self.config.disable_after_failures.ms() {
                     d.info.enabled = false;
                     disable = true;
                 } else {
@@ -372,7 +372,7 @@ impl Deliveries {
                         .nth(a.attempt.saturating_sub(1) as usize);
                     match delay {
                         Some(ms)
-                            if a.scheduled_at.0 + ms - first.0
+                            if a.scheduled_at.0.saturating_add(ms).saturating_sub(first.0)
                                 <= self.config.max_retry_duration.ms() =>
                         {
                             let nominal = a.scheduled_at.plus_ms(ms);

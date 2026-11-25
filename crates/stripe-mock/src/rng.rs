@@ -111,7 +111,9 @@ impl SimRng {
             crate::Distribution::Lognormal { median_ms, p99_ms } => {
                 let mu = median_ms.ln();
                 let sigma = (p99_ms.ln() - mu) / 2.326348;
-                ((mu + sigma * self.normal()).exp().round() as i64).max(0)
+                // A tail draw can far exceed `p99_ms`; cap it at the config limit.
+                ((mu + sigma * self.normal()).exp().round() as i64)
+                    .clamp(0, crate::config::MAX_DURATION_MS)
             }
         }
     }

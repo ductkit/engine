@@ -10,6 +10,14 @@ use crate::MockError;
 /// The only Stripe API version the mock serves (spec section 7.1).
 pub const PINNED_API_VERSION: &str = "2026-11-18.endive";
 
+/// Upper bound for every duration in the config: 100 years in milliseconds.
+/// Bounded values can be added to each other and to any simulated time without
+/// overflowing `i64`.
+pub const MAX_DURATION_MS: i64 = 100 * 365 * 86_400_000;
+
+/// Upper bound for `clock.speed` (simulated seconds per real second).
+pub const MAX_SPEED: f64 = 1e6;
+
 /// Spec keys inside supported sections that are not implemented yet, with an
 /// optional reason appended to the error.
 const UNIMPLEMENTED_KEYS: [(&str, &[&str], &str); 1] = [(
@@ -310,6 +318,7 @@ impl ApiConfig {
         if self.stale_read.max_lag.ms() < 1 {
             return config_err("api.stale_read.max_lag must be at least 1ms");
         }
+        check_max_duration("api.stale_read.max_lag", self.stale_read.max_lag)?;
         let sum = e.e500 + e.e503 + e.timeout + e.reset;
         if sum > 1.0 {
             return config_err(format!(
@@ -497,6 +506,8 @@ impl Config {
         if self.history.duration.ms() < 0 {
             return err("history.duration must be >= 0".to_string());
         }
+        check_max_duration("history.duration", self.history.duration)?;
+        check_max_duration("event_retention.window", self.event_retention.window)?;
         let ch = &self.churn;
         for (name, rate) in [
             ("churn.customer.update", ch.customer.update),
@@ -523,6 +534,12 @@ impl Config {
         if !self.clock.speed.is_finite() || self.clock.speed <= 0.0 {
             return err(format!("clock.speed must be > 0, got {}", self.clock.speed));
         }
+        if self.clock.speed > MAX_SPEED {
+            return err(format!(
+                "clock.speed must be at most {MAX_SPEED}, got {}",
+                self.clock.speed
+            ));
+        }
         self.api.validate()?;
         self.events.validate()?;
         self.webhooks.validate()?;
@@ -539,6 +556,20 @@ impl Config {
 
 fn config_err<T>(m: impl Into<String>) -> Result<T, MockError> {
     Err(MockError::Config(m.into()))
+}
+
+/// Rejects a duration above [`MAX_DURATION_MS`]; the message names the key and the limit.
+fn check_max_duration(name: &str, d: DurationStr) -> Result<(), MockError> {
+    check_max_ms(name, d.ms())
+}
+
+fn check_max_ms(name: &str, ms: i64) -> Result<(), MockError> {
+    if ms > MAX_DURATION_MS {
+        return config_err(format!(
+            "{name} must be at most 100 years ({MAX_DURATION_MS} ms), got {ms} ms"
+        ));
+    }
+    Ok(())
 }
 
 fn check_rate(name: &str, rate: f64) -> Result<(), MockError> {
@@ -634,12 +665,18 @@ impl Distribution {
     fn validate(&self, name: &str) -> Result<(), MockError> {
         match *self {
             Distribution::Fixed { ms } if ms < 0 => config_err(format!("{name}.ms must be >= 0")),
+            Distribution::Fixed { ms } => check_max_ms(&format!("{name}.ms"), ms),
             Distribution::Lognormal { median_ms, p99_ms }
                 if !(median_ms > 0.0 && median_ms <= p99_ms && p99_ms.is_finite()) =>
             {
                 config_err(format!("{name} needs 0 < median_ms <= p99_ms"))
             }
-            _ => Ok(()),
+            Distribution::Lognormal { p99_ms, .. } if p99_ms > MAX_DURATION_MS as f64 => {
+                config_err(format!(
+                    "{name}.p99_ms must be at most 100 years ({MAX_DURATION_MS} ms), got {p99_ms}"
+                ))
+            }
+            Distribution::Lognormal { .. } => Ok(()),
         }
     }
 }
@@ -669,6 +706,8 @@ impl EventsConfig {
         if self.late_tail.min > self.late_tail.max {
             return config_err("events.late_tail.min must be <= max");
         }
+        check_max_duration("events.late_tail.min", self.late_tail.min)?;
+        check_max_duration("events.late_tail.max", self.late_tail.max)?;
         Ok(())
     }
 }
@@ -843,6 +882,23 @@ impl WebhooksConfig {
             && (l.is_empty() || l.iter().any(|d| d.ms() <= 0))
         {
             return config_err("webhooks.retry_schedule must be non-empty with delays > 0");
+        }
+        if let RetrySchedule::Explicit(l) = &self.retry_schedule {
+            for d in l {
+                check_max_duration("webhooks.retry_schedule", *d)?;
+            }
+        }
+        for (name, d) in [
+            ("webhooks.reorder_window", self.reorder_window),
+            ("webhooks.response_timeout", self.response_timeout),
+            ("webhooks.max_retry_duration", self.max_retry_duration),
+            ("webhooks.signature_tolerance", self.signature_tolerance),
+            ("webhooks.clock_skew.max", self.clock_skew.max),
+        ] {
+            check_max_duration(name, d)?;
+        }
+        if let DisableAfter::After(d) = self.disable_after_failures {
+            check_max_duration("webhooks.disable_after_failures", d)?;
         }
         Ok(())
     }

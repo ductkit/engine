@@ -121,7 +121,7 @@ impl EventStore {
 
     /// Whether `r` is visible and still retained at `now`.
     pub(crate) fn is_listed(&self, r: &EventRecord, now: SimTime, retention_ms: i64) -> bool {
-        r.visible_at <= now && r.created.0 > now.0 - retention_ms
+        r.visible_at <= now && r.created.0 > now.0.saturating_sub(retention_ms)
     }
 
     /// Makes every event visible by `now` at the latest.
@@ -191,7 +191,7 @@ impl Projector {
         let mut lag = self.visibility.sample_ms(&self.config.visibility_lag);
         let tail = &self.config.late_tail;
         if self.visibility.chance(tail.probability) {
-            lag += self.visibility.uniform_ms(tail.min.ms(), tail.max.ms());
+            lag = lag.saturating_add(self.visibility.uniform_ms(tail.min.ms(), tail.max.ms()));
         }
         let visible_at = u.at.plus_ms(lag);
         let tiebreak = if self.config.same_second_shuffle {

@@ -386,3 +386,66 @@ async fn set_speed_changes_rate() {
     let slow_ms = m.now().0 - after.0;
     assert!(slow_ms < 10_000, "advanced {slow_ms} ms at speed 1");
 }
+
+#[test]
+fn durations_over_100_years_are_rejected_at_the_limit_they_pass() {
+    const MAX: i64 = 3_153_600_000_000;
+    let ok = |toml: String| Config::from_toml_str(&toml).map(|_| ());
+    let rejects = |toml: String| match Config::from_toml_str(&toml) {
+        Ok(_) => panic!("accepted: {toml}"),
+        Err(e) => {
+            let m = e.to_string();
+            assert!(m.contains("100 years"), "names the limit: {m}");
+        }
+    };
+    let cases = [
+        "[history]\nduration = \"{}\"",
+        "[event_retention]\nwindow = \"{}\"",
+        "[api]\nstale_read = {{ max_lag = \"{}\" }}",
+        "[events]\nlate_tail = {{ min = \"1ms\", max = \"{}\" }}",
+        "[webhooks]\nreorder_window = \"{}\"",
+        "[webhooks]\nresponse_timeout = \"{}\"",
+        "[webhooks]\nretry_schedule = [\"1s\", \"{}\"]",
+        "[webhooks]\nmax_retry_duration = \"{}\"",
+        "[webhooks]\ndisable_after_failures = \"{}\"",
+        "[webhooks]\nsignature_tolerance = \"{}\"",
+        "[webhooks]\nclock_skew = {{ probability = 0.5, max = \"{}\" }}",
+    ];
+    for case in cases {
+        let at = case
+            .replace("{}", &format!("{MAX}ms"))
+            .replace("{{", "{")
+            .replace("}}", "}");
+        ok(at.clone()).unwrap_or_else(|e| panic!("{at}: {e}"));
+        let over = case
+            .replace("{}", &format!("{}ms", MAX + 1))
+            .replace("{{", "{")
+            .replace("}}", "}");
+        rejects(over);
+    }
+    for key in [
+        "api.latency",
+        "actions.step_delay",
+        "events.visibility_lag",
+        "webhooks.delivery_delay",
+    ] {
+        let (section, name) = key.split_once('.').unwrap();
+        let at = format!("[{section}]\n{name} = {{ distribution = \"fixed\", ms = {MAX} }}");
+        ok(at.clone()).unwrap_or_else(|e| panic!("{at}: {e}"));
+        rejects(format!(
+            "[{section}]\n{name} = {{ distribution = \"fixed\", ms = {} }}",
+            MAX + 1
+        ));
+        rejects(format!(
+            "[{section}]\n{name} = {{ distribution = \"lognormal\", median_ms = 1, p99_ms = 1e300 }}"
+        ));
+    }
+}
+
+#[test]
+fn clock_speed_is_capped() {
+    assert!(Config::from_toml_str("clock = { speed = 1000000.0 }").is_ok());
+    let e = Config::from_toml_str("clock = { speed = 1000000.5 }").unwrap_err();
+    assert!(e.to_string().contains("clock.speed"), "{e}");
+    assert!(Config::from_toml_str("clock = { speed = 1e300 }").is_err());
+}

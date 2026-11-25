@@ -549,3 +549,109 @@ duration = \"6h\"
     assert!(from_state.contains("invoice_line_item"), "{from_state:?}");
     assert_eq!(from_stream, from_state);
 }
+
+#[tokio::test]
+async fn unbounded_durations_are_rejected_and_the_mock_survives() {
+    let m = mock_with_control("seed = 1").await;
+    let huge = "9223372036854775807ms";
+    let ops = |op: Value| ctl_post(&m, "/control/ops", op);
+    let rejected = |s: u16, b: &Value| {
+        assert_eq!(s, 400, "{b}");
+        assert_eq!(code(b), "config", "{b}");
+        let msg = b["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("100 years"), "names the limit: {msg}");
+    };
+
+    // The retry schedule that used to poison the sim lock.
+    let (s, b) = json_of(
+        ops(json!({"op": "set_webhooks_config", "config": {"retry_schedule": [huge]}})).await,
+    )
+    .await;
+    rejected(s, &b);
+    let (s, _) = json_of(ctl_get(&m, "/control/now").await).await;
+    assert_eq!(s, 200);
+
+    // Every other duration-typed value is bounded too.
+    let fixed = json!({"distribution": "fixed", "ms": i64::MAX});
+    let lognormal = json!({"distribution": "lognormal", "median_ms": 1.0, "p99_ms": 1e300});
+    for op in [
+        json!({"op": "set_webhooks_config", "config": {"reorder_window": huge}}),
+        json!({"op": "set_webhooks_config", "config": {"response_timeout": huge}}),
+        json!({"op": "set_webhooks_config", "config": {"max_retry_duration": huge}}),
+        json!({"op": "set_webhooks_config", "config": {"disable_after_failures": huge}}),
+        json!({"op": "set_webhooks_config", "config": {"signature_tolerance": huge}}),
+        json!({"op": "set_webhooks_config", "config": {"delivery_delay": fixed}}),
+        json!({"op": "set_webhooks_config", "config": {"delivery_delay": lognormal}}),
+        json!({"op": "set_actions_config", "config": {"step_delay": fixed}}),
+        json!({"op": "set_actions_config", "config": {"step_delay": lognormal}}),
+        json!({"op": "set_events_config", "config": {"visibility_lag": fixed}}),
+        json!({"op": "set_events_config", "config": {"late_tail": {"min": "1ms", "max": huge}}}),
+        json!({"op": "set_api_config", "config": {"latency": fixed}}),
+        json!({"op": "set_api_config", "config": {"stale_read": {"max_lag": huge}}}),
+    ] {
+        let (s, b) = json_of(ops(op.clone()).await).await;
+        assert_eq!((s, code(&b)), (400, "config"), "{op}: {b}");
+        let (s, _) = json_of(ctl_get(&m, "/control/now").await).await;
+        assert_eq!(s, 200, "{op}");
+    }
+
+    // The full repro, which used to panic under the sim lock.
+    let dest = json!({"op": "add_destination", "destination": {
+        "name": "dead", "url": "http://127.0.0.1:9/hook", "payload": "snapshot",
+        "enabled_events": ["*"], "secret": "whsec_test",
+    }});
+    let (s, b) = json_of(ops(dest).await).await;
+    assert_eq!(s, 200, "{b}");
+    let (s, b) = json_of(ops(json!({"op": "create_customer", "customer": {}})).await).await;
+    assert_eq!(s, 200, "{b}");
+    let (s, b) = json_of(ctl_post(&m, "/control/step", json!({"duration": "2h"})).await).await;
+    assert_eq!(s, 200, "{b}");
+    let (s, b) = json_of(ctl_get(&m, "/control/now").await).await;
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(get(&m, "/v1/customers").await.status(), 200);
+
+    // A value exactly at the limit is accepted and cannot overflow either.
+    let at_limit = "3153600000000ms";
+    let (s, b) = json_of(
+        ops(
+            json!({"op": "set_webhooks_config", "config": {"retry_schedule": [at_limit],
+            "max_retry_duration": at_limit, "reorder_window": at_limit,
+            "delivery_delay": {"distribution": "fixed", "ms": 3153600000000i64}}}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(s, 200, "{b}");
+    let (s, b) = json_of(ops(json!({"op": "create_customer", "customer": {}})).await).await;
+    assert_eq!(s, 200, "{b}");
+    let (s, b) = json_of(ctl_post(&m, "/control/step", json!({"duration": "2h"})).await).await;
+    assert_eq!(s, 200, "{b}");
+    let (s, _) = json_of(ctl_get(&m, "/control/now").await).await;
+    assert_eq!(s, 200);
+}
+
+#[tokio::test]
+async fn wall_speed_is_capped() {
+    let m = mock_with_control(WALL).await;
+    for speed in [json!(1e300), json!(1000001.0)] {
+        let (s, b) = json_of(ctl_post(&m, "/control/speed", json!({ "speed": speed })).await).await;
+        assert_eq!((s, code(&b)), (400, "config"), "{b}");
+    }
+    // Let the ticker run a few times, then mutate: the wall lock is not poisoned.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (s, b) = json_of(
+        ctl_post(
+            &m,
+            "/control/ops",
+            json!({"op": "create_customer", "customer": {}}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(s, 200, "{b}");
+    let (s, _) = json_of(ctl_post(&m, "/control/speed", json!({"speed": 1000000.0})).await).await;
+    assert_eq!(s, 200, "the cap itself is allowed");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (s, _) = json_of(ctl_post(&m, "/control/pause", json!({})).await).await;
+    assert_eq!(s, 200);
+}

@@ -23,9 +23,13 @@ impl SimTime {
         self.0.div_euclid(1000)
     }
 
-    /// This time plus `ms` milliseconds.
+    /// This time plus `ms` milliseconds, saturating at the edges of chrono's date
+    /// range so the result can always be displayed. It never panics, whatever
+    /// `ms` is; use [`SimTime::checked_plus_ms`] to detect the edge instead.
     pub fn plus_ms(self, ms: i64) -> Self {
-        SimTime(self.0 + ms)
+        let min = DateTime::<Utc>::MIN_UTC.timestamp_millis();
+        let max = DateTime::<Utc>::MAX_UTC.timestamp_millis();
+        SimTime(self.0.saturating_add(ms).clamp(min, max))
     }
 
     /// This time plus `ms` milliseconds, or `None` on overflow or when the result
