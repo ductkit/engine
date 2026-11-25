@@ -240,7 +240,11 @@ async fn list(
         engine: &sim.engine,
         at,
     };
-    let all = ordered(view.engine, r);
+    // A required filter is always a parent field, so its children index serves it.
+    let all = match r.required {
+        Some(name) => view.engine.store().children(r.t, name, &p.extra[name]),
+        None => ordered(view.engine, r),
+    };
     let (page, has_more) = paginate(
         &all,
         |o| {

@@ -143,3 +143,19 @@ async fn fault_sequence_is_deterministic() {
         runs[0]
     );
 }
+
+#[tokio::test]
+async fn timeout_sends_no_status_line() {
+    let m = mock_with("[api]\nerrors = { timeout = 1.0 }").await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    // A client that branches on status must not see one: `send` itself times out.
+    let sent = client
+        .get(format!("{}/v1/customers", m.api_url()))
+        .bearer_auth("sk_test_mock")
+        .send()
+        .await;
+    assert!(sent.as_ref().is_err_and(|e| e.is_timeout()), "{sent:?}");
+}

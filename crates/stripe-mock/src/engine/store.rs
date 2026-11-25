@@ -18,12 +18,15 @@ pub(crate) struct StoredObject {
 
 #[derive(Debug, Default)]
 struct TypeStore {
-    order: Vec<String>,
-    objects: HashMap<String, StoredObject>,
+    /// Every object, in creation order.
+    objects: Vec<StoredObject>,
+    /// Position in `objects` by ID. Lookups only.
+    index: HashMap<String, usize>,
     /// IDs not deleted, in creation order.
     live: Vec<String>,
-    /// Children by `(parent field, parent ID)`, in creation order. Lookups only.
-    parents: HashMap<(&'static str, String), Vec<String>>,
+    /// Positions of children by `(parent field, parent ID)`, in creation order.
+    /// Lookups only.
+    parents: HashMap<(&'static str, String), Vec<usize>>,
 }
 
 /// The parent fields indexed for each type. Parent fields never change.
@@ -45,16 +48,17 @@ pub(crate) struct ObjectStore {
 
 impl ObjectStore {
     pub(crate) fn get(&self, t: ObjectType, id: &str) -> Option<&StoredObject> {
-        self.types.get(&t)?.objects.get(id)
+        let ts = self.types.get(&t)?;
+        ts.index.get(id).map(|&i| &ts.objects[i])
     }
 
     /// Every object of `t` (deleted included), newest `created` first,
     /// ties broken by later creation first. `created` never decreases in
     /// creation order (checked on insert), so this is reverse creation order.
     pub(crate) fn list_order(&self, t: ObjectType) -> Vec<&StoredObject> {
-        let mut all = self.in_creation_order(t);
-        all.reverse();
-        all
+        self.types
+            .get(&t)
+            .map_or_else(Vec::new, |ts| ts.objects.iter().rev().collect())
     }
 
     /// IDs of objects of `t` that are not deleted, in creation order.
@@ -64,14 +68,13 @@ impl ObjectStore {
 
     /// Every object of `t` (deleted included), in creation order.
     pub(crate) fn in_creation_order(&self, t: ObjectType) -> Vec<&StoredObject> {
-        match self.types.get(&t) {
-            Some(ts) => ts.order.iter().map(|id| &ts.objects[id]).collect(),
-            None => Vec::new(),
-        }
+        self.types
+            .get(&t)
+            .map_or_else(Vec::new, |ts| ts.objects.iter().collect())
     }
 
-    /// Objects of `t` (deleted included) whose `parent_field` is `parent_id`,
-    /// in creation order.
+    /// Objects of `t` (deleted included) whose `parent_field` was `parent_id`
+    /// at creation, in creation order.
     pub(crate) fn children(
         &self,
         t: ObjectType,
@@ -91,8 +94,8 @@ impl ObjectStore {
         };
         ts.parents
             .get(&(*field, parent_id.to_string()))
-            .map_or_else(Vec::new, |ids| {
-                ids.iter().map(|id| &ts.objects[id]).collect()
+            .map_or_else(Vec::new, |pos| {
+                pos.iter().map(|&i| &ts.objects[i]).collect()
             })
     }
 
@@ -105,32 +108,28 @@ impl ObjectStore {
     pub(crate) fn insert(&mut self, update: StateUpdate, created: i64, log_pos: usize) {
         let ts = self.types.entry(update.object_type).or_default();
         let id = update.object_id.clone();
-        debug_assert!(!ts.objects.contains_key(&id), "duplicate id {id}");
+        debug_assert!(!ts.index.contains_key(&id), "duplicate id {id}");
         debug_assert!(
-            ts.order
-                .last()
-                .is_none_or(|last| ts.objects[last].created <= created),
+            ts.objects.last().is_none_or(|last| last.created <= created),
             "created must not decrease in creation order"
         );
-        ts.order.push(id.clone());
-        ts.live.push(id.clone());
+        let pos = ts.objects.len();
+        ts.index.insert(id.clone(), pos);
         for field in parent_fields(update.object_type) {
             if let Some(parent) = update.state[*field].as_str() {
                 ts.parents
                     .entry((field, parent.to_string()))
                     .or_default()
-                    .push(id.clone());
+                    .push(pos);
             }
         }
-        ts.objects.insert(
-            id,
-            StoredObject {
-                latest: update,
-                created,
-                deleted: false,
-                versions: vec![log_pos],
-            },
-        );
+        ts.live.push(id);
+        ts.objects.push(StoredObject {
+            latest: update,
+            created,
+            deleted: false,
+            versions: vec![log_pos],
+        });
     }
 
     /// Records a new version; `log_pos` is its truth-log position.
@@ -139,10 +138,11 @@ impl ObjectStore {
             .types
             .get_mut(&update.object_type)
             .expect("replace of unknown object");
-        let obj = ts
-            .objects
-            .get_mut(&update.object_id)
+        let pos = *ts
+            .index
+            .get(&update.object_id)
             .expect("replace of unknown object");
+        let obj = &mut ts.objects[pos];
         let deleted = update.kind == ChangeKind::Deleted;
         if deleted
             && !obj.deleted
@@ -206,6 +206,33 @@ mod tests {
         objs.into_iter()
             .map(|o| o.latest.object_id.clone())
             .collect()
+    }
+
+    /// Run with `cargo test -p ductkit-stripe-mock --release --lib -- --ignored list_order_is_cheap`.
+    /// A backfill page lists the full order; 1 000 pages over 200 000 objects
+    /// must not cost seconds of lock time.
+    #[test]
+    #[ignore]
+    fn list_order_is_cheap() {
+        let mut s = ObjectStore::default();
+        for i in 0..200_000 {
+            add(
+                &mut s,
+                ObjectType::Customer,
+                &format!("cus_{i:014}"),
+                i,
+                json!({}),
+            );
+        }
+        let started = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..1_000 {
+            n += std::hint::black_box(s.list_order(ObjectType::Customer)).len();
+        }
+        let took = started.elapsed();
+        println!("1000 list_order calls over 200k objects: {took:?}");
+        assert_eq!(n, 200_000_000);
+        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
     }
 
     #[test]

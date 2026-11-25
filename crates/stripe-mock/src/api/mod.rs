@@ -137,7 +137,17 @@ async fn gate(State(shared): State<Arc<Shared>>, req: Request, next: Next) -> Re
     };
     let mut response = match decision {
         Err(e) => e.into_response(),
-        Ok((Some(fault), _)) => fault_response(fault, &shared),
+        Ok((Some(Fault::Timeout), _)) => {
+            // Hold before any response exists, so no status line is ever sent;
+            // then abort the connection like a reset.
+            let mut shutdown = shared.shutdown.subscribe();
+            tokio::select! {
+                _ = tokio::time::sleep(TIMEOUT_HOLD) => {}
+                _ = shutdown.wait_for(|stopping| *stopping) => {}
+            }
+            fault_response(Fault::Reset)
+        }
+        Ok((Some(fault), _)) => fault_response(fault),
         Ok((None, latency_ms)) => {
             if latency_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(latency_ms)).await;
@@ -153,7 +163,7 @@ async fn gate(State(shared): State<Arc<Shared>>, req: Request, next: Next) -> Re
 }
 
 /// The response for an injected fault.
-fn fault_response(fault: Fault, shared: &Shared) -> Response {
+fn fault_response(fault: Fault) -> Response {
     let retryable = |status: StatusCode, error_type, code, message: &str| {
         let mut r = ApiError {
             status,
@@ -193,16 +203,10 @@ fn fault_response(fault: Fault, shared: &Shared) -> Response {
             None,
             "The server is temporarily unavailable. Please retry.",
         ),
-        Fault::Reset => broken(Body::from_stream(futures_util::stream::once(async move {
-            Err::<Bytes, _>(reset())
-        }))),
-        Fault::Timeout => {
-            let mut shutdown = shared.shutdown.subscribe();
+        // A body that fails on its first poll makes hyper drop the connection
+        // without writing the head. `Timeout` reaches here after its hold.
+        Fault::Reset | Fault::Timeout => {
             broken(Body::from_stream(futures_util::stream::once(async move {
-                tokio::select! {
-                    _ = tokio::time::sleep(TIMEOUT_HOLD) => {}
-                    _ = shutdown.wait_for(|stopping| *stopping) => {}
-                }
                 Err::<Bytes, _>(reset())
             })))
         }
