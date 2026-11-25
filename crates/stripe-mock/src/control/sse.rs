@@ -19,6 +19,8 @@ use super::http::{ControlError, Query, mock, parse_filter};
 use crate::SubscriptionItem;
 use crate::handle::Shared;
 
+/// How long a final close frame may take to send.
+const CLOSE_GRACE: Duration = Duration::from_millis(500);
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
 #[derive(Deserialize)]
@@ -85,8 +87,15 @@ async fn pump(mut socket: WebSocket, mut sub: crate::Subscription, shared: Arc<S
                     None => json!({"type": name}),
                 }
                 .to_string();
-                if socket.send(Message::Text(text.into())).await.is_err() {
-                    return;
+                // Race the send against shutdown: a client that stopped reading
+                // must not hold this task.
+                tokio::select! {
+                    sent = socket.send(Message::Text(text.into())) => {
+                        if sent.is_err() {
+                            return;
+                        }
+                    }
+                    () = &mut stop => break,
                 }
                 if matches!(item, SubscriptionItem::Lagged) {
                     break;
@@ -100,5 +109,9 @@ async fn pump(mut socket: WebSocket, mut sub: crate::Subscription, shared: Arc<S
             () = &mut stop => break,
         }
     }
-    let _ = socket.send(Message::Close(None)).await;
+    tokio::select! {
+        _ = socket.send(Message::Close(None)) => {}
+        // A stalled client must not hold the task: bound the close frame.
+        () = tokio::time::sleep(CLOSE_GRACE) => {}
+    }
 }

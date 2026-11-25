@@ -210,15 +210,43 @@ async fn ws_rejects_bad_filter_before_upgrade() {
     ));
 }
 
-#[tokio::test]
-async fn slow_sse_client_gets_lagged() {
-    let m = mock_with_control("seed = 1").await;
-    let mut sse = Sse::open(&m, "?types=customer").await;
-    // Do not read. The default buffer is 1024 live updates; the socket's own
-    // buffers absorb some more, so generate far beyond both.
-    for _ in 0..12_000 {
-        m.run_action(Action::NewCustomer).unwrap();
+/// Opens an SSE subscription on a raw socket and never reads from it.
+async fn stalled_sse(m: &MockStripe, query: &str) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let url = m.control_url().unwrap().replace("http://", "");
+    let mut tcp = tokio::net::TcpStream::connect(&url).await.unwrap();
+    let req = format!(
+        "GET /control/subscribe{query} HTTP/1.1\r\nHost: {url}\r\nAccept: text/event-stream\r\n\r\n"
+    );
+    tcp.write_all(req.as_bytes()).await.unwrap();
+    tcp
+}
+
+/// Generates `n` customer updates, yielding to the server tasks between batches
+/// so they can write to their sockets.
+///
+/// The default buffer is 1024 live updates. An update is about 1 KB of JSON, and
+/// loopback socket buffers (client receive plus server send, plus hyper's) hold
+/// at most a few MB, so 30 000 updates (~30 MB) exceed the channel and every
+/// buffer in front of it with a wide margin.
+async fn flood(m: &MockStripe) {
+    for batch in 0..150 {
+        for _ in 0..200 {
+            m.run_action(Action::NewCustomer).unwrap();
+        }
+        tokio::task::yield_now().await;
+        if batch % 10 == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_sse_client_gets_lagged() {
+    use tokio::io::AsyncReadExt;
+    let m = mock_with_control("seed = 1").await;
+    let mut tcp = stalled_sse(&m, "?types=customer").await;
+    flood(&m).await;
     let t = Instant::now();
     m.step(Duration::from_secs(1)).await.unwrap();
     assert!(
@@ -227,18 +255,81 @@ async fn slow_sse_client_gets_lagged() {
         t.elapsed()
     );
 
-    let (mut updates, mut lagged) = (0, false);
-    while let Some((event, _)) = sse.next().await {
-        assert!(!lagged, "frame `{event}` after lagged");
-        match event.as_str() {
-            "update" => updates += 1,
-            "synced" => {}
-            "lagged" => lagged = true,
-            other => panic!("unexpected event {other}"),
+    // Now read everything: updates, then `lagged`, then the end of the stream.
+    // The connection is keep-alive, so the end of the body is the final
+    // zero-length chunk, not EOF.
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    while !raw.ends_with(b"0\r\n\r\n") {
+        let n = tokio::time::timeout(WAIT, tcp.read(&mut chunk))
+            .await
+            .unwrap_or_else(|_| {
+                let t = String::from_utf8_lossy(&raw);
+                panic!(
+                    "stalled; {} bytes; tail {:?}",
+                    raw.len(),
+                    &t[t.len().saturating_sub(300)..]
+                )
+            })
+            .unwrap();
+        assert!(n > 0, "connection closed before the body ended");
+        raw.extend_from_slice(&chunk[..n]);
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let lagged = text.rfind("event: lagged").expect("lagged event");
+    assert!(text.contains("event: update"), "some updates before lagged");
+    assert!(
+        !text[lagged..].contains("event: update"),
+        "no updates after lagged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_lagged_then_close() {
+    let m = mock_with_control("seed = 1").await;
+    let mut ws = Box::pin(ws_connect(&m, "?types=customer").await);
+    flood(&m).await;
+    let mut saw_lagged = false;
+    loop {
+        match tokio::time::timeout(WAIT, ws.next())
+            .await
+            .expect("ws stalled")
+        {
+            Some(Message::Text(t)) => {
+                assert!(!saw_lagged, "frame after lagged: {t}");
+                let v: Value = serde_json::from_str(t.as_str()).unwrap();
+                if v["type"] == "lagged" {
+                    assert_eq!(v, json!({"type": "lagged"}));
+                    saw_lagged = true;
+                }
+            }
+            Some(Message::Close(_)) => break,
+            Some(_) => {}
+            None => panic!("connection ended without a close frame"),
         }
     }
-    assert!(updates > 0, "some updates arrive before lagged");
-    assert!(lagged, "stream ends with lagged");
+    assert!(saw_lagged, "lagged precedes the close frame");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_with_stalled_clients_is_bounded() {
+    let m = mock_with_control("seed = 1").await;
+    let _sse = stalled_sse(&m, "").await;
+    let _ws = ws_connect(&m, "").await; // never polled, so never reads
+    flood(&m).await;
+    let api = m.api_url().replace("http://", "");
+    let control = m.control_url().unwrap().replace("http://", "");
+    let t = Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), m.shutdown())
+        .await
+        .expect("shutdown is bounded");
+    assert!(t.elapsed() < Duration::from_secs(5));
+    for addr in [api, control] {
+        assert!(
+            tokio::net::TcpStream::connect(&addr).await.is_err(),
+            "{addr} still accepts connections"
+        );
+    }
 }
 
 #[tokio::test]
@@ -252,7 +343,16 @@ async fn streams_end_on_shutdown() {
     m.shutdown().await;
     let ended = tokio::time::timeout(Duration::from_secs(1), async {
         assert!(sse.next().await.is_none());
-        assert!(ws_json(&mut ws).await.is_none());
+        // An idle client reads promptly, so the server sends a Close frame;
+        // `ws_json` returns None for a Close frame and for a dropped connection,
+        // so check for the frame explicitly.
+        loop {
+            match ws.next().await {
+                Some(Message::Close(_)) => break,
+                Some(_) => {}
+                None => panic!("connection dropped without a close frame"),
+            }
+        }
     })
     .await;
     assert!(

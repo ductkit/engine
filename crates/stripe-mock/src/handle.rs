@@ -224,6 +224,9 @@ pub struct MockStripe {
     ticker: Option<JoinHandle<()>>,
 }
 
+/// How long `shutdown` waits for a server to drain before aborting it.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
 /// Where [`MockStripe::start_with`] listens.
 #[derive(Debug, Clone, Default)]
 pub struct StartOptions {
@@ -399,7 +402,16 @@ impl MockStripe {
             .into_iter()
             .flatten()
         {
-            let _ = server.await;
+            // A client that stopped reading can hold graceful shutdown open; give
+            // the server a moment to drain, then drop its listener and tasks.
+            let mut server = server;
+            if tokio::time::timeout(SHUTDOWN_GRACE, &mut server)
+                .await
+                .is_err()
+            {
+                server.abort();
+                let _ = server.await;
+            }
         }
     }
 
