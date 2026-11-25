@@ -168,6 +168,9 @@ fn parse_replay(mut flags: Flags) -> Result<Command, String> {
 
 /// Reads a config file for standalone use: `clock.mode` defaults to `wall`
 /// (spec 3), then `--clock` and `--seed` override the file.
+///
+/// The user's text is parsed as written, so parse errors carry its own line
+/// numbers. Defaults and overrides are applied to the typed `Config` after that.
 fn load_config(
     path: &std::path::Path,
     clock: Option<ClockMode>,
@@ -175,56 +178,77 @@ fn load_config(
 ) -> Result<Config, MockError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| MockError::Config(format!("cannot read {}: {e}", path.display())))?;
-    let mut table: toml::Table = text
+    let mut config = Config::from_toml_str(&text)?;
+    let table: toml::Table = text
         .parse()
         .map_err(|e| MockError::Config(format!("{}: {e}", path.display())))?;
-    let section = table
-        .entry("clock")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    // A `clock` that is not a table is left for `Config::from_toml_str` to reject.
-    if let Some(section) = section.as_table_mut() {
-        if let Some(mode) = clock {
-            let name = match mode {
-                ClockMode::Virtual => "virtual",
-                ClockMode::Wall => "wall",
-            };
-            section.insert("mode".into(), name.into());
-        } else if !section.contains_key("mode") {
-            section.insert("mode".into(), "wall".into());
-        }
+    let file_sets_mode = table
+        .get("clock")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|c| c.contains_key("mode"));
+    if let Some(mode) = clock {
+        config.clock.mode = mode;
+    } else if !file_sets_mode {
+        config.clock.mode = ClockMode::Wall;
     }
     if let Some(seed) = seed {
-        let seed = i64::try_from(seed).map_err(|_| MockError::Config("seed too large".into()))?;
-        table.insert("seed".into(), seed.into());
+        config.seed = seed;
     }
-    let text = toml::to_string(&table).map_err(|e| MockError::Config(e.to_string()))?;
-    Config::from_toml_str(&text)
+    config.validate()?;
+    Ok(config)
 }
 
 /// Resolves on Ctrl-C, on SIGTERM (unix), or when `POST /control/shutdown` arrives.
-async fn wait_for_stop(mock: &MockStripe) {
-    let requested = mock.shutdown_requested();
+struct StopSignals {
+    interrupt: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
     #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+impl StopSignals {
+    /// Installs the handlers now. Call it before the ready line is printed: a
+    /// harness may signal the process the moment it reads that line, and a
+    /// signal that arrives before a handler exists kills the process.
+    async fn install() -> StopSignals {
+        let mut interrupt: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async {
+            // Without a signal handler only the control API can stop us.
+            if tokio::signal::ctrl_c().await.is_err() {
+                std::future::pending::<()>().await;
             }
-            Err(_) => std::future::pending::<()>().await,
+        });
+        // `ctrl_c()` registers its handler on first poll, so poll once here.
+        std::future::poll_fn(|cx| {
+            let _ = interrupt.as_mut().poll(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        StopSignals {
+            interrupt,
+            // Registered on creation.
+            #[cfg(unix)]
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .ok(),
         }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    let interrupt = async {
-        // Without a signal handler only the control API can stop us.
-        if tokio::signal::ctrl_c().await.is_err() {
-            std::future::pending::<()>().await;
+    }
+
+    async fn wait(mut self, mock: &MockStripe) {
+        let requested = mock.shutdown_requested();
+        #[cfg(unix)]
+        let terminate = async {
+            match self.terminate.as_mut() {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        tokio::select! {
+            () = &mut self.interrupt => {}
+            () = terminate => {}
+            () = requested => {}
         }
-    };
-    tokio::select! {
-        () = interrupt => {}
-        () = terminate => {}
-        () = requested => {}
     }
 }
 
@@ -239,6 +263,7 @@ async fn serve_until_stopped(
             "warning: the control API on {control_addr} has no authentication and is not bound to loopback"
         );
     }
+    let signals = StopSignals::install().await;
     let ready = serde_json::json!({
         "api_url": mock.api_url(),
         "control_url": mock.control_url(),
@@ -250,7 +275,7 @@ async fn serve_until_stopped(
         let _ = writeln!(out, "{ready}");
         let _ = out.flush();
     }
-    wait_for_stop(&mock).await;
+    signals.wait(&mock).await;
     let mut code = ExitCode::SUCCESS;
     if let Some(path) = export_on_exit
         && let Err(e) = mock.export_run().save(&path)

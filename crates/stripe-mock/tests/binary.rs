@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use ductkit_stripe_mock::{Config, MockStripe, NewCustomer, RunExport};
@@ -51,10 +51,25 @@ impl Server {
         let mut child = Command::new(BIN)
             .args(args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("binary spawns");
         let stdout = child.stdout.take().unwrap();
+        // Drained continuously so the child never blocks on a full pipe.
+        let stderr_text = Arc::new(Mutex::new(String::new()));
+        let mut stderr = child.stderr.take().unwrap();
+        let sink = stderr_text.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = stderr.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut line = String::new();
@@ -68,10 +83,13 @@ impl Server {
             control_url: String::new(),
             seed: 0,
         };
-        let line = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("ready line within 10 s");
-        let ready: Value = serde_json::from_str(&line).expect("ready line is JSON");
+        let line = rx.recv_timeout(Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(50));
+        let stderr = stderr_text.lock().unwrap().clone();
+        let line =
+            line.unwrap_or_else(|e| panic!("no ready line within 10 s ({e}); stderr: {stderr}"));
+        let ready: Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("ready line {line:?} is not JSON ({e}); stderr: {stderr}"));
         server.api_url = ready["api_url"].as_str().unwrap().to_string();
         server.control_url = ready["control_url"].as_str().unwrap().to_string();
         server.seed = ready["seed"].as_u64().unwrap();
@@ -305,4 +323,41 @@ fn bad_flags_exit_2() {
     let out = run(&["--help"]);
     assert_eq!(out.code, Some(0));
     assert!(out.stdout.contains("usage"), "{}", out.stdout);
+}
+
+#[test]
+fn check_reports_file_line_numbers() {
+    let dir = temp_dir();
+    let bad = write(
+        &dir,
+        "bad.toml",
+        "seed = 1
+
+[clock]
+speed = \"x\"
+",
+    );
+    let out = run(&["check", "--config", bad.to_str().unwrap()]);
+    assert_eq!(out.code, Some(1));
+    assert!(out.stderr.contains("line 4"), "{}", out.stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_right_after_ready_line_exports_and_exits_zero() {
+    let dir = temp_dir();
+    let config = write(&dir, "c.toml", MINIMAL);
+    let export = dir.join("run.json");
+    let mut s = Server::serve(&config, &["--export-on-exit", export.to_str().unwrap()]);
+    let pid = s.child.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = s.wait_exit(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(0));
+    assert!(RunExport::load(&export).is_ok());
 }
