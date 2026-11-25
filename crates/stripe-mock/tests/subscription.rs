@@ -82,6 +82,7 @@ async fn type_filter_excludes() {
     m.create_customer(NewCustomer::default()).unwrap();
     let mut s = m.subscribe(SubscribeFilter {
         object_types: Some(vec![]),
+        ..Default::default()
     });
     assert_eq!(next(&mut s).await, Some(SubscriptionItem::Synced));
 }

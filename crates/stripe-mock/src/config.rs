@@ -1388,6 +1388,12 @@ platforms = 2",
     }
 
     #[test]
+    fn spec_mentions_stripe_context() {
+        let spec = include_str!("../../../docs/stripe-mock-spec.md");
+        assert!(spec.contains("Stripe-Context"));
+    }
+
+    #[test]
     fn spec_example_accounts_section_parses() {
         let spec = include_str!("../../../docs/stripe-mock-spec.md");
         let toml = spec

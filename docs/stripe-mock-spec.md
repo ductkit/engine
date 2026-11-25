@@ -141,6 +141,8 @@ archive = 0.1
 update = 0.5         # metadata
 [churn.invoice]
 update = 0.5         # metadata
+[churn.account]
+update = 0.2         # business profile, email and metadata of a random connected account
 
 [api]
 keys = ["sk_test_mock"]   # accepted API keys (section 7.1)
@@ -187,6 +189,20 @@ enabled_events = ["v1.customer.*", "v1.invoice.*"]
 events_from = ["@self", "@accounts"]   # @accounts: events from connected accounts
 ```
 
+`[accounts]` defaults and rules:
+
+- `platforms` must be `1`; any other value is rejected as not implemented.
+- `connect` defaults to `false`. With `connect = false` a connected-account count or rate above 0, any `Stripe-Account` or `Stripe-Context` header, and the `connect` / `events_from` destination options are errors.
+- Defaults: `initial = 0`, `connect_rate = 0`, `deauthorize_rate = 0`, `account_api = { v1 = 0.5, v2 = 0.5 }`, `account_types = { standard = 0.5, express = 0.3, custom = 0.2 }`. Each mix must sum to 1 (±1e-9) with no negative weight.
+- `[churn.account] update` (per hour, default 0) updates a random connected account.
+- Initial accounts are connected at the start of history (`clock.start - history.duration`), so they get history too; their connect events fall inside history and are not delivered.
+
+Destination rules:
+
+- A snapshot destination receives events with no account label. With `connect = true` it also receives events labelled with a connected account (carrying `account`). `events_from` on a snapshot destination is a config error.
+- A thin destination receives unlabelled events for `"@self"` and labelled events for `"@accounts"` (carrying `context`). `events_from` defaults to `["@self"]`. `connect` on a thin destination is a config error.
+- `@organization_members…` values are rejected as not implemented (organizations are out of scope).
+
 Configuration can be changed at runtime through the control API (section 11). Changes are recorded in the truth log, so replays reproduce them.
 
 ## 5. Entities and lifecycles
@@ -231,9 +247,28 @@ Phase 3 generates `incomplete → active | incomplete_expired`, `active ⇄ past
 The mock models connected accounts created through **both** Accounts APIs, in the proportion set by `accounts.account_api`:
 
 - **v1 accounts** (`/v1/accounts`): `type` standard, express or custom. Lifecycle events include `account.updated`, `account.application.authorized` and `account.application.deauthorized`, with thin `v1.` equivalents.
-- **v2 accounts** (`/v2/core/accounts`): modelled with Accounts v2 configurations (merchant, customer, recipient). As v2 resources they emit thin events only (`v2.core.account.*`), never snapshot events.
-- Both kinds use `acct_` IDs and are addressed with the `Stripe-Account` header. Whether a v2 account is also readable through `/v1/accounts` follows Stripe's documented behaviour for the pinned version (section 18).
-- Accounts can be connected and disconnected during a run (`connect_rate`, `deauthorize_rate`, control API).
+- **v2 accounts** (`/v2/core/accounts`): modelled with Accounts v2 configurations. Each of `merchant`, `customer` and `recipient` is applied with probability 0.5; an empty draw is rerolled to `["merchant"]`. They emit the thin `v2.core.account.created`, `.updated` and `.closed` events (platform scope, `context: null`, no snapshot pair). They **also** emit the v1 events of the table below, including the v1 `account.updated` snapshot event, so a v1 consumer sees them too.
+- Both kinds use `acct_` IDs and are addressed with `Stripe-Account` (v1 endpoints) or `Stripe-Context` (v1 and v2 endpoints); see section 7.1.
+- **Both APIs read both kinds of account.** A v2-created account appears in `/v1/accounts` in the v1 shape with `type: "none"` and a `controller`; a v1-created account appears in `/v2/core/accounts` with `applied_configurations: ["merchant"]`. Sources: Stripe's Accounts v2 and Connect webhooks documentation (section 18).
+- Accounts can be connected and disconnected during a run (`connect_rate`, `deauthorize_rate`, control API). The mock uses one "disconnect" for every account, although Stripe allows deauthorization only for Standard accounts.
+
+| Lifecycle step | Events | Event account label |
+|---|---|---|
+| Connect, any account | `account.application.authorized` and thin `v1.account.application.authorized` | the account |
+| Connect, v2 account | additionally thin `v2.core.account.created` | none |
+| Update, any account | `account.updated` and thin `v1.account.updated` | the account |
+| Update, v2 account | additionally thin `v2.core.account.updated` | none |
+| Disconnect, any account | `account.application.deauthorized` and thin `v1.account.application.deauthorized` | the account |
+| Disconnect, v2 account | additionally thin `v2.core.account.closed` | none |
+
+The `data.object` of `account.application.*` is the platform application (`{"id": "ca_…", "object": "application", "name": …}`). The thin `related_object` of every account event is the account (`/v1/accounts/{id}`).
+
+**Disconnect and closed semantics.**
+
+- A disconnect is a delete in the store for both APIs; the v1 tombstone is `{"id", "object": "account", "deleted": true}`. `/v1/accounts` omits the account and `/v1/accounts/{id}` returns 404. `/v2/core/accounts/{id}` still renders the last live version with `closed: true`.
+- `/v2/core/accounts` lists only open accounts by default. `closed=true` lists **only** closed accounts.
+- A disconnected account's header is rejected with 403 `account_invalid` on every endpoint, so its events cannot be fetched through the Events APIs. No new events are created in its scope. Deliveries already queued for it still go out to connect destinations.
+- A disconnected account's objects remain in the truth log and in subscriptions as they were.
 
 **Event coverage is identical for platform and connected accounts.** Every action, entity type, lifecycle and event type the mock generates for a platform account is generated for each connected account too, with the same rates. Connected-account events reach snapshot destinations with `connect = true` (carrying `account`) and thin destinations with `@accounts` in `events_from` (carrying `context`). All faults apply to them in the same way.
 
@@ -280,7 +315,13 @@ History events are listed by the Events APIs while inside retention, but never d
 ### 7.1 Requests and responses
 
 - `Authorization: Bearer sk_test_…` (any key from config; unknown keys → 401).
-- `Stripe-Account: acct_…` for Connect; objects are scoped per account.
+- `Stripe-Account: acct_…` and `Stripe-Context: acct_…` select a connected account; objects, lists and events are scoped per account. Without a header the request is the platform's.
+  - On `/v1/` endpoints both headers select the scope; on `/v2/` endpoints only `Stripe-Context` does, and `Stripe-Account` there gets a 400 (`Use the Stripe-Context header with v2 endpoints.`).
+  - If both are present and differ: 400 (`Stripe-Account and Stripe-Context name different accounts.`). An empty header value is treated as absent.
+  - An unknown or disconnected account: 403, `invalid_request_error`, code `account_invalid` (`The provided key does not have access to account '{acct}' (or that account does not exist). Application access may have been revoked.`).
+  - The Accounts endpoints (`/v1/accounts`, `/v2/core/accounts`) are platform-only: a connected-account header gets 400 (`Accounts endpoints must be called by the platform.`). The delivery-target lists (`/v1/webhook_endpoints`, `/v2/core/event_destinations`) are platform-only too: a connected scope sees an empty list.
+  - Event retrieve by ID outside the request's scope returns 404. With `connect = false`, any of these headers gets `Connected accounts are not enabled in this mock.`
+  - Faults (rate limits, errors, stale reads, pagination writes) apply to connected scopes like the platform; a stale read or pagination write stays inside the request's scope.
 - Stripe error envelope (`{"error": {"type", "code", "message", ...}}`), `Request-Id` header, `Stripe-Should-Retry` on retryable errors.
 - **One API version**: `2026-11-18.endive`, the latest stable version when this spec was written. Requests with no `Stripe-Version` header are served at that version; a different `Stripe-Version` gets an error. All snapshot payloads use this version. Moving to a newer version is a deliberate change to the mock (update the OpenAPI spec it is generated from, section 14).
 - **Read-only**: every `POST`, `PUT`, `PATCH` and `DELETE` returns a Stripe-style `invalid_request_error` explaining that the mock is read-only.
@@ -291,7 +332,9 @@ History events are listed by the Events APIs while inside retention, but never d
 - Sub-lists for embedded collections: `GET /v1/subscription_items?subscription=…`, `GET /v1/invoices/{id}/lines`.
 - Snapshot events: `GET /v1/events`, `GET /v1/events/{id}`.
 - Thin events: `GET /v2/core/events`, `GET /v2/core/events/{id}` (section 8.2).
-- Connect: `GET /v1/accounts`, `GET /v1/accounts/{id}`, `GET /v2/core/accounts`, `GET /v2/core/accounts/{id}`.
+- Connect: `GET /v1/accounts`, `GET /v1/accounts/{id}`, `GET /v2/core/accounts`, `GET /v2/core/accounts/{id}`. Platform-only, and each API reads both kinds of account (section 5.4).
+  - `/v1/accounts` lists connected accounts only; a disconnected account is absent and its retrieve is 404.
+  - `/v2/core/accounts` lists open accounts by default; `closed=true` lists only closed (disconnected) accounts. Retrieve renders a closed account with `closed: true`.
 - Read-only views of configured delivery targets: `GET /v1/webhook_endpoints` (snapshot targets) and `GET /v2/core/event_destinations` (thin targets), so the sync engine can check its setup.
 
 ### 7.3 List semantics
@@ -353,7 +396,7 @@ Through the control API and the Rust handle, a test can subscribe to **the lates
 
 ### 10.1 Semantics
 
-- On subscribe, the subscriber first receives the current state of every object (optionally filtered by account and object type), then a `synced` marker, then every subsequent change as it happens in the truth log.
+- On subscribe, the subscriber first receives the current state of every object (optionally filtered by object type and by account: `SubscribeFilter.accounts` lists scopes, `None` for the platform; an absent filter means every scope; snapshot and live updates are both filtered on the update's account), then a `synced` marker, then every subsequent change as it happens in the truth log.
 - Every message carries the object's full state after the change and its per-object `version`.
 - Deleted objects are sent as tombstones (`kind: "deleted"`, `state` = Stripe's deleted stub), so a subscriber can tell "deleted" from "never seen".
 - A subscriber that falls too far behind is not allowed to slow the mock down. It is told it lagged and must resubscribe, which gives it a fresh snapshot. Because every message is a complete latest state, nothing is lost by skipping intermediate versions.
@@ -408,6 +451,10 @@ Separate from the Stripe surface. Available as a Rust handle in-process and as H
 ## 12. Determinism and time
 
 - One seeded RNG drives all generation and fault decisions. Separate RNG streams per subsystem (generation, API faults, event visibility, webhooks) so changing one setting doesn't reshuffle unrelated decisions.
+  - Platform streams keep their names and draw order: a run with `connect = false` is identical to one before Connect existed.
+  - Connect streams: `accounts.connect` (connect clock), `accounts.deauthorize` (disconnect clock and pick), `accounts.content` (API, type, configurations and fields of a new account), `accounts.update` (`[churn.account]` clock and content), `accounts.ids` (account IDs), `platform.application` (the `ca_` ID, drawn once at start and only with `connect = true`) and `api.pagination_writes.accounts` (pagination writes on the Accounts list).
+  - Each connected account's generator uses every platform stream name prefixed `account/{acct}/`.
+  - Ties at the same instant run in this order: platform, the accounts generator, then connected accounts in connection order.
 - **Virtual clock** by default in-process: time only moves when the test advances it, or at a fixed multiple of wall time. Retry schedules, visibility lags and history all run on virtual time, so a "3 days of retries" scenario finishes in milliseconds.
 - In wall-clock mode the HTTP layer still uses real latencies; such runs are not exactly reproducible, but the seed still governs generation.
 - **Replay**: any run can be reproduced from its exported seed, config and runtime changes. Test failures should print the seed and the replay command.
@@ -462,5 +509,5 @@ The mock supports all of these through the latest-state subscription, per-object
 
 ## 18. Open questions
 
-- **v1/v2 account interoperability**: how a v2 account appears through `/v1/accounts` and in v1 events (and the reverse) at the pinned version. To be taken from Stripe's docs and OpenAPI spec during implementation.
+- **v1/v2 account interoperability** (answered): both APIs read both kinds of account, and v2 accounts also emit v1 `account.updated` and `account.application.*` events alongside the thin `v2.core.account.*` events. Taken from Stripe's Accounts v2 and Connect webhooks documentation (docs.stripe.com); details in section 5.4.
 - **v2 list details** (pagination parameters, filters beyond `types`): to be taken from the OpenAPI spec for the pinned version rather than decided here.

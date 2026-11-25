@@ -582,8 +582,9 @@ impl Engine {
     ) -> Subscription {
         let snapshot = self
             .stores
-            .values()
-            .flat_map(|store| {
+            .iter()
+            .filter(|(scope, _)| filter.matches_scope(scope))
+            .flat_map(|(_, store)| {
                 let mut types: Vec<ObjectType> = store
                     .all_types()
                     .into_iter()
