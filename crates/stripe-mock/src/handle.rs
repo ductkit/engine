@@ -75,17 +75,70 @@ impl Shared {
             generator.run_until(engine, target);
         }
         let now = sim.engine.now();
+        let mut due = Vec::new();
         while let Some((_, batch)) = sim.engine.due_batch(now) {
-            for a in batch {
-                let shared = self.clone();
-                tokio::spawn(async move {
-                    let (outcome, elapsed) = send(&shared.client, &a).await;
-                    let mut sim = shared.lock();
-                    let now = sim.engine.now();
-                    sim.engine.record_outcome(&a, outcome, elapsed, now);
-                });
+            due.extend(batch);
+        }
+        drop(sim);
+        if !due.is_empty() {
+            self.spawn_batch(due, None);
+        }
+    }
+
+    /// Sends `batch` on its own task, so a cancelled caller loses nothing, and records
+    /// each outcome as it arrives. Attempts to one destination go one at a time in
+    /// queue order; destinations proceed concurrently. Outcomes are recorded at `at`,
+    /// or at the sim time of arrival when `None`.
+    fn spawn_batch(
+        self: &Arc<Self>,
+        batch: Vec<PreparedAttempt>,
+        at: Option<SimTime>,
+    ) -> JoinHandle<()> {
+        let mut lanes: Vec<Vec<PreparedAttempt>> = Vec::new();
+        for a in batch {
+            match lanes
+                .iter_mut()
+                .find(|l| l[0].destination_id == a.destination_id)
+            {
+                Some(lane) => lane.push(a),
+                None => lanes.push(vec![a]),
             }
         }
+        let shared = self.clone();
+        tokio::spawn(async move {
+            let lanes = lanes.into_iter().map(|lane| {
+                let shared = shared.clone();
+                async move {
+                    for a in lane {
+                        let (outcome, elapsed) = send(&shared.client, &a).await;
+                        let mut sim = shared.lock();
+                        let now = at.unwrap_or_else(|| sim.engine.now());
+                        sim.engine.record_outcome(&a, outcome, elapsed, now);
+                    }
+                }
+            });
+            futures_util::future::join_all(lanes).await;
+        })
+    }
+}
+
+/// Leaves quiesce mode when `quiesce` returns or is cancelled.
+struct QuiesceGuard<'a>(&'a Shared);
+
+impl Drop for QuiesceGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut sim) = self.0.sim.lock() {
+            sim.engine.end_quiesce();
+        }
+    }
+}
+
+/// Waits for a delivery task, re-raising its panic.
+async fn join(h: JoinHandle<()>) {
+    if let Err(e) = h.await
+        && e.is_panic()
+    {
+        std::panic::resume_unwind(e.into_panic());
     }
 }
 
@@ -126,7 +179,12 @@ impl MockStripe {
                 anchor_sim: start,
                 paused: false,
             }),
-            client: reqwest::Client::new(),
+            // Stripe treats a redirect as a failed delivery, and receivers are local.
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .build()
+                .map_err(|e| MockError::Config(format!("HTTP client: {e}")))?,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let api_addr = listener.local_addr()?;
@@ -248,17 +306,8 @@ impl MockStripe {
                     (Some(_), None) => unreachable!("covered by the action arm"),
                 }
             };
-            let results = self.send_batch(&batch).await;
-            let mut sim = self.shared.lock();
-            for (a, (outcome, elapsed)) in batch.iter().zip(results) {
-                sim.engine.record_outcome(a, outcome, elapsed, due);
-            }
+            join(self.shared.spawn_batch(batch, Some(due))).await;
         }
-    }
-
-    async fn send_batch(&self, batch: &[PreparedAttempt]) -> Vec<(crate::AttemptOutcome, u64)> {
-        let client = &self.shared.client;
-        futures_util::future::join_all(batch.iter().map(|a| send(client, a))).await
     }
 
     /// Creates a customer now and returns its ID.
@@ -326,6 +375,7 @@ impl MockStripe {
             sim.generator.set_enabled(false, now);
             sim.engine.begin_quiesce();
         }
+        let _quiescing = QuiesceGuard(&self.shared);
         loop {
             let next = {
                 let mut sim = self.shared.lock();
@@ -338,18 +388,13 @@ impl MockStripe {
                 }
             };
             let Some((_, batch)) = next else {
-                // Wall mode: the ticker has attempts in flight; wait for them.
+                // Attempts started elsewhere (the wall ticker, or a cancelled step)
+                // are still in flight; their tasks always finish.
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 continue;
             };
-            let results = self.send_batch(&batch).await;
-            let mut sim = self.shared.lock();
-            let now = sim.engine.now();
-            for (a, (outcome, elapsed)) in batch.iter().zip(results) {
-                sim.engine.record_outcome(a, outcome, elapsed, now);
-            }
+            join(self.shared.spawn_batch(batch, None)).await;
         }
-        self.shared.lock().engine.end_quiesce();
         Ok(())
     }
 

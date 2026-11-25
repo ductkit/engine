@@ -255,7 +255,8 @@ impl Deliveries {
             let d = &mut self.list[index];
             d.attempts += 1;
             d.state = State::InFlight;
-            d.first_attempt_at.get_or_insert(due);
+            // Nominal time: quiesce may send early, but the retry window follows the schedule.
+            d.first_attempt_at.get_or_insert(d.timeline_at);
             let d = d.clone();
             let ev = events
                 .get(&d.event_id)

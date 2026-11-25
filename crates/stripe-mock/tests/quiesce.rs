@@ -77,3 +77,55 @@ async fn wall_mode_delivers() {
     m.create_customer(NewCustomer::default()).unwrap();
     assert_eq!(rx.wait_for(1, Duration::from_secs(5)).await.len(), 1);
 }
+
+#[tokio::test]
+async fn cancelled_step_does_not_lose_the_attempt() {
+    let rx = Receiver::start(|_| (200, Duration::from_millis(1500)));
+    let m = mock_with(&dest(&rx.url("/h"), "snapshot", "*")).await;
+    m.create_customer(NewCustomer::default()).unwrap();
+    let cancelled =
+        tokio::time::timeout(Duration::from_millis(200), m.step(Duration::from_millis(1))).await;
+    assert!(cancelled.is_err(), "step should still be sending");
+    tokio::time::timeout(Duration::from_secs(10), m.quiesce())
+        .await
+        .expect("quiesce finishes")
+        .unwrap();
+    assert!(m.delivery_log().iter().any(|r| matches!(
+        r.kind,
+        DeliveryRecordKind::Attempt {
+            outcome: ductkit_stripe_mock::AttemptOutcome::Success { .. },
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn cancelled_quiesce_ends_quiesce_mode() {
+    let rx = Receiver::start(|_| (500, Duration::from_millis(800)));
+    let m = mock_with(&format!(
+        "{}[webhooks]\nretry_schedule = [\"1m\"]",
+        dest(&rx.url("/h"), "snapshot", "*")
+    ))
+    .await;
+    m.create_customer(NewCustomer::default()).unwrap();
+    let cancelled = tokio::time::timeout(Duration::from_millis(200), m.quiesce()).await;
+    assert!(cancelled.is_err(), "quiesce should still be sending");
+    tokio::time::sleep(Duration::from_millis(1500)).await; // the in-flight attempt finishes
+    m.step(Duration::from_millis(1)).await.unwrap();
+    // Out of quiesce mode the retry waits its minute.
+    assert_eq!(rx.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn quiesce_keeps_the_nominal_retry_window() {
+    let rx = Receiver::start(|_| (500, Duration::ZERO));
+    let m = mock_with(&format!(
+        "{}[webhooks]\ndelivery_delay = {{ distribution = \"fixed\", ms = 600000 }}\nmax_retry_duration = \"10m\"\nretry_schedule = [\"1m\"]",
+        dest(&rx.url("/h"), "snapshot", "*")
+    ))
+    .await;
+    m.create_customer(NewCustomer::default()).unwrap();
+    m.quiesce().await.unwrap();
+    // As under `step`: the first attempt is at +10m and the retry at +11m is within 10m of it.
+    assert_eq!(rx.requests().len(), 2);
+}

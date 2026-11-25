@@ -3,7 +3,9 @@ mod common;
 use std::time::Duration;
 
 use common::{Receiver, dest, get, mock_with, real_now};
-use ductkit_stripe_mock::{AttemptOutcome, DeliveryRecordKind, NewCustomer, verify_signature};
+use ductkit_stripe_mock::{
+    AttemptOutcome, CustomerUpdate, DeliveryRecordKind, NewCustomer, verify_signature,
+};
 use serde_json::Value;
 
 fn ok() -> Receiver {
@@ -108,4 +110,71 @@ async fn generated_traffic_is_delivered_in_step() {
         rx.wait_for(created, Duration::from_secs(10)).await.len(),
         created
     );
+}
+
+#[tokio::test]
+async fn same_instant_events_arrive_in_order() {
+    // A slow receiver: if attempts to one destination raced, all three would
+    // arrive at once, in any order.
+    let rx = Receiver::start(|_| (200, Duration::from_millis(100)));
+    let m = mock_with(&dest(&rx.url("/h"), "snapshot", "*")).await;
+    let id = m.create_customer(NewCustomer::default()).unwrap();
+    m.update_customer(&id, CustomerUpdate::SetName(Some("Ada".into())))
+        .unwrap();
+    m.delete_customer(&id).unwrap();
+    m.step(Duration::from_millis(1)).await.unwrap();
+    let got = rx.wait_for(3, Duration::from_secs(5)).await;
+    let types: Vec<String> = got
+        .iter()
+        .map(|r| {
+            serde_json::from_slice::<Value>(&r.body).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        types,
+        ["customer.created", "customer.updated", "customer.deleted"]
+    );
+    for w in got.windows(2) {
+        assert!(
+            w[1].at - w[0].at >= Duration::from_millis(90),
+            "sent one at a time"
+        );
+    }
+}
+
+#[tokio::test]
+async fn redirects_are_not_followed() {
+    use axum::http::{HeaderValue, StatusCode, header::LOCATION};
+    let target = ok();
+    let to = target.url("/ok");
+    let app = axum::Router::new().fallback(move || {
+        let to = to.clone();
+        async move {
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(LOCATION, HeaderValue::from_str(&to).unwrap())],
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/r", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let m = mock_with(&format!(
+        "{}[webhooks]\nretry_schedule = [\"1h\"]",
+        dest(&url, "snapshot", "*")
+    ))
+    .await;
+    m.create_customer(NewCustomer::default()).unwrap();
+    m.step(Duration::from_millis(1)).await.unwrap();
+    assert!(target.requests().is_empty());
+    assert!(m.delivery_log().iter().any(|r| matches!(
+        r.kind,
+        DeliveryRecordKind::Attempt {
+            outcome: AttemptOutcome::HttpError { status: 307 },
+            ..
+        }
+    )));
 }
