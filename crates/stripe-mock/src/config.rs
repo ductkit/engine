@@ -115,6 +115,16 @@ pub struct ApiConfig {
     pub errors: ApiErrors,
     /// Retrieve and list may show objects as they were up to `max_lag` ago.
     pub stale_read: StaleRead,
+    /// A list page after the first may follow a fresh mutation of the listed type.
+    pub pagination_writes: PaginationWrites,
+}
+
+/// Writes during pagination (spec section 7.4).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PaginationWrites {
+    /// Per list request that carries a cursor.
+    pub probability: f64,
 }
 
 /// Stale reads on object retrieve and list (spec section 7.4).
@@ -184,6 +194,10 @@ impl ApiConfig {
             check_probability(name, p)?;
         }
         check_probability("api.stale_read.probability", self.stale_read.probability)?;
+        check_probability(
+            "api.pagination_writes.probability",
+            self.pagination_writes.probability,
+        )?;
         if self.stale_read.max_lag.ms() < 1 {
             return config_err("api.stale_read.max_lag must be at least 1ms");
         }
@@ -330,6 +344,7 @@ impl Default for ApiConfig {
             rate_limit: None,
             errors: ApiErrors::default(),
             stale_read: StaleRead::default(),
+            pagination_writes: PaginationWrites::default(),
         }
     }
 }

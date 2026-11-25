@@ -63,6 +63,7 @@ pub(crate) struct ApiFaults {
     errors: SimRng,
     latency: SimRng,
     stale: SimRng,
+    pagination_writes: SimRng,
 }
 
 impl ApiFaults {
@@ -74,6 +75,7 @@ impl ApiFaults {
             errors: streams.stream("api.errors"),
             latency: streams.stream("api.latency"),
             stale: streams.stream("api.stale_reads"),
+            pagination_writes: streams.stream("api.pagination_writes"),
         };
         f.set_config(config.clone(), Instant::now());
         f
@@ -103,6 +105,12 @@ impl ApiFaults {
         self.stale
             .chance(s.probability)
             .then(|| self.stale.uniform_ms(1, s.max_lag.ms()))
+    }
+
+    /// For one object list request with a cursor: whether a write runs first.
+    pub(crate) fn pagination_write(&mut self) -> bool {
+        self.pagination_writes
+            .chance(self.config.pagination_writes.probability)
     }
 
     /// The fault for one request that passed the gate (if any) and its latency in ms.

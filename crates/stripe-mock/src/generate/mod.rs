@@ -194,6 +194,8 @@ pub(crate) struct Generator {
     enabled: bool,
     /// Multiplies every configured Poisson rate (`history.scale` during history).
     scale: f64,
+    /// Draws for writes during pagination (spec section 7.4).
+    pagination_rng: SimRng,
 }
 
 impl Generator {
@@ -292,6 +294,7 @@ impl Generator {
                 billing: streams.stream("generate.billing"),
             },
             control: streams.stream("control.actions"),
+            pagination_rng: streams.stream("api.pagination_writes.content"),
             enabled: true,
         }
     }
@@ -473,13 +476,54 @@ impl Generator {
                     })?
             }
         };
+        self.run_due_now(engine);
+        Ok(cause)
+    }
+
+    /// Runs every continuation due at or before now (when generation is on).
+    fn run_due_now(&mut self, engine: &mut Engine) {
         if self.enabled {
             let now = engine.now();
             while self.ctx.next_due().is_some_and(|t| t <= now) {
                 self.run_next_continuation(engine);
             }
         }
-        Ok(cause)
+    }
+
+    /// A write during pagination: one random action for the listed type `t`, then
+    /// any continuations due now. Does nothing while generation is off or for
+    /// sub-list types.
+    pub(crate) fn pagination_write(&mut self, engine: &mut Engine, t: ObjectType) {
+        if !self.enabled {
+            return;
+        }
+        let kinds: &[ActionKind] = match t {
+            ObjectType::Customer => &[
+                ActionKind::NewCustomer,
+                ActionKind::CustomerUpdate,
+                ActionKind::CustomerDelete,
+            ],
+            ObjectType::Product => &[
+                ActionKind::CatalogChange,
+                ActionKind::ProductUpdate,
+                ActionKind::ProductArchive,
+            ],
+            ObjectType::Price => &[
+                ActionKind::CatalogChange,
+                ActionKind::PriceUpdate,
+                ActionKind::PriceArchive,
+            ],
+            ObjectType::Subscription => &[
+                ActionKind::StartSubscription,
+                ActionKind::SubscriptionUpdate,
+                ActionKind::CancelSubscription,
+            ],
+            ObjectType::Invoice => &[ActionKind::OneOffInvoice, ActionKind::InvoiceUpdate],
+            ObjectType::SubscriptionItem | ObjectType::InvoiceLineItem => return,
+        };
+        let kind = *pick(&mut self.pagination_rng, kinds);
+        perform(kind, &mut self.pagination_rng, engine, &mut self.ctx);
+        self.run_due_now(engine);
     }
 }
 
