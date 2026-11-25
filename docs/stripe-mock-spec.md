@@ -172,7 +172,7 @@ name = "thin"
 url = "http://localhost:4000/webhooks/stripe-thin"
 payload = "thin"                     # v2 event destination semantics
 enabled_events = ["v1.customer.*", "v1.invoice.*"]
-events_from = ["self", "other_accounts"]   # other_accounts: events from connected accounts
+events_from = ["@self", "@accounts"]   # @accounts: events from connected accounts
 ```
 
 Configuration can be changed at runtime through the control API (section 11). Changes are recorded in the truth log, so replays reproduce them.

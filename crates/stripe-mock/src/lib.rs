@@ -14,8 +14,10 @@ mod stream;
 mod time;
 
 pub use config::{
-    ActionsConfig, ApiConfig, ChurnConfig, ClockConfig, ClockMode, Config, CustomerChurn,
-    PINNED_API_VERSION,
+    ActionsConfig, ApiConfig, ChurnConfig, ClockConfig, ClockMode, ClockSkew, Config,
+    CustomerChurn, DestinationConfig, DisableAfter, Distribution, DurationStr,
+    EventRetentionConfig, EventsConfig, LateTail, PINNED_API_VERSION, PayloadFormat, RetrySchedule,
+    WebhooksConfig,
 };
 pub use engine::{Cause, ChangeKind, EventRefs, StateUpdate};
 pub use error::MockError;

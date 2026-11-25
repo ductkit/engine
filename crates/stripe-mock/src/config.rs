@@ -11,15 +11,7 @@ use crate::MockError;
 pub const PINNED_API_VERSION: &str = "2026-11-18.endive";
 
 /// Top-level spec sections that phase 1 does not implement yet.
-const UNIMPLEMENTED_SECTIONS: [&str; 7] = [
-    "accounts",
-    "history",
-    "event_retention",
-    "events",
-    "webhooks",
-    "payloads",
-    "destinations",
-];
+const UNIMPLEMENTED_SECTIONS: [&str; 3] = ["accounts", "history", "payloads"];
 
 /// Spec keys inside sections phase 1 does support, but that phase 1 does not implement.
 const UNIMPLEMENTED_KEYS: [(&str, &[&str]); 3] = [
@@ -69,6 +61,10 @@ pub struct Config {
     pub api: ApiConfig,
     pub actions: ActionsConfig,
     pub churn: ChurnConfig,
+    pub events: EventsConfig,
+    pub event_retention: EventRetentionConfig,
+    pub webhooks: WebhooksConfig,
+    pub destinations: Vec<DestinationConfig>,
 }
 
 /// How simulated time moves.
@@ -132,6 +128,10 @@ impl Default for Config {
             api: ApiConfig::default(),
             actions: ActionsConfig::default(),
             churn: ChurnConfig::default(),
+            events: EventsConfig::default(),
+            event_retention: EventRetentionConfig::default(),
+            webhooks: WebhooksConfig::default(),
+            destinations: Vec::new(),
         }
     }
 }
@@ -160,7 +160,7 @@ impl Config {
         let table: toml::Table = s.parse().map_err(|e| MockError::Config(format!("{e}")))?;
         if let Some(path) = first_unimplemented(&table) {
             return Err(MockError::Config(format!(
-                "`{path}` is not implemented yet (phase 1 supports seed, api_version, clock, api.keys, actions.new_customer, churn.customer)"
+                "`{path}` is not implemented yet"
             )));
         }
         let config: Config = toml::from_str(s).map_err(|e| MockError::Config(format!("{e}")))?;
@@ -199,6 +199,360 @@ impl Config {
         }
         if let Some(k) = self.api.keys.iter().find(|k| !k.starts_with("sk_test_")) {
             return err(format!("api key `{k}` must start with `sk_test_`"));
+        }
+        self.events.validate()?;
+        self.webhooks.validate()?;
+        let mut names = std::collections::BTreeSet::new();
+        for d in &self.destinations {
+            d.validate()?;
+            if !names.insert(d.name.as_str()) {
+                return err(format!("destination name `{}` is used twice", d.name));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn config_err<T>(m: impl Into<String>) -> Result<T, MockError> {
+    Err(MockError::Config(m.into()))
+}
+
+fn check_probability(name: &str, p: f64) -> Result<(), MockError> {
+    if !(0.0..=1.0).contains(&p) {
+        return config_err(format!("{name} must be between 0 and 1, got {p}"));
+    }
+    Ok(())
+}
+
+/// A duration written as `"<int><unit>"` with unit `ms`, `s`, `m`, `h` or `d`; stored in ms.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct DurationStr(pub i64);
+
+impl DurationStr {
+    /// Milliseconds.
+    pub fn ms(self) -> i64 {
+        self.0
+    }
+
+    fn parse(s: &str) -> Option<DurationStr> {
+        let split = s.find(|c: char| !c.is_ascii_digit())?;
+        if split == 0 {
+            return None;
+        }
+        let (num, unit) = s.split_at(split);
+        let n: i64 = num.parse().ok()?;
+        let factor = match unit {
+            "ms" => 1,
+            "s" => 1_000,
+            "m" => 60_000,
+            "h" => 3_600_000,
+            "d" => 86_400_000,
+            _ => return None,
+        };
+        n.checked_mul(factor).map(DurationStr)
+    }
+}
+
+impl<'de> Deserialize<'de> for DurationStr {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        DurationStr::parse(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "invalid duration `{s}`; expected e.g. \"500ms\", \"30s\", \"10m\", \"2h\" or \"3d\""
+            ))
+        })
+    }
+}
+
+/// A distribution of delays in milliseconds.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(tag = "distribution", rename_all = "lowercase", deny_unknown_fields)]
+pub enum Distribution {
+    Fixed { ms: i64 },
+    Lognormal { median_ms: f64, p99_ms: f64 },
+}
+
+impl Default for Distribution {
+    fn default() -> Self {
+        Distribution::Fixed { ms: 0 }
+    }
+}
+
+impl Distribution {
+    fn validate(&self, name: &str) -> Result<(), MockError> {
+        match *self {
+            Distribution::Fixed { ms } if ms < 0 => config_err(format!("{name}.ms must be >= 0")),
+            Distribution::Lognormal { median_ms, p99_ms }
+                if !(median_ms > 0.0 && median_ms <= p99_ms && p99_ms.is_finite()) =>
+            {
+                config_err(format!("{name} needs 0 < median_ms <= p99_ms"))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Occasional extra visibility delay.
+#[derive(Clone, Debug, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LateTail {
+    pub probability: f64,
+    pub min: DurationStr,
+    pub max: DurationStr,
+}
+
+/// Events API projection settings (spec section 8).
+#[derive(Clone, Debug, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EventsConfig {
+    pub visibility_lag: Distribution,
+    pub late_tail: LateTail,
+    pub same_second_shuffle: bool,
+}
+
+impl EventsConfig {
+    pub(crate) fn validate(&self) -> Result<(), MockError> {
+        self.visibility_lag.validate("events.visibility_lag")?;
+        check_probability("events.late_tail.probability", self.late_tail.probability)?;
+        if self.late_tail.min > self.late_tail.max {
+            return config_err("events.late_tail.min must be <= max");
+        }
+        Ok(())
+    }
+}
+
+/// How long events stay in the Events APIs.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EventRetentionConfig {
+    pub window: DurationStr,
+}
+
+impl Default for EventRetentionConfig {
+    fn default() -> Self {
+        EventRetentionConfig {
+            window: DurationStr(30 * 86_400_000),
+        }
+    }
+}
+
+/// Retry delays after failed attempts.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum RetrySchedule {
+    /// 1m, 5m, 30m, 2h, 5h, then 10h repeated.
+    #[default]
+    StripeLike,
+    Explicit(Vec<DurationStr>),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StringOrList {
+    S(String),
+    L(Vec<DurationStr>),
+}
+
+impl<'de> Deserialize<'de> for RetrySchedule {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match StringOrList::deserialize(d)? {
+            StringOrList::S(s) if s == "stripe_like" => Ok(RetrySchedule::StripeLike),
+            StringOrList::S(s) => Err(serde::de::Error::custom(format!(
+                "retry_schedule must be \"stripe_like\" or a list of durations, got `{s}`"
+            ))),
+            StringOrList::L(l) => Ok(RetrySchedule::Explicit(l)),
+        }
+    }
+}
+
+/// When a persistently failing destination is disabled.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum DisableAfter {
+    /// 3 days.
+    #[default]
+    StripeLike,
+    After(DurationStr),
+}
+
+impl DisableAfter {
+    /// Milliseconds.
+    pub fn ms(&self) -> i64 {
+        match self {
+            DisableAfter::StripeLike => 3 * 86_400_000,
+            DisableAfter::After(d) => d.ms(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DisableAfter {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        if s == "stripe_like" {
+            return Ok(DisableAfter::StripeLike);
+        }
+        DurationStr::parse(&s)
+            .map(DisableAfter::After)
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "disable_after_failures must be \"stripe_like\" or a duration, got `{s}`"
+                ))
+            })
+    }
+}
+
+/// Signatures with timestamps outside the receiver's tolerance.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClockSkew {
+    pub probability: f64,
+    pub max: DurationStr,
+}
+
+impl Default for ClockSkew {
+    fn default() -> Self {
+        ClockSkew {
+            probability: 0.0,
+            max: DurationStr(600_000),
+        }
+    }
+}
+
+/// Webhook delivery behaviour (spec section 9).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebhooksConfig {
+    pub delivery_delay: Distribution,
+    pub duplicate_probability: f64,
+    pub reorder_window: DurationStr,
+    pub response_timeout: DurationStr,
+    pub retry_schedule: RetrySchedule,
+    pub max_retry_duration: DurationStr,
+    pub disable_after_failures: DisableAfter,
+    pub signature_tolerance: DurationStr,
+    pub clock_skew: ClockSkew,
+    pub invalid_signature_probability: f64,
+}
+
+impl Default for WebhooksConfig {
+    fn default() -> Self {
+        WebhooksConfig {
+            delivery_delay: Distribution::default(),
+            duplicate_probability: 0.0,
+            reorder_window: DurationStr(0),
+            response_timeout: DurationStr(10_000),
+            retry_schedule: RetrySchedule::StripeLike,
+            max_retry_duration: DurationStr(3 * 86_400_000),
+            disable_after_failures: DisableAfter::StripeLike,
+            signature_tolerance: DurationStr(300_000),
+            clock_skew: ClockSkew::default(),
+            invalid_signature_probability: 0.0,
+        }
+    }
+}
+
+impl WebhooksConfig {
+    pub(crate) fn validate(&self) -> Result<(), MockError> {
+        self.delivery_delay.validate("webhooks.delivery_delay")?;
+        check_probability("webhooks.duplicate_probability", self.duplicate_probability)?;
+        check_probability(
+            "webhooks.clock_skew.probability",
+            self.clock_skew.probability,
+        )?;
+        check_probability(
+            "webhooks.invalid_signature_probability",
+            self.invalid_signature_probability,
+        )?;
+        if self.response_timeout.ms() <= 0 {
+            return config_err("webhooks.response_timeout must be > 0");
+        }
+        if self.clock_skew.probability > 0.0 && self.clock_skew.max <= self.signature_tolerance {
+            return config_err(
+                "webhooks.clock_skew.max must be greater than webhooks.signature_tolerance",
+            );
+        }
+        if let RetrySchedule::Explicit(l) = &self.retry_schedule
+            && (l.is_empty() || l.iter().any(|d| d.ms() <= 0))
+        {
+            return config_err("webhooks.retry_schedule must be non-empty with delays > 0");
+        }
+        Ok(())
+    }
+}
+
+/// Snapshot or thin payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PayloadFormat {
+    Snapshot,
+    Thin,
+}
+
+/// A webhook delivery target (spec section 9).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestinationConfig {
+    pub name: String,
+    pub url: String,
+    pub payload: PayloadFormat,
+    pub enabled_events: Vec<String>,
+    #[serde(default)]
+    pub connect: bool,
+    #[serde(default)]
+    pub events_from: Option<Vec<String>>,
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
+impl DestinationConfig {
+    pub(crate) fn validate(&self) -> Result<(), MockError> {
+        let n = &self.name;
+        if n.is_empty() {
+            return config_err("destination name must not be empty");
+        }
+        if !self.url.starts_with("http://") {
+            return config_err(format!(
+                "destination `{n}`: url must start with http:// (https is not supported yet)"
+            ));
+        }
+        if self.enabled_events.is_empty() {
+            return config_err(format!(
+                "destination `{n}`: enabled_events must not be empty"
+            ));
+        }
+        for e in &self.enabled_events {
+            let thin_name = e.starts_with("v1.");
+            match self.payload {
+                PayloadFormat::Snapshot if thin_name => {
+                    return config_err(format!(
+                        "destination `{n}`: snapshot destinations take snapshot event names, not v1.* thin names (`{e}`)"
+                    ));
+                }
+                PayloadFormat::Thin if e != "*" && !thin_name => {
+                    return config_err(format!(
+                        "destination `{n}`: thin destinations take v1.* event names (`{e}`)"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if self.connect {
+            return config_err("`destinations.connect` is not implemented yet (phase 5: Connect)");
+        }
+        if let Some(from) = &self.events_from {
+            if self.payload == PayloadFormat::Snapshot {
+                return config_err(format!(
+                    "destination `{n}`: events_from only applies to thin destinations"
+                ));
+            }
+            if from.as_slice() != ["@self"] {
+                return config_err(
+                    "`destinations.events_from` other than [\"@self\"] is not implemented yet (phase 5: Connect)",
+                );
+            }
+        }
+        if let Some(secret) = &self.secret
+            && !secret.starts_with("whsec_")
+        {
+            return config_err(format!("destination `{n}`: secret must start with whsec_"));
         }
         Ok(())
     }
@@ -252,10 +606,10 @@ mod tests {
 
     #[test]
     fn unimplemented_section_is_named() {
-        let e = Config::from_toml_str("[webhooks]\nduplicate_probability = 0.01").unwrap_err();
+        let e = Config::from_toml_str("[history]\nduration = \"90d\"").unwrap_err();
         let msg = e.to_string();
         assert!(
-            msg.contains("[webhooks]") && msg.contains("not implemented"),
+            msg.contains("[history]") && msg.contains("not implemented"),
             "{msg}"
         );
     }
@@ -331,8 +685,113 @@ update = 0.5",
 
     #[test]
     fn not_implemented_message_is_tidy() {
-        let msg = Config::from_toml_str("[webhooks]").unwrap_err().to_string();
+        let msg = Config::from_toml_str("[history]").unwrap_err().to_string();
         assert!(!msg.contains("  "), "{msg:?}");
+    }
+
+    #[test]
+    fn durations_parse() {
+        for (s, ms) in [
+            ("250ms", 250),
+            ("300s", 300_000),
+            ("10m", 600_000),
+            ("2h", 7_200_000),
+            ("3d", 259_200_000),
+        ] {
+            let c = Config::from_toml_str(&format!("[event_retention]\nwindow = \"{s}\"")).unwrap();
+            assert_eq!(c.event_retention.window.ms(), ms, "{s}");
+        }
+        for bad in ["10", "x5s", "5w", "-1s"] {
+            assert!(
+                Config::from_toml_str(&format!("[event_retention]\nwindow = \"{bad}\"")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase2_defaults_are_fault_free() {
+        let c = Config::from_toml_str("").unwrap();
+        assert_eq!(c.events.visibility_lag, Distribution::Fixed { ms: 0 });
+        assert_eq!(c.event_retention.window.ms(), 30 * 86_400_000);
+        assert_eq!(c.webhooks.duplicate_probability, 0.0);
+        assert_eq!(c.webhooks.response_timeout.ms(), 10_000);
+        assert_eq!(c.webhooks.retry_schedule, RetrySchedule::StripeLike);
+        assert!(c.destinations.is_empty());
+    }
+
+    #[test]
+    fn parses_spec_phase2_sections() {
+        let c = Config::from_toml_str(
+            r#"
+            [events]
+            visibility_lag = { distribution = "lognormal", median_ms = 200, p99_ms = 5000 }
+            late_tail = { probability = 0.001, min = "30s", max = "10m" }
+            same_second_shuffle = true
+            [webhooks]
+            retry_schedule = ["1s", "2s"]
+            disable_after_failures = "1h"
+            clock_skew = { probability = 0.1, max = "10m" }
+            [[destinations]]
+            name = "thin"
+            url = "http://127.0.0.1:4000/hook"
+            payload = "thin"
+            enabled_events = ["v1.customer.*"]
+            events_from = ["@self"]
+            secret = "whsec_test"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.events.visibility_lag,
+            Distribution::Lognormal {
+                median_ms: 200.0,
+                p99_ms: 5000.0
+            }
+        );
+        assert_eq!(
+            c.webhooks.retry_schedule,
+            RetrySchedule::Explicit(vec![DurationStr(1000), DurationStr(2000)])
+        );
+        assert_eq!(
+            c.webhooks.disable_after_failures,
+            DisableAfter::After(DurationStr(3_600_000))
+        );
+        assert_eq!(c.destinations[0].payload, PayloadFormat::Thin);
+    }
+
+    #[test]
+    fn rejects_bad_destinations() {
+        let d = |url: &str, events: &str, extra: &str| {
+            format!(
+                "[[destinations]]\nname = \"d\"\nurl = \"{url}\"\npayload = \"snapshot\"\nenabled_events = [\"{events}\"]\n{extra}"
+            )
+        };
+        for (toml, needle) in [
+            (d("https://x", "*", ""), "http://"),
+            (d("http://x", "*", "connect = true"), "phase 5"),
+            (d("http://x", "v1.customer.created", ""), "v1."),
+            (d("http://x", "*", "secret = \"nope\""), "whsec_"),
+            (
+                d("http://x", "*", "events_from = [\"@self\"]"),
+                "events_from",
+            ),
+        ] {
+            let msg = Config::from_toml_str(&toml).unwrap_err().to_string();
+            assert!(msg.contains(needle), "{toml}: {msg}");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_fault_values() {
+        for bad in [
+            "[webhooks]\nduplicate_probability = 1.5",
+            "[events]\nvisibility_lag = { distribution = \"lognormal\", median_ms = 500, p99_ms = 100 }",
+            "[webhooks]\nclock_skew = { probability = 0.5, max = \"60s\" }",
+            "[webhooks]\nretry_schedule = []",
+        ] {
+            assert!(Config::from_toml_str(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
