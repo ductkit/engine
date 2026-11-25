@@ -101,7 +101,7 @@ pub(crate) fn deleted_stub(id: &str) -> Value {
     json!({"id": id, "object": "customer", "deleted": true})
 }
 
-fn random_metadata_value(rng: &mut SimRng) -> String {
+pub(crate) fn random_metadata_value(rng: &mut SimRng) -> String {
     match rng.below(4) {
         0 => String::new(),
         1 => "gold".to_string(),

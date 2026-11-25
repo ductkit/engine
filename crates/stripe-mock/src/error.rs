@@ -25,6 +25,9 @@ pub enum MockError {
         object_type: crate::ObjectType,
         id: String,
     },
+    /// The action cannot run against the named object in its current state.
+    #[error("invalid action: {0}")]
+    InvalidAction(String),
     /// No destination with this ID exists.
     #[error("no such destination: {0}")]
     NoSuchDestination(String),

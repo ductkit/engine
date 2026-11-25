@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod catalog;
 pub mod customer;
+pub mod embedded;
 
 /// A simulated Stripe object type.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

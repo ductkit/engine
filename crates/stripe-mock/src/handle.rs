@@ -10,7 +10,8 @@ use tokio::task::JoinHandle;
 use crate::delivery::sender::send;
 use crate::delivery::{DeliveryRecord, DestinationInfo, PreparedAttempt};
 use crate::engine::events::EventInfo;
-use crate::engine::{ChangeKind, Engine, StateUpdate};
+use crate::engine::{Cause, ChangeKind, Engine, StateUpdate};
+use crate::generate::Action;
 use crate::generate::Generator;
 use crate::model::customer::{
     CustomerUpdate, NewCustomer, apply_update, deleted_stub, new_customer_json,
@@ -359,6 +360,16 @@ impl MockStripe {
             &["customer.deleted"],
         )?;
         Ok(())
+    }
+
+    /// Runs a business action now, plus every follow-up step due by now
+    /// (spec section 11, "Triggers"). Returns the action's cause.
+    pub fn run_action(&self, a: Action) -> Result<Cause, MockError> {
+        let mut sim = self.shared.lock();
+        let Sim {
+            engine, generator, ..
+        } = &mut *sim;
+        generator.run_action(engine, a)
     }
 
     /// Subscribes to the latest state of every matching object (spec section 10).
