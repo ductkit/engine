@@ -2,6 +2,7 @@
 
 mod customers;
 mod events_v1;
+mod events_v2;
 mod list;
 
 use std::sync::Arc;
@@ -21,6 +22,8 @@ use crate::handle::Shared;
 #[derive(Debug, Clone)]
 pub(crate) struct ApiError {
     pub status: StatusCode,
+    /// `invalid_request_error` except for v2 not-found errors.
+    pub error_type: &'static str,
     pub message: String,
     pub code: Option<&'static str>,
     pub param: Option<String>,
@@ -30,6 +33,7 @@ impl ApiError {
     pub(crate) fn not_found(message: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::NOT_FOUND,
+            error_type: "invalid_request_error",
             message: message.into(),
             code: None,
             param: None,
@@ -43,6 +47,7 @@ impl ApiError {
     ) -> Self {
         ApiError {
             status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
             message: message.into(),
             code,
             param: param.map(str::to_string),
@@ -52,6 +57,7 @@ impl ApiError {
     fn unauthorized() -> Self {
         ApiError {
             status: StatusCode::UNAUTHORIZED,
+            error_type: "invalid_request_error",
             message: "Invalid API Key provided.".to_string(),
             code: None,
             param: None,
@@ -62,7 +68,7 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut error = Map::new();
-        error.insert("type".into(), json!("invalid_request_error"));
+        error.insert("type".into(), json!(self.error_type));
         error.insert("message".into(), json!(self.message));
         if let Some(code) = self.code {
             error.insert("code".into(), json!(code));
@@ -85,6 +91,8 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/customers/{id}", get(customers::retrieve))
         .route("/v1/events", get(events_v1::list))
         .route("/v1/events/{id}", get(events_v1::retrieve))
+        .route("/v2/core/events", get(events_v2::list))
+        .route("/v2/core/events/{id}", get(events_v2::retrieve))
         .fallback(fallback)
         .layer(middleware::from_fn_with_state(shared.clone(), gate))
         .with_state(shared)

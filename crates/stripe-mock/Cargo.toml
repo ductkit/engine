@@ -9,6 +9,7 @@ repository.workspace = true
 axum.workspace = true
 chrono.workspace = true
 form_urlencoded.workspace = true
+hex.workspace = true
 futures-core.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
