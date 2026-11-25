@@ -1,0 +1,332 @@
+//! The truth log: every mutation, in order (spec section 2).
+
+pub(crate) mod store;
+
+use serde::Serialize;
+use serde_json::Value;
+
+use crate::{MockError, ObjectType, SimTime};
+
+pub(crate) use store::ObjectStore;
+
+/// What kind of change a [`StateUpdate`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    /// Part of a subscription's initial snapshot (live object).
+    Snapshot,
+    Created,
+    Updated,
+    Deleted,
+}
+
+/// The business action that caused a mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Cause {
+    pub action: String,
+    pub action_id: String,
+}
+
+/// Stripe events a mutation produced (always empty until phase 2).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct EventRefs {
+    pub snapshot: Vec<String>,
+    pub thin: Vec<String>,
+}
+
+/// One truth-log entry: an object's full state after a mutation (spec section 10.3).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StateUpdate {
+    /// Global, gap-free, starting at 1.
+    pub seq: u64,
+    pub at: SimTime,
+    /// `None` for the platform account.
+    pub account: Option<String>,
+    pub object_type: ObjectType,
+    pub object_id: String,
+    /// Per object, starting at 1.
+    pub version: u64,
+    pub kind: ChangeKind,
+    pub state: Value,
+    pub events: EventRefs,
+    pub cause: Option<Cause>,
+}
+
+/// Authoritative state: current time, truth log and object store.
+#[derive(Debug)]
+pub(crate) struct Engine {
+    now: SimTime,
+    next_seq: u64,
+    next_action: u64,
+    log: Vec<StateUpdate>,
+    store: ObjectStore,
+}
+
+impl Engine {
+    pub(crate) fn new(start: SimTime) -> Self {
+        Engine {
+            now: start,
+            next_seq: 1,
+            next_action: 1,
+            log: Vec::new(),
+            store: ObjectStore::default(),
+        }
+    }
+
+    pub(crate) fn now(&self) -> SimTime {
+        self.now
+    }
+
+    pub(crate) fn set_now(&mut self, t: SimTime) {
+        debug_assert!(t >= self.now, "time moved backwards");
+        self.now = t;
+    }
+
+    /// Starts a business action; all its mutations share the returned cause.
+    pub(crate) fn begin_action(&mut self, name: &str) -> Cause {
+        let n = self.next_action;
+        self.next_action += 1;
+        Cause {
+            action: name.to_string(),
+            action_id: format!("act_{n}"),
+        }
+    }
+
+    pub(crate) fn create(
+        &mut self,
+        t: ObjectType,
+        id: String,
+        state: Value,
+        cause: Cause,
+    ) -> StateUpdate {
+        let created = state["created"].as_i64().unwrap_or(self.now.unix_seconds());
+        let update = self.record(t, id, 1, ChangeKind::Created, state, cause);
+        self.store.insert(update.clone(), created);
+        self.notify(&update);
+        update
+    }
+
+    /// Applies `f` to the object's state; records nothing if the state is unchanged.
+    pub(crate) fn update(
+        &mut self,
+        t: ObjectType,
+        id: &str,
+        f: impl FnOnce(&mut Value),
+        cause: Cause,
+    ) -> Result<Option<StateUpdate>, MockError> {
+        let latest = self.live(t, id)?;
+        let mut state = latest.state.clone();
+        f(&mut state);
+        if state == latest.state {
+            return Ok(None);
+        }
+        let version = latest.version + 1;
+        let update = self.record(
+            t,
+            id.to_string(),
+            version,
+            ChangeKind::Updated,
+            state,
+            cause,
+        );
+        self.store.replace(update.clone());
+        self.notify(&update);
+        Ok(Some(update))
+    }
+
+    pub(crate) fn delete(
+        &mut self,
+        t: ObjectType,
+        id: &str,
+        tombstone: Value,
+        cause: Cause,
+    ) -> Result<StateUpdate, MockError> {
+        let version = self.live(t, id)?.version + 1;
+        let update = self.record(
+            t,
+            id.to_string(),
+            version,
+            ChangeKind::Deleted,
+            tombstone,
+            cause,
+        );
+        self.store.replace(update.clone());
+        self.notify(&update);
+        Ok(update)
+    }
+
+    pub(crate) fn latest(&self, t: ObjectType, id: &str) -> Option<&StateUpdate> {
+        self.store.get(t, id).map(|o| &o.latest)
+    }
+
+    pub(crate) fn log(&self) -> &[StateUpdate] {
+        &self.log
+    }
+
+    pub(crate) fn store(&self) -> &ObjectStore {
+        &self.store
+    }
+
+    fn live(&self, t: ObjectType, id: &str) -> Result<&StateUpdate, MockError> {
+        match self.store.get(t, id) {
+            None => Err(MockError::NoSuchObject {
+                object_type: t,
+                id: id.to_string(),
+            }),
+            Some(o) if o.deleted => Err(MockError::Deleted {
+                object_type: t,
+                id: id.to_string(),
+            }),
+            Some(o) => Ok(&o.latest),
+        }
+    }
+
+    fn record(
+        &mut self,
+        t: ObjectType,
+        id: String,
+        version: u64,
+        kind: ChangeKind,
+        state: Value,
+        cause: Cause,
+    ) -> StateUpdate {
+        let update = StateUpdate {
+            seq: self.next_seq,
+            at: self.now,
+            account: None,
+            object_type: t,
+            object_id: id,
+            version,
+            kind,
+            state,
+            events: EventRefs::default(),
+            cause: Some(cause),
+        };
+        self.next_seq += 1;
+        self.log.push(update.clone());
+        update
+    }
+
+    /// Fan-out to subscribers (Task 6).
+    fn notify(&mut self, _update: &StateUpdate) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cust(id: &str, created: i64) -> Value {
+        json!({"id": id, "object": "customer", "created": created, "email": null})
+    }
+
+    #[test]
+    fn seq_and_versions() {
+        let mut e = Engine::new(SimTime(0));
+        let c = e.begin_action("t");
+        let a = e.create(
+            ObjectType::Customer,
+            "cus_a".into(),
+            cust("cus_a", 0),
+            c.clone(),
+        );
+        let b = e
+            .update(
+                ObjectType::Customer,
+                "cus_a",
+                |v| v["email"] = json!("x@example.com"),
+                c.clone(),
+            )
+            .unwrap()
+            .unwrap();
+        let d = e
+            .delete(
+                ObjectType::Customer,
+                "cus_a",
+                json!({"id": "cus_a", "object": "customer", "deleted": true}),
+                c,
+            )
+            .unwrap();
+        assert_eq!((a.seq, b.seq, d.seq), (1, 2, 3));
+        assert_eq!((a.version, b.version, d.version), (1, 2, 3));
+        assert_eq!(
+            (a.kind, b.kind, d.kind),
+            (
+                ChangeKind::Created,
+                ChangeKind::Updated,
+                ChangeKind::Deleted
+            )
+        );
+        assert_eq!(e.log().len(), 3);
+        assert!(
+            e.store()
+                .get(ObjectType::Customer, "cus_a")
+                .unwrap()
+                .deleted
+        );
+        assert!(e.store().live_ids(ObjectType::Customer).is_empty());
+    }
+
+    #[test]
+    fn noop_update_records_nothing() {
+        let mut e = Engine::new(SimTime(0));
+        let c = e.begin_action("t");
+        e.create(
+            ObjectType::Customer,
+            "cus_a".into(),
+            cust("cus_a", 0),
+            c.clone(),
+        );
+        assert_eq!(
+            e.update(ObjectType::Customer, "cus_a", |_| {}, c).unwrap(),
+            None
+        );
+        assert_eq!(e.log().len(), 1);
+    }
+
+    #[test]
+    fn mutating_deleted_or_missing_errors() {
+        let mut e = Engine::new(SimTime(0));
+        let c = e.begin_action("t");
+        assert!(matches!(
+            e.update(ObjectType::Customer, "cus_x", |_| {}, c.clone()),
+            Err(MockError::NoSuchObject { .. })
+        ));
+        e.create(
+            ObjectType::Customer,
+            "cus_a".into(),
+            cust("cus_a", 0),
+            c.clone(),
+        );
+        e.delete(ObjectType::Customer, "cus_a", json!({}), c.clone())
+            .unwrap();
+        assert!(matches!(
+            e.delete(ObjectType::Customer, "cus_a", json!({}), c),
+            Err(MockError::Deleted { .. })
+        ));
+        assert_eq!(e.log().len(), 2);
+    }
+
+    #[test]
+    fn list_order_breaks_ties_by_creation() {
+        let mut e = Engine::new(SimTime(0));
+        let c = e.begin_action("t");
+        for (id, t) in [("cus_1", 5), ("cus_2", 5), ("cus_3", 4)] {
+            e.create(ObjectType::Customer, id.into(), cust(id, t), c.clone());
+        }
+        let ids: Vec<_> = e
+            .store()
+            .list_order(ObjectType::Customer)
+            .iter()
+            .map(|o| o.latest.object_id.clone())
+            .collect();
+        assert_eq!(ids, ["cus_2", "cus_1", "cus_3"]);
+    }
+
+    #[test]
+    fn begin_action_ids() {
+        let mut e = Engine::new(SimTime(0));
+        assert_eq!(e.begin_action("a").action_id, "act_1");
+        assert_eq!(e.begin_action("b").action_id, "act_2");
+    }
+}

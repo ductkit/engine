@@ -3,6 +3,8 @@
 //! See `docs/stripe-mock-spec.md` in the repository.
 
 mod config;
+#[allow(dead_code)]
+mod engine;
 mod error;
 #[allow(dead_code)]
 mod model;
@@ -15,6 +17,7 @@ pub use config::{
     ActionsConfig, ApiConfig, ChurnConfig, ClockConfig, ClockMode, Config, CustomerChurn,
     PINNED_API_VERSION,
 };
+pub use engine::{Cause, ChangeKind, EventRefs, StateUpdate};
 pub use error::MockError;
 pub use model::ObjectType;
 pub use model::customer::{CustomerUpdate, NewCustomer};
