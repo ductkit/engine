@@ -1,5 +1,8 @@
 //! Read-only Stripe-compatible HTTP API (spec section 7).
 
+mod customers;
+mod list;
+
 use std::sync::Arc;
 
 use axum::Router;
@@ -7,6 +10,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use axum::routing::get;
 use serde_json::{Map, Value, json};
 
 use crate::PINNED_API_VERSION;
@@ -76,6 +80,8 @@ impl IntoResponse for ApiError {
 /// The router with every route and the request gate.
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
     Router::new()
+        .route("/v1/customers", get(customers::list))
+        .route("/v1/customers/{id}", get(customers::retrieve))
         .fallback(fallback)
         .layer(middleware::from_fn_with_state(shared.clone(), gate))
         .with_state(shared)
