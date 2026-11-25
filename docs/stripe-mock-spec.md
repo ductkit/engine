@@ -90,14 +90,14 @@ The binary has three commands:
 
 ```
 ductkit-stripe-mock serve  --config F [--api-addr A] [--control-addr A] [--clock virtual|wall] [--seed N] [--export-on-exit F]
-ductkit-stripe-mock replay --run F [--api-addr A] [--control-addr A] [--clock virtual|wall] [--seed N] [--export-on-exit F] [--drop-destinations]
+ductkit-stripe-mock replay --run F [--api-addr A] [--control-addr A] [--export-on-exit F] [--drop-destinations]
 ductkit-stripe-mock check  --config F
 ```
 
 - **Addresses**: the Stripe-compatible API defaults to `127.0.0.1:8420` and the control API to `127.0.0.1:8421`. Port `0` picks a free port.
-- **Ready line**: once both listeners are bound, the binary prints one JSON line to stdout, `{"api_url":"http://…","control_url":"http://…","seed":…}`. Tests and scripts read it, which makes port `0` usable.
-- **Clock**: the standalone default is `wall`. If the config file has no `clock.mode` key, the binary sets `mode = "wall"` before parsing. `--clock` overrides both the file and that default. `replay` always runs on the virtual clock (section 12).
-- **`--seed`** overrides the config's seed. **`--export-on-exit F`** writes the run export (section 12) when the process exits, whether by `POST /control/shutdown`, SIGINT or SIGTERM.
+- **Ready line**: once both listeners are bound, the binary prints one JSON line to stdout, `{"api_url":"http://…","control_url":"http://…","seed":…}`. Tests and scripts read it, which makes port `0` usable. `replay` binds its listeners, and prints the line, only after the replay has reached `ended_at` (section 12.1).
+- **Clock**: the standalone default is `wall`. If the config file has no `clock.mode` key, the binary sets `mode = "wall"` before parsing. `--clock` overrides both the file and that default. `replay` always runs on the virtual clock and takes its seed from the run file, so it has no `--clock` or `--seed` (section 12).
+- **`--seed`** overrides the config's seed. **`--export-on-exit F`** writes the run export (section 12) when the process exits, whether by `POST /control/shutdown`, SIGINT (Ctrl-C) or SIGTERM. SIGTERM is handled on unix only; on Windows only Ctrl-C and `POST /control/shutdown` trigger the export.
 - **`check`** parses and validates the config without starting anything. It prints `ok` and exits 0, or prints the error (with file line numbers where TOML gives them) to stderr and exits 1. Bad flags exit 2.
 - The control API has no authentication and binds to loopback by default. The binary warns on stderr when `--control-addr` is not a loopback address (section 11).
 
@@ -515,11 +515,20 @@ Mutating calls other than `step`, `advance_to`, `quiesce`, pause, resume and spe
 - `no_such_object`, `no_such_destination`, `unknown_account` → 404;
 - `clock_mode`, `time_travel`, `deleted`, `invalid_action`, `connect_disabled` → 409;
 - `config`, and malformed bodies, queries or JSON → 400;
+- `forbidden` (cross-origin, see Security) → 403;
+- `not_found` (no such route) → 404, `method_not_allowed` → 405;
+- `unsupported_media_type` (a `POST` without a JSON content type) → 415;
 - anything else → 500.
 
 **Shutdown**: `POST /control/shutdown` answers 202, then stops the control server and the API server. Shutdown is bounded: each server gets 2 s to finish in-flight requests, then is aborted. The process then exits 0, after writing the `--export-on-exit` file when one was given.
 
-**Security**: the control API has no authentication. It binds to loopback by default and is meant for test and development machines only. Never expose it on a shared network.
+**Scripts are not atomic**: other control calls and generated actions (wall mode) can run between a script's ops. Each op is journalled when it applies, so the truth stays replayable.
+
+**Security**: the control API has no authentication. It binds to loopback by default and is meant for test and development machines only. Never expose it on a shared network. So that web pages in a browser on the same machine cannot drive it, every control request, including the WebSocket upgrade, is checked:
+
+- (a) the `Host` header must be a loopback name (`localhost`, `127.0.0.1` or `[::1]`, any port) or the host of the address the control API is bound to; otherwise 403 `forbidden`. This defeats DNS rebinding. When `--control-addr` is a non-loopback IP (the binary warns), clients on other machines reach it by that IP; a wildcard bind such as `0.0.0.0` only admits loopback names, so bind the specific interface IP for remote use.
+- (b) a request with an `Origin` header must come from `http://localhost`, `http://127.0.0.1` or `http://[::1]` (any port); otherwise 403 `forbidden`.
+- (c) every `POST`, even one without a body (`pause`, `resume`, `quiesce`, `generation/resume`, `shutdown`, …), must have `Content-Type: application/json` (parameters such as `charset` allowed); otherwise 415 `unsupported_media_type`. A browser cannot send that cross-origin without a CORS preflight, which the control API never grants.
 
 ## 12. Determinism and time
 
@@ -551,9 +560,9 @@ Mutating calls other than `step`, `advance_to`, `quiesce`, pause, resume and spe
 - **Not journalled**: `pause`, `resume` and `set_speed`, which only shape wall time (ops carry their own `at`); `force_rate_limit` and other API-only faults, which never touch truth; every read. A failed control call is not journalled and does not use up an action number.
 - In wall mode every journalled control call first ticks the clock, so everything due by the op's `at` has already run.
 
-**Replay** (`MockStripe::replay(export, options)`, or `ductkit-stripe-mock replay --run F`) always runs on the virtual clock. Before applying each op it advances time to the op's `at`, running every action and delivery due at or before it, then applies the op. After the last op it advances to `ended_at` and stops there. Replay rejects an unknown `format` with a config error.
+**Replay** (`MockStripe::replay(export, options)`, or `ductkit-stripe-mock replay --run F`) always runs on the virtual clock. Before applying each op it advances time to the op's `at`, running every action and delivery due at or before it, then applies the op. After the last op it advances to `ended_at` and stops there. Replay rejects an unknown `format` with a config error. `MockStripe::replay_with` and the binary bind their listeners only after that, so no client can inject ops or pagination writes into a replay in progress; until then connections are refused.
 
-- **Guarantee**: replay reproduces the **truth log** and the **event timeline** of the original. It does not guarantee the delivery log: destinations are kept, so deliveries are attempted again against the same URLs, and real HTTP outcomes can differ. `--drop-destinations` (`ReplayOptions { drop_destinations: true }`) removes them for offline replays.
+- **Guarantee**: replay reproduces the **truth log** and the **event timeline** of the original. It does not guarantee the delivery log: destinations are kept, so deliveries are attempted again against the same URLs, and real HTTP outcomes can differ. `--drop-destinations` (`ReplayOptions { drop_destinations: true }`) removes them for offline replays. It also keeps a replay from blocking on destination URLs that are no longer reachable: a journalled `quiesce` waits for every pending delivery, and a re-run against a dead URL waits out each attempt's `response_timeout` and the retries.
 - A wall-mode run replays exactly up to the tick boundary.
 - **`ReplayGuard`**: `MockStripe::replay_guard(dir)` returns a guard that, when dropped during a panic, writes `<dir>/run-<seed>-<ended_at ms>.json` and prints to stderr `stripe-mock: run exported to <path>; replay with: ductkit-stripe-mock replay --run <path>`. Tests hold one so that a failure leaves a replayable file behind.
 
