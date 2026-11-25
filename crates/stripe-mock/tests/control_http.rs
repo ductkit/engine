@@ -159,6 +159,187 @@ async fn control_errors_are_4xx_json() {
     check(s, &b, 409, Some("clock_mode"));
     let (s, b) = json_of(ctl_post(&virt, "/control/pause", json!({})).await).await;
     check(s, &b, 409, Some("clock_mode"));
+
+    // Durations that overflow simulated time are config errors, and leave the
+    // mock usable (the sim lock is not poisoned).
+    let dest = json!({"op": "add_destination", "destination": {
+        "name": "d", "url": "http://127.0.0.1:9/hook", "payload": "snapshot",
+        "enabled_events": ["*"], "secret": "whsec_test",
+    }});
+    let (s, d) = json_of(ctl_post(&virt, "/control/ops", dest).await).await;
+    assert_eq!(s, 200, "{d}");
+    let dest_id = d["destination"]["id"].as_str().expect("destination id");
+    let huge = "9223372036854775807ms";
+    for op in [
+        json!({"op": "start_outage", "id": dest_id, "duration": huge}),
+        json!({"op": "rotate_secret", "id": dest_id, "overlap": huge}),
+        json!({"op": "start_outage", "id": "nope", "duration": huge}),
+    ] {
+        let (s, b) = json_of(ctl_post(&virt, "/control/ops", op).await).await;
+        check(s, &b, 400, Some("config"));
+        let (s, _) = json_of(ctl_get(&virt, "/control/now").await).await;
+        assert_eq!(s, 200);
+    }
+
+    // A plain GET on the WebSocket route (no upgrade headers).
+    let (s, b) = json_of(ctl_get(&virt, "/control/subscribe/ws").await).await;
+    assert!((400..500).contains(&s), "{s} {b}");
+    check(s, &b, s, None);
+
+    // A non-JSON content type.
+    let r = reqwest::Client::new()
+        .post(format!("{url}/control/ops"))
+        .header("content-type", "text/plain")
+        .body(r#"{"op":"quiesce"}"#)
+        .send()
+        .await
+        .unwrap();
+    let (s, b) = json_of(r).await;
+    check(s, &b, 415, Some("unsupported_media_type"));
+
+    let (s, b) = json_of(ctl_post(&virt, "/control/step", json!({"duration": "xyz"})).await).await;
+    check(s, &b, 400, Some("invalid_request"));
+
+    let (s, b) = json_of(ctl_get(&virt, "/control/truth_log?limit=abc").await).await;
+    check(s, &b, 400, Some("invalid_request"));
+
+    let r = reqwest::Client::new()
+        .delete(format!("{url}/control/now"))
+        .send()
+        .await
+        .unwrap();
+    let (s, b) = json_of(r).await;
+    check(s, &b, 405, Some("method_not_allowed"));
+}
+
+#[tokio::test]
+async fn cross_origin_requests_are_rejected() {
+    let m = mock_with_control("seed = 1").await;
+    let url = m.control_url().unwrap();
+    let port = url.rsplit(':').next().unwrap().to_string();
+    let client = reqwest::Client::new();
+    let forbidden = |r: (u16, Value)| {
+        assert_eq!(r.0, 403, "{}", r.1);
+        assert_eq!(code(&r.1), "forbidden", "{}", r.1);
+    };
+
+    // A page on another origin posting to the control API.
+    let r = client
+        .post(format!("{url}/control/quiesce"))
+        .header("origin", "https://evil.example")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    forbidden(json_of(r).await);
+    let r = client
+        .post(format!("{url}/control/quiesce"))
+        .header("origin", "https://evil.example")
+        .header("content-type", "text/plain")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    forbidden(json_of(r).await);
+    assert!(m.generation_enabled(), "quiesce did not run");
+
+    // DNS rebinding: a foreign Host name.
+    let r = client
+        .get(format!("{url}/control/export"))
+        .header("host", "evil.example:8421")
+        .send()
+        .await
+        .unwrap();
+    forbidden(json_of(r).await);
+
+    // A form post (no CORS preflight) is not JSON.
+    let waiting = tokio::spawn(m.shutdown_requested());
+    let r = client
+        .post(format!("{url}/control/shutdown"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("a=b")
+        .send()
+        .await
+        .unwrap();
+    let (s, b) = json_of(r).await;
+    assert_eq!((s, code(&b)), (415, "unsupported_media_type"), "{b}");
+    let r = client
+        .post(format!("{url}/control/pause"))
+        .send()
+        .await
+        .unwrap();
+    let (s, b) = json_of(r).await;
+    assert_eq!((s, code(&b)), (415, "unsupported_media_type"), "{b}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!waiting.is_finished(), "shutdown was requested");
+
+    // A WebSocket upgrade from another origin.
+    let ws = url.replace("http://", "ws://");
+    let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+        format!("{ws}/control/subscribe/ws"),
+    )
+    .unwrap();
+    req.headers_mut()
+        .insert("origin", "https://evil.example".parse().unwrap());
+    let err = tokio_tungstenite::connect_async(req).await.unwrap_err();
+    assert!(
+        matches!(&err, tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 403),
+        "{err:?}"
+    );
+
+    // The same requests from loopback origins and hosts succeed.
+    for (host, origin) in [
+        (
+            format!("localhost:{port}"),
+            format!("http://localhost:{port}"),
+        ),
+        (
+            format!("127.0.0.1:{port}"),
+            "http://127.0.0.1:3000".to_string(),
+        ),
+        (format!("[::1]:{port}"), "http://[::1]:3000".to_string()),
+    ] {
+        let r = client
+            .get(format!("{url}/control/export"))
+            .header("host", &host)
+            .header("origin", &origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{host} {origin}");
+        let r = client
+            .post(format!("{url}/control/quiesce"))
+            .header("host", &host)
+            .header("origin", &origin)
+            .header("content-type", "application/json; charset=utf-8")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{host} {origin}");
+    }
+    let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+        format!("{ws}/control/subscribe/ws"),
+    )
+    .unwrap();
+    req.headers_mut().insert(
+        "origin",
+        format!("http://localhost:{port}").parse().unwrap(),
+    );
+    tokio_tungstenite::connect_async(req)
+        .await
+        .expect("loopback origin upgrades");
+    let r = client
+        .post(format!("{url}/control/shutdown"))
+        .header("origin", format!("http://127.0.0.1:{port}"))
+        .header("content-type", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("resolved within 1s")
+        .unwrap();
 }
 
 #[tokio::test]

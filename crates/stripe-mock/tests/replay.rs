@@ -145,6 +145,83 @@ async fn virtual_run_replays_exactly() {
     assert_eq!(r.export_run().journal, export.journal);
 }
 
+fn free_addr() -> std::net::SocketAddr {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    probe.local_addr().unwrap()
+}
+
+/// Clients polling the replay's ports cannot reach it (and so cannot inject ops or
+/// pagination writes) until it has reached `ended_at`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replay_serves_only_after_it_finished() {
+    let m = virtual_run().await;
+    m.step(Duration::from_secs(2 * 86_400)).await.unwrap();
+    let export = m.export_run();
+    let ended_at = serde_json::to_value(export.ended_at).unwrap();
+    let (api_addr, control_addr) = (free_addr(), free_addr());
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let prober = tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            let client = reqwest::Client::new();
+            let mut seen = Vec::new();
+            let mut attempts = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                attempts += 1;
+                let r = client
+                    .get(format!("http://{control_addr}/control/now"))
+                    .send()
+                    .await;
+                if let Ok(r) = r {
+                    let status = r.status().as_u16();
+                    let body: Value = r.json().await.unwrap_or(Value::Null);
+                    seen.push((status, body));
+                }
+                if reqwest::get(format!("http://{api_addr}/v1/customers"))
+                    .await
+                    .is_ok()
+                {
+                    // The API listener only exists once the replay is done.
+                    let r = client
+                        .get(format!("http://{control_addr}/control/now"))
+                        .send()
+                        .await
+                        .expect("control API is up with the Stripe API");
+                    let body: Value = r.json().await.unwrap();
+                    seen.push((200, body));
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            (attempts, seen)
+        }
+    });
+    // Let the prober issue its first request before the replay starts.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let r = MockStripe::replay_with(
+        export.clone(),
+        ReplayOptions::default(),
+        ductkit_stripe_mock::StartOptions {
+            api_addr: Some(api_addr),
+            control_addr: Some(control_addr),
+        },
+    )
+    .await
+    .unwrap();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (attempts, seen) = prober.await.unwrap();
+    assert!(attempts >= 1);
+    for (status, body) in &seen {
+        assert_eq!(*status, 200, "{body}");
+        assert_eq!(body["now"], ended_at, "served before the replay finished");
+    }
+    assert_eq!(r.now(), m.now());
+    assert_eq!(truth(&r), truth(&m));
+    assert_eq!(timeline(&r), timeline(&m));
+    assert_eq!(r.control_url(), Some(format!("http://{control_addr}")));
+    assert_eq!(r.api_url(), format!("http://{api_addr}"));
+}
+
 #[tokio::test]
 async fn drop_destinations_replays() {
     let m = virtual_run().await;

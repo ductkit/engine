@@ -3,12 +3,14 @@
 //! Handlers are thin: they parse, call the `MockStripe` method that does the work
 //! (and journals it), and map errors to the control error envelope.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{FromRequest, FromRequestParts, Path, Request, State};
-use axum::http::StatusCode;
+use axum::extract::{FromRequest, FromRequestParts, Request, State};
 use axum::http::request::Parts;
+use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
@@ -23,9 +25,10 @@ use crate::{DurationStr, MockError, MockStripe, ObjectType, SubscribeFilter};
 const DEFAULT_LIMIT: usize = 1000;
 const MAX_LIMIT: usize = 10_000;
 
-/// The control API's router: `/control/*` only, no Stripe routes.
-pub(crate) fn router(shared: Arc<Shared>) -> Router {
-    Router::new()
+/// The control API's router: `/control/*` only, no Stripe routes. `bound` is the
+/// address the control listener is bound to (see [`guard`]).
+pub(crate) fn router(shared: Arc<Shared>, bound: SocketAddr) -> Router {
+    let routes = Router::new()
         .route("/control/now", get(now))
         .route("/control/step", post(step))
         .route("/control/advance_to", post(advance_to))
@@ -60,7 +63,88 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
                 "method not allowed",
             )
         })
-        .with_state(shared)
+        .with_state(shared);
+    routes.layer(axum::middleware::from_fn_with_state(bound, guard))
+}
+
+// ---- cross-origin guard -------------------------------------------------------
+
+/// Keeps web pages away from the unauthenticated control API (spec section 11,
+/// "Security"). Every request, including the WebSocket upgrade and unknown routes:
+///
+/// - (a) `Host` must be a loopback name (`localhost`, `127.0.0.1`, `[::1]`, any
+///   port) or the bound address's own host, which lets remote clients reach a
+///   control API bound to a non-loopback IP. This defeats DNS rebinding.
+/// - (b) an `Origin` header, if present, must be `http://` on a loopback host.
+/// - (c) a `POST` must have `Content-Type: application/json` (parameters
+///   allowed), even without a body, so a page cannot send it as a "simple"
+///   cross-origin request (a form post or `text/plain` fetch) without a preflight.
+///
+/// (a) and (b) fail with 403 `forbidden`, (c) with 415 `unsupported_media_type`.
+async fn guard(State(bound): State<SocketAddr>, req: Request, next: Next) -> Response {
+    let headers = req.headers();
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    if !host.is_some_and(|h| host_allowed(h, bound)) {
+        return ControlError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "the Host header must name a loopback address or the control address",
+        )
+        .into_response();
+    }
+    if let Some(origin) = headers.get(header::ORIGIN)
+        && !origin.to_str().is_ok_and(origin_allowed)
+    {
+        return ControlError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "cross-origin requests to the control API are not allowed",
+        )
+        .into_response();
+    }
+    if req.method() == Method::POST && !is_json(headers.get(header::CONTENT_TYPE)) {
+        return ControlError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "POST requests need `Content-Type: application/json`",
+        )
+        .into_response();
+    }
+    next.run(req).await
+}
+
+/// The host part of `host[:port]` or `[v6][:port]`, lowercased.
+fn host_name(authority: &str) -> String {
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(authority, |(h, _)| h),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    host.to_ascii_lowercase()
+}
+
+fn is_loopback_name(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn host_allowed(authority: &str, bound: SocketAddr) -> bool {
+    let host = host_name(authority);
+    is_loopback_name(&host) || host == bound.ip().to_string()
+}
+
+fn origin_allowed(origin: &str) -> bool {
+    origin.strip_prefix("http://").is_some_and(|authority| {
+        !authority.contains('/') && is_loopback_name(&host_name(authority))
+    })
+}
+
+fn is_json(content_type: Option<&HeaderValue>) -> bool {
+    content_type
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
 }
 
 // ---- errors -----------------------------------------------------------------
@@ -128,6 +212,39 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Json<T> {
         match axum::Json::<T>::from_request(req, state).await {
             Ok(axum::Json(v)) => Ok(Json(v)),
             Err(rejection) => Err(ControlError::invalid(rejection.body_text())),
+        }
+    }
+}
+
+/// `axum::extract::Path` whose rejections are control errors.
+struct Path<T>(T);
+
+impl<S: Send + Sync, T: DeserializeOwned + Send> FromRequestParts<S> for Path<T> {
+    type Rejection = ControlError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ControlError> {
+        match axum::extract::Path::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Path(v)) => Ok(Path(v)),
+            Err(rejection) => Err(ControlError::invalid(rejection.body_text())),
+        }
+    }
+}
+
+/// `axum::extract::ws::WebSocketUpgrade` whose rejections are control errors,
+/// keeping the rejection's status (e.g. 400, 405, 426).
+pub(super) struct WebSocketUpgrade(pub(super) axum::extract::ws::WebSocketUpgrade);
+
+impl<S: Send + Sync> FromRequestParts<S> for WebSocketUpgrade {
+    type Rejection = ControlError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ControlError> {
+        match axum::extract::ws::WebSocketUpgrade::from_request_parts(parts, state).await {
+            Ok(upgrade) => Ok(WebSocketUpgrade(upgrade)),
+            Err(rejection) => Err(ControlError::new(
+                rejection.status(),
+                "invalid_request",
+                rejection.body_text(),
+            )),
         }
     }
 }
@@ -439,4 +556,60 @@ async fn export(State(s): Mock) -> Reply {
 async fn shutdown(State(s): Mock) -> Response {
     s.shutdown_requested.send_replace(true);
     (StatusCode::ACCEPTED, axum::Json(json!({}))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guard_names() {
+        let lo: SocketAddr = "127.0.0.1:8421".parse().unwrap();
+        let lan: SocketAddr = "192.168.1.5:8421".parse().unwrap();
+        for h in [
+            "localhost",
+            "LOCALHOST:1",
+            "127.0.0.1:8421",
+            "[::1]:9",
+            "[::1]",
+        ] {
+            assert!(host_allowed(h, lo), "{h}");
+        }
+        for h in [
+            "evil.example:8421",
+            "192.168.1.5:8421",
+            "localhost.evil.example",
+            "",
+        ] {
+            assert!(!host_allowed(h, lo), "{h}");
+        }
+        assert!(host_allowed("192.168.1.5:8421", lan));
+        assert!(host_allowed("localhost:8421", lan));
+        let v6: SocketAddr = "[fd00::5]:8421".parse().unwrap();
+        assert!(host_allowed("[fd00::5]:8421", v6));
+
+        for o in [
+            "http://localhost:3000",
+            "http://127.0.0.1",
+            "http://[::1]:80",
+        ] {
+            assert!(origin_allowed(o), "{o}");
+        }
+        for o in [
+            "https://evil.example",
+            "null",
+            "https://localhost:3000",
+            "http://localhost.evil.example",
+            "http://192.168.1.5:8421",
+        ] {
+            assert!(!origin_allowed(o), "{o}");
+        }
+
+        let ct = |s: &str| is_json(Some(&HeaderValue::from_str(s).unwrap()));
+        assert!(ct("application/json"));
+        assert!(ct("Application/JSON; charset=utf-8"));
+        assert!(!ct("text/plain"));
+        assert!(!ct("application/x-www-form-urlencoded"));
+        assert!(!is_json(None));
+    }
 }

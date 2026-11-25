@@ -287,6 +287,11 @@ impl MockStripe {
     }
 
     /// [`MockStripe::replay`], serving the replayed mock on the addresses in `start`.
+    ///
+    /// Nothing is bound until the replay has reached `ended_at`: the journal runs on
+    /// a mock with no listeners, so no client can inject ops or pagination writes
+    /// into a replay in progress (connections are refused until then). The ports
+    /// are bound, and an error returned if that fails, only after the replay.
     pub async fn replay_with(
         export: RunExport,
         options: ReplayOptions,
@@ -299,7 +304,8 @@ impl MockStripe {
         if options.drop_destinations {
             config.destinations.clear();
         }
-        let m = MockStripe::start_with(config, start).await?;
+        let shared = MockStripe::build(config)?;
+        let m = MockStripe::view(shared.clone());
         for entry in export.journal {
             if options.drop_destinations && entry.op.is_destination_op() {
                 continue;
@@ -316,7 +322,8 @@ impl MockStripe {
             }
         }
         m.advance_unjournalled(export.ended_at).await?;
-        Ok(m)
+        drop(m);
+        MockStripe::listen(shared, start).await
     }
 
     /// Exports the run to `dir` if dropped while panicking, e.g. by a failing test.

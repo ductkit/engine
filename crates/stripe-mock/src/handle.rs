@@ -278,6 +278,12 @@ impl MockStripe {
         config: Config,
         options: StartOptions,
     ) -> Result<MockStripe, MockError> {
+        MockStripe::listen(MockStripe::build(config)?, options).await
+    }
+
+    /// Validates `config` and builds the simulation, history included, without
+    /// serving anything.
+    pub(crate) fn build(config: Config) -> Result<Arc<Shared>, MockError> {
         config.validate()?;
         let config_speed = config.clock.speed;
         let streams = RngStreams::new(config.seed);
@@ -320,6 +326,15 @@ impl MockStripe {
             shutdown: tokio::sync::watch::Sender::new(false),
             shutdown_requested: tokio::sync::watch::Sender::new(false),
         });
+        Ok(shared)
+    }
+
+    /// Binds the addresses in `options` and serves `shared` on them (plus the
+    /// wall-clock ticker in wall mode).
+    pub(crate) async fn listen(
+        shared: Arc<Shared>,
+        options: StartOptions,
+    ) -> Result<MockStripe, MockError> {
         let listener = match options.api_addr {
             Some(addr) => tokio::net::TcpListener::bind(addr).await?,
             None => tokio::net::TcpListener::bind("127.0.0.1:0").await?,
@@ -349,7 +364,8 @@ impl MockStripe {
         let (control_stop, control_server) = match control_listener {
             Some(listener) => {
                 let (stop, stopped) = oneshot::channel::<()>();
-                let app = crate::control::http::router(shared.clone());
+                let bound = listener.local_addr()?;
+                let app = crate::control::http::router(shared.clone(), bound);
                 (Some(stop), Some(serve(listener, app, stopped)))
             }
             None => (None, None),
@@ -821,7 +837,13 @@ impl MockStripe {
 
     /// A rate-limit storm: every Stripe API request gets 429 for `d` of wall time.
     pub fn force_rate_limit(&self, d: Duration) {
-        self.shared.lock().api.storm(Instant::now() + d);
+        // Computed before the lock: `Instant + Duration` panics on overflow, so a
+        // huge `d` is capped at a century rather than poisoning the sim lock.
+        let now = Instant::now();
+        let until = now
+            .checked_add(d)
+            .unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 86_400));
+        self.shared.lock().api.storm(until);
     }
 
     /// Changes `[actions]` settings (validated). Changed rates redraw their next
@@ -887,7 +909,7 @@ impl MockStripe {
     pub fn start_outage(&self, id: &str, duration: Duration) -> Result<(), MockError> {
         let ms = duration_ms(duration);
         self.journalled(|sim| {
-            let until = sim.engine.now().plus_ms(ms);
+            let until = later(sim.engine.now(), ms)?;
             sim.engine.destinations_mut().get_mut(id)?.outage_until = Some(until);
             let op = ControlOp::StartOutage {
                 id: id.to_string(),
@@ -909,7 +931,7 @@ impl MockStripe {
     pub fn rotate_secret(&self, id: &str, overlap: Duration) -> Result<String, MockError> {
         let ms = duration_ms(overlap);
         self.journalled(|sim| {
-            let until = sim.engine.now().plus_ms(ms);
+            let until = later(sim.engine.now(), ms)?;
             let secret = sim.engine.destinations_mut().rotate_secret(id, until)?;
             let op = ControlOp::RotateSecret {
                 id: id.to_string(),
@@ -1052,6 +1074,13 @@ impl MockStripe {
 /// Whole milliseconds, as the journal stores durations.
 fn duration_ms(d: Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// `now` plus a user-given `ms`; a config error (not a panic under the sim lock)
+/// when that overflows simulated time. Callers check it before mutating anything.
+fn later(now: SimTime, ms: i64) -> Result<SimTime, MockError> {
+    now.checked_plus_ms(ms)
+        .ok_or_else(|| MockError::Config("duration too large".to_string()))
 }
 
 impl Drop for MockStripe {

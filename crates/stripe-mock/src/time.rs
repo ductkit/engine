@@ -27,6 +27,16 @@ impl SimTime {
     pub fn plus_ms(self, ms: i64) -> Self {
         SimTime(self.0 + ms)
     }
+
+    /// This time plus `ms` milliseconds, or `None` on overflow or when the result
+    /// is outside chrono's date range (so it could not be displayed). Use it for
+    /// durations that come from users.
+    pub fn checked_plus_ms(self, ms: i64) -> Option<Self> {
+        self.0
+            .checked_add(ms)
+            .filter(|&t| DateTime::from_timestamp_millis(t).is_some())
+            .map(SimTime)
+    }
 }
 
 impl std::fmt::Display for SimTime {
@@ -58,5 +68,16 @@ mod tests {
         assert_eq!(serde_json::to_value(t).unwrap(), "2026-01-01T00:12:03.120Z");
         assert_eq!(t.unix_seconds(), 1767226323);
         assert_eq!(SimTime(-1).unix_seconds(), -1);
+    }
+
+    #[test]
+    fn checked_plus_ms_overflows_to_none() {
+        assert_eq!(SimTime(1).checked_plus_ms(2), Some(SimTime(3)));
+        assert_eq!(SimTime(1).checked_plus_ms(i64::MAX), None);
+        assert_eq!(
+            SimTime(0).checked_plus_ms(i64::MAX / 2),
+            None,
+            "beyond chrono"
+        );
     }
 }

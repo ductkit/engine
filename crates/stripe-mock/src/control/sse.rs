@@ -8,14 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, WebSocket};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::http::{ControlError, Query, mock, parse_filter};
+use super::http::{ControlError, Query, WebSocketUpgrade, mock, parse_filter};
 use crate::SubscriptionItem;
 use crate::handle::Shared;
 
@@ -66,7 +66,7 @@ pub(super) async fn subscribe(
 pub(super) async fn subscribe_ws(
     State(s): State<Arc<Shared>>,
     Query(q): Query<SubscribeQuery>,
-    upgrade: WebSocketUpgrade,
+    WebSocketUpgrade(upgrade): WebSocketUpgrade,
 ) -> Result<Response, ControlError> {
     let m = mock(s.clone());
     let filter = parse_filter(&m, q.types.as_deref(), q.account.as_deref())?;
