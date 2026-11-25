@@ -37,7 +37,7 @@ pub use engine::events::{EventFormat, EventInfo};
 pub use engine::{Cause, ChangeKind, EventRefs, Scope, StateUpdate};
 pub use error::MockError;
 pub use generate::{Action, InvoiceOutcome};
-pub use handle::{AccountHandle, AccountInfo, MockStripe};
+pub use handle::{AccountHandle, AccountInfo, MockStripe, StartOptions};
 pub use model::ObjectType;
 pub use model::account::{AccountApi, AccountKind, Configuration};
 pub use model::customer::{CustomerUpdate, NewCustomer};

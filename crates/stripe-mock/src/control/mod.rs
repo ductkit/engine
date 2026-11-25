@@ -1,6 +1,7 @@
 //! Control ops: one serializable form of every mutating control call, applied by
 //! [`MockStripe::apply`], run as scripts, journalled, exported and replayed.
 
+pub(crate) mod http;
 pub(crate) mod journal;
 
 use std::path::{Path, PathBuf};
@@ -146,7 +147,7 @@ pub struct ReplayOptions {
     pub drop_destinations: bool,
 }
 
-fn duration(d: DurationStr) -> Result<Duration, MockError> {
+pub(crate) fn duration(d: DurationStr) -> Result<Duration, MockError> {
     u64::try_from(d.ms())
         .map(Duration::from_millis)
         .map_err(|_| MockError::Config(format!("duration must not be negative, got {} ms", d.ms())))

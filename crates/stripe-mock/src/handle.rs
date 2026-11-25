@@ -1,5 +1,6 @@
 //! The public control handle (spec section 11, in-process).
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -92,6 +93,8 @@ pub(crate) struct Shared {
     pub client: reqwest::Client,
     /// Set to `true` on shutdown, so held (`timeout`) responses end.
     pub shutdown: tokio::sync::watch::Sender<bool>,
+    /// Set to `true` by `POST /control/shutdown`; the process owner acts on it.
+    pub shutdown_requested: tokio::sync::watch::Sender<bool>,
 }
 
 /// Maps real time to simulated time in wall mode.
@@ -213,14 +216,65 @@ pub struct AccountInfo {
 pub struct MockStripe {
     pub(crate) shared: Arc<Shared>,
     api_addr: SocketAddr,
+    control_addr: Option<SocketAddr>,
     stop: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<()>>,
+    control_stop: Option<oneshot::Sender<()>>,
+    control_server: Option<JoinHandle<()>>,
     ticker: Option<JoinHandle<()>>,
 }
 
+/// Where [`MockStripe::start_with`] listens.
+#[derive(Debug, Clone, Default)]
+pub struct StartOptions {
+    /// The Stripe API's address. Default `127.0.0.1:0`.
+    pub api_addr: Option<SocketAddr>,
+    /// The control API's address. `None` opens no control port.
+    pub control_addr: Option<SocketAddr>,
+}
+
+/// Serves `app` on `listener` until `stopped` resolves.
+fn serve(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    stopped: oneshot::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await;
+    })
+}
+
 impl MockStripe {
-    /// Validates `config` and starts the mock.
+    /// A handle over `shared` for the control API's handlers. It owns no server,
+    /// so dropping it stops nothing.
+    pub(crate) fn view(shared: Arc<Shared>) -> MockStripe {
+        MockStripe {
+            shared,
+            api_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            control_addr: None,
+            stop: None,
+            server: None,
+            control_stop: None,
+            control_server: None,
+            ticker: None,
+        }
+    }
+
+    /// Validates `config` and starts the mock with the Stripe API on an ephemeral
+    /// loopback port and no control API.
     pub async fn start(config: Config) -> Result<MockStripe, MockError> {
+        MockStripe::start_with(config, StartOptions::default()).await
+    }
+
+    /// Validates `config` and starts the mock on the addresses in `options`.
+    pub async fn start_with(
+        config: Config,
+        options: StartOptions,
+    ) -> Result<MockStripe, MockError> {
         config.validate()?;
         let config_speed = config.clock.speed;
         let streams = RngStreams::new(config.seed);
@@ -261,9 +315,21 @@ impl MockStripe {
                 .build()
                 .map_err(|e| MockError::Config(format!("HTTP client: {e}")))?,
             shutdown: tokio::sync::watch::Sender::new(false),
+            shutdown_requested: tokio::sync::watch::Sender::new(false),
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let listener = match options.api_addr {
+            Some(addr) => tokio::net::TcpListener::bind(addr).await?,
+            None => tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+        };
         let api_addr = listener.local_addr()?;
+        let control_listener = match options.control_addr {
+            Some(addr) => Some(tokio::net::TcpListener::bind(addr).await?),
+            None => None,
+        };
+        let control_addr = control_listener
+            .as_ref()
+            .map(tokio::net::TcpListener::local_addr)
+            .transpose()?;
         let (stop, stopped) = oneshot::channel::<()>();
         let app = crate::api::router(shared.clone());
         let ticker = (shared.config.clock.mode == ClockMode::Wall).then(|| {
@@ -276,18 +342,23 @@ impl MockStripe {
                 }
             })
         });
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = stopped.await;
-                })
-                .await;
-        });
+        let server = serve(listener, app, stopped);
+        let (control_stop, control_server) = match control_listener {
+            Some(listener) => {
+                let (stop, stopped) = oneshot::channel::<()>();
+                let app = crate::control::http::router(shared.clone());
+                (Some(stop), Some(serve(listener, app, stopped)))
+            }
+            None => (None, None),
+        };
         Ok(MockStripe {
             shared,
             api_addr,
+            control_addr,
             stop: Some(stop),
             server: Some(server),
+            control_stop,
+            control_server,
             ticker,
         })
     }
@@ -297,17 +368,37 @@ impl MockStripe {
         format!("http://{}", self.api_addr)
     }
 
-    /// Stops the HTTP server (waiting until the port is closed) and ends every subscription.
+    /// Base URL of the control API, or `None` if no `control_addr` was given.
+    pub fn control_url(&self) -> Option<String> {
+        self.control_addr.map(|a| format!("http://{a}"))
+    }
+
+    /// Resolves once `POST /control/shutdown` has been called. It does not stop
+    /// anything itself; the process owner calls [`MockStripe::shutdown`].
+    pub fn shutdown_requested(&self) -> impl Future<Output = ()> + use<> {
+        let mut requested = self.shared.shutdown_requested.subscribe();
+        async move {
+            let _ = requested.wait_for(|r| *r).await;
+        }
+    }
+
+    /// Stops both HTTP servers (waiting until the ports are closed) and ends every subscription.
     pub async fn shutdown(mut self) {
         if let Some(ticker) = self.ticker.take() {
             ticker.abort();
         }
         self.shared.lock().engine.clear_subscribers();
         self.shared.shutdown.send_replace(true);
-        if let Some(stop) = self.stop.take() {
+        for stop in [self.stop.take(), self.control_stop.take()]
+            .into_iter()
+            .flatten()
+        {
             let _ = stop.send(());
         }
-        if let Some(server) = self.server.take() {
+        for server in [self.server.take(), self.control_server.take()]
+            .into_iter()
+            .flatten()
+        {
             let _ = server.await;
         }
     }
@@ -951,7 +1042,10 @@ impl Drop for MockStripe {
         if let Some(ticker) = self.ticker.take() {
             ticker.abort();
         }
-        if let Some(stop) = self.stop.take() {
+        for stop in [self.stop.take(), self.control_stop.take()]
+            .into_iter()
+            .flatten()
+        {
             let _ = stop.send(());
         }
     }

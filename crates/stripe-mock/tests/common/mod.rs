@@ -164,3 +164,36 @@ pub fn recurring_prices(m: &MockStripe, n: usize, interval: &str) -> Vec<String>
     }
     panic!("no {n} recurring {interval} prices after 200 catalog changes");
 }
+
+/// `GET path` against the control API.
+pub async fn ctl_get(m: &MockStripe, path: &str) -> reqwest::Response {
+    let url = m.control_url().expect("control API is open");
+    reqwest::Client::new()
+        .get(format!("{url}{path}"))
+        .send()
+        .await
+        .expect("request sent")
+}
+
+/// `POST path` with a JSON body against the control API.
+pub async fn ctl_post(m: &MockStripe, path: &str, body: serde_json::Value) -> reqwest::Response {
+    let url = m.control_url().expect("control API is open");
+    reqwest::Client::new()
+        .post(format!("{url}{path}"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request sent")
+}
+
+/// Starts a mock with the control API on `127.0.0.1:0`.
+pub async fn mock_with_control(toml: &str) -> MockStripe {
+    let config = Config::from_toml_str(toml).expect("valid config");
+    let options = ductkit_stripe_mock::StartOptions {
+        control_addr: Some("127.0.0.1:0".parse().expect("addr")),
+        ..Default::default()
+    };
+    MockStripe::start_with(config, options)
+        .await
+        .expect("mock starts")
+}
