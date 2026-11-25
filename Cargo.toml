@@ -9,4 +9,4 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/ductkit/engine"
 
 [workspace.dependencies]
-engine-core = { path = "crates/engine-core" }
+ductkit-core = { path = "crates/core" }

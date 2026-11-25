@@ -3,12 +3,12 @@
 version = 4
 
 [[package]]
-name = "engine-cli"
+name = "ductkit-core"
 version = "0.1.0"
-dependencies = [
- "engine-core",
-]
 
 [[package]]
-name = "engine-core"
+name = "ductkit-sync"
 version = "0.1.0"
+dependencies = [
+ "ductkit-core",
+]

@@ -6,8 +6,8 @@ The ductkit engine, organised as a multi-crate Rust workspace.
 
 | Crate | Kind | Purpose |
 |-------|------|---------|
-| [`engine-core`](crates/engine-core) | library | Core engine logic |
-| [`engine-cli`](crates/engine-cli) | binary | Command-line entry point |
+| [`ductkit-core`](crates/core) | library | Core engine logic |
+| [`ductkit-sync`](crates/sync) | binary | `sync` command-line tool |
 
 ## Getting started
 
@@ -16,7 +16,7 @@ Requires a recent stable Rust toolchain (edition 2024).
 ```sh
 cargo build          # build every crate
 cargo test           # run all tests
-cargo run -p engine-cli
+cargo run -p ductkit-sync
 ```
 
 ## License

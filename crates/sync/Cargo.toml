@@ -1,9 +1,9 @@
 [package]
-name = "engine-cli"
+name = "ductkit-sync"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-engine-core.workspace = true
+ductkit-core.workspace = true
