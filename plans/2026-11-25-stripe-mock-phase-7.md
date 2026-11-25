@@ -387,7 +387,7 @@
 ### Task 10: One-off payments and refunds
 
 **Files:**
-- Modify: `src/config.rs` (`ActionsConfig.one_off_payment`, `ActionsConfig.refund`, validation, `UNIMPLEMENTED_KEYS` emptied), `src/generate/mod.rs` (`ActionKind::OneOffPayment`, `ActionKind::Refund` appended, plus `Action::OneOffPayment { customer: Option<String>, amount: Option<i64>, succeed: Option<bool> }` and `Action::Refund { charge: Option<String>, amount: Option<i64> }`), `src/generate/payments.rs`, `src/control/mod.rs` (ops serialize), `docs/stripe-mock-spec.md` sections 4 and 11
+- Modify: `src/config.rs` (`ActionsConfig.one_off_payment`, `ActionsConfig.refund`, validation; `one_off_payment` and `refund` removed from `UNIMPLEMENTED_KEYS`, while `dispute` stays reserved until Task 11), `src/generate/mod.rs` (`ActionKind::OneOffPayment`, `ActionKind::Refund` appended, plus `Action::OneOffPayment { customer: Option<String>, amount: Option<i64>, succeed: Option<bool> }` and `Action::Refund { charge: Option<String>, amount: Option<i64> }`), `src/generate/payments.rs`, `src/control/mod.rs` (ops serialize), `docs/stripe-mock-spec.md` sections 4 and 11
 - Test: `tests/payments_actions.rs`, `src/config.rs` unit tests
 
 **Interfaces:**
@@ -401,6 +401,7 @@
 - One-off payment: `charge_once` with no invoice, for a random live customer, or with no customer for p = 0.2. The amount is drawn like a one-off invoice line, the outcome comes from `payment_failure_probability`, and the stream is `"generate.one_off_payment"`.
 
 - [ ] **Step 1: Write the failing tests:**
+  - Update `spec_example_config_fails_clearly` in `src/config.rs`. It relies on the spec's example TOML failing with "not implemented yet (needs payment objects, phase 7)". After this task the example must parse, or fail only on a key that is still unimplemented. Rename and rewrite it to assert whatever the example now does, and ledger the change.
   - `config_accepts_one_off_payment_and_refund_rates`: the TOML that used to fail with "not implemented yet (needs payment objects, phase 7)" now parses.
   - `one_off_payment_without_invoice`: asserts `pi.invoice`-related fields are null and there's no invoice payment.
   - `partial_then_full_refund`: two refunds, then `charge.refunded == true`, `amount_refunded == amount`, and a third `Action::Refund` on it is an error naming the charge.
@@ -415,7 +416,7 @@
 ### Task 11: Disputes
 
 **Files:**
-- Modify: `src/config.rs` (`ActionsConfig.dispute`), `src/generate/mod.rs` (`ActionKind::Dispute`, `Action::Dispute { charge: Option<String>, outcome: Option<DisputeOutcome> }`, and continuations `DisputeUpdate { id }`, `DisputeClose { id, outcome }`), `src/generate/payments.rs`
+- Modify: `src/config.rs` (`ActionsConfig.dispute`, and the `UNIMPLEMENTED_KEYS` entry removed entirely, along with the now-unused mechanism if nothing else uses it; update `spec_example_config_fails_clearly` again), `src/generate/mod.rs` (`ActionKind::Dispute`, `Action::Dispute { charge: Option<String>, outcome: Option<DisputeOutcome> }`, and continuations `DisputeUpdate { id }`, `DisputeClose { id, outcome }`), `src/generate/payments.rs`
 - Test: `tests/disputes.rs`
 
 **Interfaces:**
@@ -499,11 +500,9 @@
     - `charge.disputed` exactly when a dispute exists.
   - `payment_lists_survive_faults` (Review Focus 5): `stale_read = { probability = 0.5, max_lag = "5s" }` and `pagination_writes = { probability = 1.0 }`, with the one-off payment rate high. Paginate `/v1/charges` and `/v1/payment_intents` fully, 10 times while generation runs. No ID appears twice in one pagination, and no deleted ID appears.
 - [ ] **Step 2: Run them.** Run `cargo test -p ductkit-stripe-mock --test openapi_conformance`. Expected: they PASS if Tasks 5–12 are right. Any failure is a bug in the owning task's code: fix it here, with a regression test in that task's test file, and ledger it.
-- [ ] **Step 3: Update the spec and `CLAUDE.md`.**
-  - Section 4: the new action and churn keys in the example TOML, with rates that keep the config test passing.
-  - Section 5.1: the 9 new types, in the table format with delete style and relations, and the phase-2 candidates line replaced by "Phase 8 adds Connect money movement; phase 9 billing extras (see `docs/superpowers/specs/2026-11-25-stripe-mock-types-and-openapi-design.md`)".
-  - Section 7.2: the new endpoints.
-  - Section 14: generation, freshness and conformance, with the regenerate command.
-  - Section 16: item 7 rewritten as done-scope, plus new items 8 (Connect money movement) and 9 (billing extras).
+- [ ] **Step 3: Bring the spec and `CLAUDE.md` in line with what was built.** Sections 5.5, 14, 16 and 17 already describe phase 7, because they were written before execution. Correct them wherever the build differs, for example a confirmed ID prefix, and ledger each correction.
+  - Section 4: the new action and churn keys in the example TOML (`save_payment_method`, `checkout`, `[churn.payment_method] detach`), with rates that keep the config tests passing.
+  - Section 5.1: the 9 new types moved into the table, with their ID prefixes, delete style and relations.
+  - Section 7.2: every new endpoint, filter and sub-list from Task 8.
 - [ ] **Step 4: Run the full suite,** then `grep -c $'\r' docs/stripe-mock-spec.md` (expected `0`).
 - [ ] **Step 5: Commit** with the message `test(stripe-mock): OpenAPI conformance coverage for phase 7`.

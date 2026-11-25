@@ -65,7 +65,8 @@ ductkit-stripe-mock
 ├── faults      fault policies applied by `project` and the HTTP layer
 ├── api         read-only Stripe-compatible HTTP API, v1 and v2 (axum)
 ├── control     control/admin API (separate router + Rust handle)
-└── stream      latest-state subscription (async stream in-process; SSE/WebSocket over HTTP)
+├── stream      latest-state subscription (async stream in-process; SSE/WebSocket over HTTP)
+└── stripe      Rust types generated from the vendored OpenAPI spec, and the conformance check (section 14)
 ```
 
 Two run modes share one engine:
@@ -240,7 +241,7 @@ Chosen to cover each deletion style and the main relationship shapes:
 
 Connected accounts themselves are covered in section 5.4.
 
-Phase 2 candidates: `payment_intent`, `charge`, `refund`, `dispute`, `payment_method`, `coupon`, `promotion_code`, `balance_transaction`, `payout`.
+Later phases add payments, Connect money movement and billing extras (section 5.5).
 
 ### 5.2 Lifecycle state machines
 
@@ -289,6 +290,48 @@ The `data.object` of `account.application.*` is the platform application (`{"id"
 
 **Event coverage is identical for platform and connected accounts.** Every action, entity type, lifecycle and event type the mock generates for a platform account is generated for each connected account too, with the same rates. Connected-account events reach snapshot destinations with `connect = true` (carrying `account`) and thin destinations with `@accounts` in `events_from` (carrying `context`). All faults apply to them in the same way.
 
+### 5.5 Planned entity types (phases 7–9)
+
+Coverage follows what a Stripe Connect integration needs, most-used first. Each type is there for the sync situation it adds. The full design is in `docs/superpowers/specs/2026-11-25-stripe-mock-types-and-openapi-design.md`. ID prefixes are confirmed against Stripe's examples when each type is built.
+
+**Phase 7: payments core.**
+
+| Type | Removal style | Sync situation |
+|---|---|---|
+| `payment_intent` | `canceled` status | fast status churn |
+| `charge` | none (`refunded`, `disputed` flags) | updated by its children |
+| `refund` | `canceled` / `failed` status | appears standalone and embedded in `charge.refunds` |
+| `dispute` | closed statuses | lives for weeks of simulated time, with many updates |
+| `balance_transaction` | none | no events of its own: found only by listing; `pending → available` changes silently at `available_on` |
+| `payment_method` | detach (`customer: null`, stays retrievable) | listing needs a customer |
+| `setup_intent` | `canceled` status | creates payment methods |
+| `checkout.session` | expires | dotted object name; creates a payment or a subscription |
+| `invoice_payment` | none | links an invoice to its payments (`invoice.payments`) |
+
+Paying an invoice creates, in one action: a payment intent, a charge with its balance transaction, an invoice payment, and the paid invoice. Events: `payment_intent.created`, `charge.succeeded`, `payment_intent.succeeded`, `invoice_payment.paid`, `invoice.paid`, `invoice.payment_succeeded`. A failed attempt creates a failed charge instead. Finalizing stays a separate, earlier step. New actions: `one_off_payment`, `refund` and `dispute` (until now reserved keys), plus `save_payment_method`, `checkout` and `[churn.payment_method] detach`.
+
+**Phase 8: Connect money movement.**
+
+| Type | Removal style | Sync situation |
+|---|---|---|
+| `transfer` and `transfer_reversal` | reversal | reversals as an embedded list and sub-list |
+| `application_fee` and `fee_refund` | refund | platform-scope objects that describe connected-account charges |
+| `payout` | `canceled` / `failed` | own lifecycle; creates balance transactions; runs on connected accounts too |
+| external accounts (`bank_account`, `card`) | hard delete | polymorphic sub-list of an account |
+| `person` | hard delete | sub-list of an account; changes `account.requirements` |
+
+Charge patterns under Connect:
+- **Connected accounts keep direct charges.** Their own payments stay in their own scope, which makes them direct charges by construction. `accounts.application_fee = { probability, percent }` (default `{ probability = 0.0, percent = 10.0 }`) adds a platform `application_fee` to some of them.
+- **The platform's own payments can route money to a connected account.** `accounts.platform_payments = { own, destination, separate }` (default `{ own = 1.0 }`) draws a pattern for each platform payment, and for a non-`own` pattern, a recipient account:
+  - **destination:** `transfer_data.destination`, a `transfer`, and a `py_` payment in the account's scope.
+  - **separate:** separate charges and transfers: a `transfer_group`, then an independent `transfer`.
+  - With no connected account available, the payment falls back to `own`.
+- With `connect = false`, non-default values of either key are config errors.
+
+**Phase 9: billing extras.** `coupon` (hard delete), `promotion_code` (deactivate only, no delete event), `discount` (embedded only), `invoiceitem` (hard delete while pending), `credit_note` with `credit_note_line_item` (void), `tax_rate` (archive) and `subscription_schedule` (released, canceled or completed).
+
+Every new type gets events for both payload formats, history, faults and the latest-state subscription. It also gets the same Connect coverage as platform types, except the scope-specific money movement above.
+
 ## 6. Action generation
 
 ### 6.1 Cause-driven fan-out
@@ -301,7 +344,7 @@ In Stripe, one action produces many events across objects. The generator models 
 4. `invoice.paid`, `invoice.payment_succeeded`
 5. `customer.subscription.updated` (status `incomplete → active`)
 
-Until payment objects exist (phase 7), paying an invoice is one mutation announcing `invoice.paid` and `invoice.payment_succeeded`.
+Until payment objects exist (phase 7), paying an invoice is one mutation announcing `invoice.paid` and `invoice.payment_succeeded`. Phase 7 replaces it with the payment sequence in section 5.5.
 
 Mutations inside one action are spaced over a short, configurable span (often the same second), which produces the cross-object races that matter. Per-type `churn` rates add independent updates and deletes on top.
 
@@ -354,6 +397,7 @@ History events are listed by the Events APIs while inside retention, but never d
   - `/v1/accounts` lists connected accounts only; a disconnected account is absent and its retrieve is 404.
   - `/v2/core/accounts` lists open accounts by default; `closed=true` lists only closed (disconnected) accounts. Retrieve renders a closed account with `closed: true`.
 - Read-only views of configured delivery targets: `GET /v1/webhook_endpoints` (snapshot targets) and `GET /v2/core/event_destinations` (thin targets), so the sync engine can check its setup.
+- Phases 7–9 add retrieve and list for each of their types, plus their sub-lists (section 5.5). Some lists need a parent, the way `/v1/subscription_items` needs `subscription`: `/v1/payment_methods` needs `customer`, and is also served at `/v1/customers/{id}/payment_methods`.
 
 ### 7.3 List semantics
 
@@ -388,7 +432,7 @@ Every truth-log mutation that Stripe would announce produces **one snapshot even
 
 ### 8.2 Thin events (v2)
 
-Stripe made thin events for API v1 resources generally available in `2026-09-30.endive`. The mock implements them for every phase-1 type.
+Stripe made thin events for API v1 resources generally available in `2026-09-30.endive`. The mock implements them for every type it models.
 
 - **Naming**: the snapshot type with a `v1.` prefix, e.g. `customer.created` → `v1.customer.created`.
 - **Notification** (what a destination receives): `id`, `object: "v2.core.event"`, `type`, `created`, `livemode`, `context` (the connected account, for Connect), `reason` (`type`, `request {id, idempotency_key}`), and `related_object {id, type, url}`. `related_object.type` is the v1 object name (e.g. `customer`) and `url` is an API path such as `/v1/customers/cus_…`. The notification has **no** object data.
@@ -582,8 +626,18 @@ The mock supports all of these through the latest-state subscription, per-object
 
 ## 14. Fidelity
 
-- Generate object types and response shapes from Stripe's published **OpenAPI spec** for the pinned version, and validate every mock response against it in the mock's own tests. This prevents the mock from drifting away from real Stripe.
-- **OpenAPI validation is part of the regular test suite.** It runs on every full test run (`cargo test --workspace`), locally or in CI, with no extra command, flag or credentials. The OpenAPI spec for the pinned version is vendored in the repository, so validation runs offline and gives the same result on every machine. Updating the pinned version means replacing the vendored file.
+- **Generated types.** Every object the mock serves is built from Rust types generated from Stripe's published **OpenAPI spec** for the pinned version. That covers REST responses, embedded and expanded objects, event payloads, thin events, delivery-target views and error bodies. A misnamed, mistyped or wrongly nullable field is a compile error, not a drifted response. This matters because sync users map individual fields to database columns.
+  - **The vendored spec** is `crates/stripe-mock/openapi/spec3.json`: `stripe/openapi` path `latest/openapi.spec3.json` at commit `0f6d4dfafe157c10df393ce8a27d00b186ab3955` ("Update OpenAPI for 2026-11-18.endive"). It covers v1 and v2. Its provenance, size and SHA-256 are in `openapi/README.md`, and a test pins them.
+  - **The generated code** is committed under `crates/stripe-mock/src/stripe/generated/` and never edited by hand. Only an allowlist of root schemas, plus what they reference without expansion, is generated. An expandable reference to a type the mock doesn't model is generated as ID-only.
+  - **The generator** lives in the crate's test tree. Its test regenerates the code in memory and fails if the committed files differ. Regenerate with `DUCTKIT_REGEN=1 cargo test -p ductkit-stripe-mock --test openapi_codegen`.
+  - **The pinned schema wins.** Where it disagrees with behavior this spec documents, the mock follows the schema, and this spec is corrected.
+  - **Field presence.** The spec's `required` lists don't say which fields Stripe always returns. For example, `customer` lists only `created`, `id`, `livemode` and `object`. Generated structs therefore have no defaults, and the model code decides explicitly, for every field, whether it is present, `null` or absent. A test compares each type's served fields with the schema's, against a reviewed list of deliberate exclusions.
+- **OpenAPI conformance is part of the regular test suite.** It runs on every full test run (`cargo test --workspace`), locally or in CI, with no extra command, flag or credentials, and offline. Three checks:
+  - the freshness test above;
+  - a round-trip check that deserializes every payload the tests receive into its generated type, with unknown fields denied;
+  - a coverage test that runs a busy Connect run and checks everything it serves.
+
+  Updating the pinned version means replacing the vendored file and regenerating.
 - Stripe's official `stripe-mock` is stateless and doesn't fit this purpose, but its OpenAPI-based fixtures can seed realistic example values.
 - **Calibration** (deferred; not scheduled in any phase): periodically run equivalent scripted actions against real Stripe test mode and compare event fan-out, ordering and latency distributions with the mock's defaults. When it is built, calibration is a manual or scheduled job, not part of the regular test suite.
 - One pinned API version (`2026-11-18.endive`). The OpenAPI spec for that version, covering both v1 and v2 endpoints, is the source for generated types. Multi-version payload rendering is not planned.
@@ -602,7 +656,9 @@ The mock supports all of these through the latest-state subscription, per-object
 4. **History and backfill races**; API faults (rate limits, 5xx, stale reads, writes during pagination).
 5. **Connect**: v1 and v2 connected accounts, `Stripe-Account`, connect/disconnect, full event coverage for connected accounts through snapshot and thin destinations.
 6. **Standalone server binary**, SSE/WebSocket subscription, HTTP control API, run export and replay.
-7. **Phase-2 entity types and OpenAPI validation**: more entity types (section 5.1), and validation of every mock response against the vendored OpenAPI spec as part of the regular test suite (section 14).
+7. **Generated types and payments core**: the vendored OpenAPI spec, generated Rust types for every served object, and conformance checks in the regular test suite (section 14). Plus payment intents, charges, refunds, disputes, balance transactions, payment methods, setup intents, Checkout sessions and invoice payments, with invoice payments creating real payment objects (section 5.5).
+8. **Connect money movement**: transfers and reversals, application fees and fee refunds, payouts, external accounts and persons, and the Connect charge patterns (section 5.5).
+9. **Billing extras**: coupons, promotion codes, discounts, invoice items, credit notes, tax rates and subscription schedules (section 5.5).
 
 Calibration against real Stripe test mode (section 14) is deferred to a later, unscheduled phase.
 
@@ -618,6 +674,11 @@ Calibration against real Stripe test mode (section 14) is deferred to a later, u
 | 6 | Connected accounts are modelled for both Accounts v1 and Accounts v2. | 4, 5.4, 7.2 |
 | 7 | Connected accounts get the same event coverage as platform accounts, through both snapshot and thin destinations. | 5.4, 9 |
 | 8 | Packaged as one crate with a library (imported by tests) and a binary (standalone server). No container image. | 3.1 |
+| 9 | Object shapes come from Rust types generated from the vendored OpenAPI spec. The generated code is committed and kept fresh by a test. The types live in the mock crate and are not shared with the sync engine. | 3, 14 |
+| 10 | Where the pinned OpenAPI schema disagrees with documented behavior, the schema wins and the spec is corrected. | 14 |
+| 11 | Entity coverage follows what a Stripe Connect integration needs, delivered over phases 7–9. | 5.5, 16 |
+| 12 | Under Connect, connected accounts keep direct charges. Destination charges and separate charges and transfers come from the platform's own payments. | 5.5 |
+| 13 | Calibration against real Stripe test mode is deferred to an unscheduled phase. | 14, 16 |
 
 ## 18. Open questions
 
