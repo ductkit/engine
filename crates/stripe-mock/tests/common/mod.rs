@@ -15,14 +15,63 @@ pub async fn mock_with(toml: &str) -> MockStripe {
     MockStripe::start(config).await.expect("mock starts")
 }
 
+/// `object` values whose payloads `get` and friends check against the pinned schema. Each
+/// task that types an object adds its value here.
+pub const CONFORMANCE_CHECKED: &[&str] = &[];
+
+/// Panics unless `v` conforms to the pinned Stripe schema.
+pub fn assert_conforms(v: &Value) {
+    if let Err(e) = ductkit_stripe_mock::stripe::check_payload(v) {
+        panic!(
+            "payload does not conform: {e}
+{v:#}"
+        );
+    }
+}
+
+/// Checks every object in `v` whose `object` is in [`CONFORMANCE_CHECKED`], recursing into
+/// lists (`data`) and events (`data.object`).
+fn check_checked(v: &Value) {
+    let object = v.get("object").and_then(Value::as_str);
+    let is_list = object == Some("list")
+        || (v.get("next_page_url").is_some() && v.get("data").is_some_and(Value::is_array));
+    if is_list {
+        for item in v["data"].as_array().into_iter().flatten() {
+            check_checked(item);
+        }
+        return;
+    }
+    match object {
+        Some(o) if CONFORMANCE_CHECKED.contains(&o) => assert_conforms(v),
+        Some("event") => {
+            if let Some(obj) = v.pointer("/data/object") {
+                check_checked(obj);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Buffers the body, checks it on a 2xx JSON response, and rebuilds the response so callers
+/// can still read it.
+async fn checked(resp: reqwest::Response) -> reqwest::Response {
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp.bytes().await.expect("body read");
+    if status.is_success()
+        && let Ok(v) = serde_json::from_slice::<Value>(&body)
+    {
+        check_checked(&v);
+    }
+    let mut rebuilt = axum::http::Response::new(body);
+    *rebuilt.status_mut() = status;
+    *rebuilt.headers_mut() = headers;
+    reqwest::Response::from(rebuilt)
+}
+
 /// `GET path` against the mock's API with the default test key.
 pub async fn get(m: &MockStripe, path: &str) -> reqwest::Response {
-    reqwest::Client::new()
-        .get(format!("{}{path}", m.api_url()))
-        .bearer_auth("sk_test_mock")
-        .send()
-        .await
-        .expect("request sent")
+    get_with(m, path, &[]).await
 }
 
 /// `GET path` with extra request headers.
@@ -33,7 +82,7 @@ pub async fn get_with(m: &MockStripe, path: &str, headers: &[(&str, &str)]) -> r
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
-    req.send().await.expect("request sent")
+    checked(req.send().await.expect("request sent")).await
 }
 
 /// `GET path` scoped to a connected account with `Stripe-Account`.

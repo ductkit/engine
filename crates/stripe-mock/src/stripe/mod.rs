@@ -3,17 +3,17 @@
 //! `generated` is emitted from the vendored OpenAPI spec by `tests/codegen` and committed;
 //! never edit it by hand. The rest of this module holds the hand-written types it builds on.
 
+mod conformance;
 pub mod double_option;
 mod expandable;
 mod list;
 
 // The generator emits formatted code (prettyplease); rustfmt must not reformat it, or the
 // freshness test fails.
-// `check_by_object` has no caller until `check_payload` is added on top of it.
 #[rustfmt::skip]
-#[allow(dead_code)]
 mod generated;
 
+pub use conformance::{ConformanceError, check_payload};
 pub use expandable::{Expandable, HasId};
 pub use generated::*;
 pub use list::{List, ListObject};

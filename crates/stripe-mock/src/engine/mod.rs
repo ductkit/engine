@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::delivery::{
@@ -445,6 +446,72 @@ impl Engine {
         Ok(Some(update))
     }
 
+    /// [`create`](Self::create) for a typed object: the generated struct is the only way in.
+    // The model code that uses the typed helpers arrives in later tasks.
+    #[allow(dead_code)]
+    pub(crate) fn create_obj<T: Serialize>(
+        &mut self,
+        t: ObjectType,
+        id: String,
+        obj: &T,
+        cause: Cause,
+        events: &[&str],
+    ) -> StateUpdate {
+        let state = serde_json::to_value(obj)
+            .unwrap_or_else(|e| panic!("{t:?} {id}: object does not serialize: {e}"));
+        self.create(t, id, state, cause, events)
+    }
+
+    /// [`update`](Self::update) through the typed object: the latest state is deserialized
+    /// into `T`, `f` changes it, and the result is stored. A state that does not deserialize
+    /// is a bug in the mock, so it panics with the type, the ID and the path.
+    #[allow(dead_code, clippy::too_many_arguments)] // every argument is part of the entry
+    pub(crate) fn update_obj<T: Serialize + DeserializeOwned>(
+        &mut self,
+        t: ObjectType,
+        id: &str,
+        f: impl FnOnce(&mut T),
+        cause: Cause,
+        kind: ChangeKind,
+        events: &[&str],
+    ) -> Result<Option<StateUpdate>, MockError> {
+        self.update(
+            t,
+            id,
+            |state| {
+                let mut obj: T = serde_path_to_error::deserialize(&*state).unwrap_or_else(|e| {
+                    panic!(
+                        "{t:?} {id}: stored state is not a valid object at {}: {}",
+                        e.path(),
+                        e.inner()
+                    )
+                });
+                f(&mut obj);
+                *state = serde_json::to_value(&obj)
+                    .unwrap_or_else(|e| panic!("{t:?} {id}: object does not serialize: {e}"));
+            },
+            cause,
+            kind,
+            events,
+        )
+    }
+
+    /// The object's latest state as `T`; `None` if it does not exist. Panics, like
+    /// [`update_obj`](Self::update_obj), if the stored state is not a valid `T`.
+    #[allow(dead_code)]
+    pub(crate) fn latest_obj<T: DeserializeOwned>(&self, t: ObjectType, id: &str) -> Option<T> {
+        let latest = self.latest(t, id)?;
+        Some(
+            serde_path_to_error::deserialize(&latest.state).unwrap_or_else(|e| {
+                panic!(
+                    "{t:?} {id}: stored state is not a valid object at {}: {}",
+                    e.path(),
+                    e.inner()
+                )
+            }),
+        )
+    }
+
     pub(crate) fn delete(
         &mut self,
         t: ObjectType,
@@ -674,6 +741,53 @@ mod tests {
 
     fn cust(id: &str, created: i64) -> Value {
         json!({"id": id, "object": "customer", "created": created, "email": null})
+    }
+
+    #[test]
+    fn update_obj_round_trips_a_customer() {
+        use crate::stripe::Customer;
+        let mut e = test_engine();
+        let c = e.begin_action("t");
+        let customer: Customer = serde_json::from_value(json!({
+            "id": "cus_a", "object": "customer", "created": 1, "livemode": false, "name": null
+        }))
+        .unwrap();
+        e.create_obj(
+            ObjectType::Customer,
+            "cus_a".into(),
+            &customer,
+            c.clone(),
+            &[],
+        );
+        let u = e
+            .update_obj::<Customer>(
+                ObjectType::Customer,
+                "cus_a",
+                |c| c.name = Some(Some("Ada".into())),
+                c.clone(),
+                ChangeKind::Updated,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(u.state["name"], "Ada");
+        let back: Customer = e.latest_obj(ObjectType::Customer, "cus_a").unwrap();
+        assert_eq!(back.name, Some(Some("Ada".to_string())));
+        let same = e
+            .update_obj::<Customer>(
+                ObjectType::Customer,
+                "cus_a",
+                |_| {},
+                c,
+                ChangeKind::Updated,
+                &[],
+            )
+            .unwrap();
+        assert!(same.is_none());
+        assert!(
+            e.latest_obj::<Customer>(ObjectType::Customer, "cus_zz")
+                .is_none()
+        );
     }
 
     #[test]
