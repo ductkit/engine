@@ -17,7 +17,7 @@ mod time;
 pub use config::{
     ActionsConfig, ApiConfig, CatalogChurn, ChurnConfig, ClockConfig, ClockMode, ClockSkew, Config,
     CustomerChurn, DestinationConfig, DisableAfter, Distribution, DurationStr,
-    EventRetentionConfig, EventsConfig, LateTail, PINNED_API_VERSION, PayloadFormat,
+    EventRetentionConfig, EventsConfig, HistoryConfig, LateTail, PINNED_API_VERSION, PayloadFormat,
     PayloadsConfig, RenewMode, RetrySchedule, UpdateChurn, WebhooksConfig,
 };
 pub use delivery::signing::verify_signature;

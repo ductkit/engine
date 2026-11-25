@@ -90,15 +90,17 @@ impl Engine {
             subscribers: Vec::new(),
             projector: Projector::new(config, streams),
             events: EventStore::default(),
-            destinations: {
-                let mut d = Destinations::new(streams);
-                for c in &config.destinations {
-                    d.add(c.clone(), start)
-                        .expect("config destinations are validated");
-                }
-                d
-            },
+            destinations: Destinations::new(streams),
             deliveries: Deliveries::new(&config.webhooks, streams),
+        }
+    }
+
+    /// Adds the configured destinations at the current time (after history).
+    pub(crate) fn add_config_destinations(&mut self, config: &Config) {
+        for c in &config.destinations {
+            self.destinations
+                .add(c.clone(), self.now)
+                .expect("config destinations are validated");
         }
     }
 

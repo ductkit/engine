@@ -11,7 +11,7 @@ use crate::MockError;
 pub const PINNED_API_VERSION: &str = "2026-11-18.endive";
 
 /// Top-level spec sections that are not implemented yet.
-const UNIMPLEMENTED_SECTIONS: [&str; 2] = ["accounts", "history"];
+const UNIMPLEMENTED_SECTIONS: [&str; 1] = ["accounts"];
 
 /// Spec keys inside supported sections that are not implemented yet, with an
 /// optional reason appended to the error.
@@ -56,6 +56,7 @@ pub struct Config {
     /// Must equal [`PINNED_API_VERSION`].
     pub api_version: String,
     pub clock: ClockConfig,
+    pub history: HistoryConfig,
     pub api: ApiConfig,
     pub actions: ActionsConfig,
     pub churn: ChurnConfig,
@@ -86,6 +87,25 @@ pub enum ClockMode {
     Virtual,
     /// Time follows the real clock multiplied by `speed`.
     Wall,
+}
+
+/// Pre-generated data that exists before the run starts (spec section 6.3).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HistoryConfig {
+    /// How far before `clock.start` generation begins. Default `"0s"`: no history.
+    pub duration: DurationStr,
+    /// Multiplies every action and churn rate during history.
+    pub scale: f64,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        HistoryConfig {
+            duration: DurationStr(0),
+            scale: 1.0,
+        }
+    }
 }
 
 /// Stripe-compatible API settings.
@@ -198,6 +218,7 @@ impl Default for Config {
             seed: 0,
             api_version: PINNED_API_VERSION.to_string(),
             clock: ClockConfig::default(),
+            history: HistoryConfig::default(),
             api: ApiConfig::default(),
             actions: ActionsConfig::default(),
             churn: ChurnConfig::default(),
@@ -255,6 +276,15 @@ impl Config {
             ));
         }
         self.actions.validate()?;
+        let scale = self.history.scale;
+        if !scale.is_finite() || scale < 0.0 {
+            return err(format!(
+                "history.scale must be a finite number >= 0, got {scale}"
+            ));
+        }
+        if self.history.duration.ms() < 0 {
+            return err("history.duration must be >= 0".to_string());
+        }
         let ch = &self.churn;
         for (name, rate) in [
             ("churn.customer.update", ch.customer.update),
@@ -696,10 +726,10 @@ mod tests {
 
     #[test]
     fn unimplemented_section_is_named() {
-        let e = Config::from_toml_str("[history]\nduration = \"90d\"").unwrap_err();
+        let e = Config::from_toml_str("[accounts]\nplatforms = 1").unwrap_err();
         let msg = e.to_string();
         assert!(
-            msg.contains("[history]") && msg.contains("not implemented"),
+            msg.contains("[accounts]") && msg.contains("not implemented"),
             "{msg}"
         );
     }
@@ -769,8 +799,24 @@ dispute = 0.05",
     }
 
     #[test]
+    fn history_defaults_are_empty() {
+        let d = Config::default();
+        assert_eq!((d.history.duration.ms(), d.history.scale), (0, 1.0));
+        let c = Config::from_toml_str(
+            "[history]
+duration = \"90d\"
+scale = 0.5",
+        )
+        .unwrap();
+        assert_eq!(
+            (c.history.duration.ms(), c.history.scale),
+            (90 * 86_400_000, 0.5)
+        );
+    }
+
+    #[test]
     fn not_implemented_message_is_tidy() {
-        let msg = Config::from_toml_str("[history]").unwrap_err().to_string();
+        let msg = Config::from_toml_str("[accounts]").unwrap_err().to_string();
         assert!(!msg.contains("  "), "{msg:?}");
     }
 

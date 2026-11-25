@@ -139,6 +139,9 @@ pub(crate) enum Continuation {
 #[derive(Debug)]
 struct Scheduled {
     kind: ActionKind,
+    /// The configured rate.
+    base_rate: f64,
+    /// `base_rate` × the generator's scale.
     rate: f64,
     rng: SimRng,
     next_due: Option<SimTime>,
@@ -189,6 +192,8 @@ pub(crate) struct Generator {
     /// Draws for actions triggered through `run_action`.
     control: SimRng,
     enabled: bool,
+    /// Multiplies every configured Poisson rate (`history.scale` during history).
+    scale: f64,
 }
 
 impl Generator {
@@ -268,6 +273,7 @@ impl Generator {
                 let next_due = rng.exp_interval_ms(rate).map(|ms| start.plus_ms(ms));
                 Scheduled {
                     kind,
+                    base_rate: rate,
                     rate,
                     rng,
                     next_due,
@@ -276,6 +282,7 @@ impl Generator {
             .collect();
         Generator {
             actions,
+            scale: 1.0,
             ctx: Ctx {
                 config: config.actions.clone(),
                 page_size: config.payloads.nested_list_page_size,
@@ -309,6 +316,19 @@ impl Generator {
         &self.ctx.config
     }
 
+    /// Sets every Poisson rate to its configured rate × `factor` (history uses
+    /// `history.scale`); actions whose rate changed redraw their next due time from `now`.
+    pub(crate) fn scale_rates(&mut self, factor: f64, now: SimTime) {
+        self.scale = factor;
+        for a in &mut self.actions {
+            let rate = a.base_rate * factor;
+            if rate != a.rate {
+                a.rate = rate;
+                a.next_due = a.rng.exp_interval_ms(rate).map(|ms| now.plus_ms(ms));
+            }
+        }
+    }
+
     /// Replaces `[actions]`. Poisson actions whose rate changed redraw their next
     /// due time from `now`; everything else applies to later draws.
     /// Turning natural renewals back on queues a renewal for every live
@@ -326,6 +346,8 @@ impl Generator {
                 ActionKind::CancelSubscription => config.cancel_subscription,
                 _ => continue,
             };
+            a.base_rate = rate;
+            let rate = rate * self.scale;
             if rate != a.rate {
                 a.rate = rate;
                 a.next_due = a.rng.exp_interval_ms(rate).map(|ms| now.plus_ms(ms));

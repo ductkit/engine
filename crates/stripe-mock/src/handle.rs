@@ -163,9 +163,18 @@ impl MockStripe {
         config.validate()?;
         let streams = RngStreams::new(config.seed);
         let start = SimTime::from_datetime(config.clock.start);
+        // History (spec section 6.3): generation runs from `start - duration` with
+        // scaled rates, before any destination exists, so none of it is delivered.
+        let history_start = start.plus_ms(-config.history.duration.ms());
+        let mut engine = Engine::new(history_start, &config, &streams);
+        let mut generator = Generator::new(&config, &streams, history_start);
+        generator.scale_rates(config.history.scale, history_start);
+        generator.run_until(&mut engine, start);
+        generator.scale_rates(1.0, start);
+        engine.add_config_destinations(&config);
         let sim = Sim {
-            engine: Engine::new(start, &config, &streams),
-            generator: Generator::new(&config, &streams, start),
+            engine,
+            generator,
             control_rng: streams.stream("control"),
             api_rng: streams.stream("api.request_ids"),
         };
