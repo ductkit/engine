@@ -11,6 +11,7 @@
 
 mod billing;
 mod catalog;
+mod subscriptions;
 
 pub use billing::InvoiceOutcome;
 
@@ -40,6 +41,12 @@ pub enum Action {
         customer: Option<String>,
         outcome: Option<InvoiceOutcome>,
     },
+    /// Start a subscription for the named or a random customer, on the named
+    /// prices (active, recurring, one currency and interval) or random ones.
+    StartSubscription {
+        customer: Option<String>,
+        prices: Option<Vec<String>>,
+    },
 }
 
 /// Generated actions, in tie-break order. New kinds are appended, so existing
@@ -56,6 +63,7 @@ enum ActionKind {
     PriceArchive,
     OneOffInvoice,
     InvoiceUpdate,
+    StartSubscription,
 }
 
 /// A follow-up step of an action.
@@ -84,6 +92,22 @@ pub(crate) enum Continuation {
     },
     VoidInvoice {
         id: String,
+    },
+    /// Create the first invoice of a new subscription.
+    SubscriptionInvoice {
+        sub: String,
+    },
+    FinalizeFirstInvoice {
+        sub: String,
+        invoice: String,
+    },
+    PayFirstInvoice {
+        sub: String,
+        invoice: String,
+    },
+    ExpireIncomplete {
+        sub: String,
+        invoice: String,
     },
 }
 
@@ -195,6 +219,11 @@ impl Generator {
                 ActionKind::InvoiceUpdate,
                 c.invoice.update,
                 "generate.invoice.update",
+            ),
+            (
+                ActionKind::StartSubscription,
+                a.start_subscription,
+                "generate.subscription.start",
             ),
         ];
         let actions = specs
@@ -312,6 +341,13 @@ impl Generator {
                 customer,
                 outcome,
             )?,
+            Action::StartSubscription { customer, prices } => subscriptions::start_subscription(
+                &mut self.control,
+                engine,
+                &mut self.ctx,
+                customer,
+                prices,
+            )?,
         };
         if self.enabled {
             let now = engine.now();
@@ -345,6 +381,10 @@ fn run_continuation(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mu
         Continuation::SetDefaultPrice { product, price } => {
             catalog::set_default_price(engine, &product, &price, &cause);
         }
+        c @ (Continuation::SubscriptionInvoice { .. }
+        | Continuation::FinalizeFirstInvoice { .. }
+        | Continuation::PayFirstInvoice { .. }
+        | Continuation::ExpireIncomplete { .. }) => subscriptions::run(c, cause, engine, ctx),
         c => billing::run(c, cause, engine, ctx),
     }
 }
@@ -421,6 +461,10 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
                 .expect("random targets are valid");
         }
         ActionKind::InvoiceUpdate => billing::churn_update(rng, engine),
+        ActionKind::StartSubscription => {
+            subscriptions::start_subscription(rng, engine, ctx, None, None)
+                .expect("random targets are valid");
+        }
     }
 }
 

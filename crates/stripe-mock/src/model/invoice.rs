@@ -8,7 +8,6 @@ use crate::model::embedded::embedded_list;
 /// Why an invoice exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BillingReason {
-    #[allow(dead_code)] // TEMP: used from Task 5
     SubscriptionCreate,
     #[allow(dead_code)] // TEMP: used from Task 6
     SubscriptionCycle,

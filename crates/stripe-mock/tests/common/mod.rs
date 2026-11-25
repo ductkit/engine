@@ -7,7 +7,7 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use ductkit_stripe_mock::{Config, MockStripe};
+use ductkit_stripe_mock::{Action, Config, MockStripe, ObjectType};
 
 /// Parses `toml` and starts a mock, panicking on error.
 pub async fn mock_with(toml: &str) -> MockStripe {
@@ -113,4 +113,33 @@ pub fn real_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+
+/// Runs catalog changes until `n` active recurring prices share one currency and
+/// `interval`; returns their IDs.
+pub fn recurring_prices(m: &MockStripe, n: usize, interval: &str) -> Vec<String> {
+    for _ in 0..200 {
+        let mut groups: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for id in m
+            .truth_log()
+            .into_iter()
+            .filter(|u| u.object_type == ObjectType::Price)
+            .map(|u| u.object_id)
+        {
+            let p = m.get(ObjectType::Price, &id).unwrap().state;
+            if p["active"] == true && p["recurring"]["interval"] == interval {
+                let ids = groups
+                    .entry(p["currency"].as_str().unwrap().to_string())
+                    .or_default();
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        if let Some(ids) = groups.values().find(|ids| ids.len() >= n) {
+            return ids[..n].to_vec();
+        }
+        m.run_action(Action::CatalogChange).unwrap();
+    }
+    panic!("no {n} recurring {interval} prices after 200 catalog changes");
 }

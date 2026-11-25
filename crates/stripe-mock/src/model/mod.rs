@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod customer;
 pub mod embedded;
 pub mod invoice;
+pub mod subscription;
 
 /// A simulated Stripe object type.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
