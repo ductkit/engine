@@ -416,3 +416,27 @@ async fn pagination_writes_do_nothing_while_generation_is_off() {
     assert_eq!(s, 200);
     assert_eq!(m.truth_log().len(), before);
 }
+
+#[tokio::test]
+async fn destinations_are_platform_only() {
+    let toml = format!(
+        "{CONNECT}{}",
+        common::dest("http://127.0.0.1:9/h", "snapshot", "*")
+    );
+    let m = mock_with(&toml).await;
+    let a = m.connect_account(AccountApi::V1).unwrap();
+    let (_, v) = json_of(get(&m, "/v1/webhook_endpoints").await).await;
+    assert_eq!(ids(&v).len(), 1, "the platform sees its destination");
+    for header in ["Stripe-Account", "Stripe-Context"] {
+        let r = get_with(&m, "/v1/webhook_endpoints", &[(header, &a)]).await;
+        let (s, v) = json_of(r).await;
+        assert_eq!(s, 200);
+        assert_eq!(v["object"], "list");
+        assert_eq!(v["has_more"], false);
+        assert!(ids(&v).is_empty(), "{header}: {v}");
+    }
+    let (s, v) = json_of(get_ctx(&m, "/v2/core/event_destinations", &a).await).await;
+    assert_eq!(s, 200);
+    assert!(ids(&v).is_empty(), "{v}");
+    assert!(v["next_page_url"].is_null());
+}

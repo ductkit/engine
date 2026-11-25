@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{RawQuery, State};
+use axum::{Extension, Json};
 use serde_json::{Value, json};
 
-use crate::api::ApiError;
 use crate::api::list::decode;
 use crate::api::list::{Cursorable, paginate, parse_list_params};
+use crate::api::{ApiError, RequestScope};
 use crate::delivery::Destination;
 use crate::handle::Shared;
 use crate::{PINNED_API_VERSION, PayloadFormat};
@@ -64,8 +64,10 @@ fn v2_object(d: &Destination) -> Value {
     })
 }
 
+/// Destinations belong to the platform; a connected account has none of its own.
 pub(crate) async fn list_v1(
     State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let p = parse_list_params(decode(query), &[], &[])?;
@@ -75,7 +77,7 @@ pub(crate) async fn list_v1(
         .engine
         .destinations()
         .iter()
-        .filter(|d| d.info.payload == PayloadFormat::Snapshot)
+        .filter(|d| scope.is_none() && d.info.payload == PayloadFormat::Snapshot)
         .rev()
         .collect();
     let (page, has_more) = paginate(&ordered, |_| true, &p)?;
@@ -88,13 +90,16 @@ pub(crate) async fn list_v1(
     })))
 }
 
-pub(crate) async fn list_v2(State(shared): State<Arc<Shared>>) -> Json<Value> {
+pub(crate) async fn list_v2(
+    State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
+) -> Json<Value> {
     let sim = shared.lock();
     let data: Vec<Value> = sim
         .engine
         .destinations()
         .iter()
-        .filter(|d| d.info.payload == PayloadFormat::Thin)
+        .filter(|d| scope.is_none() && d.info.payload == PayloadFormat::Thin)
         .map(v2_object)
         .collect();
     Json(json!({
