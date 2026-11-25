@@ -179,6 +179,33 @@ impl Engine {
         Ok(())
     }
 
+    /// Quiesce support: retries go to `now`, every queued attempt is due now and
+    /// every event is visible now.
+    pub(crate) fn begin_quiesce(&mut self) {
+        self.deliveries.quiescing = true;
+        self.events.flush_visibility(self.now);
+    }
+
+    pub(crate) fn end_quiesce(&mut self) {
+        self.deliveries.quiescing = false;
+    }
+
+    pub(crate) fn rush_deliveries(&mut self) {
+        self.deliveries.rush_all(self.now);
+    }
+
+    pub(crate) fn has_pending_deliveries(&self) -> bool {
+        self.deliveries.has_pending()
+    }
+
+    pub(crate) fn webhooks_config(&self) -> &crate::WebhooksConfig {
+        &self.deliveries.config
+    }
+
+    pub(crate) fn set_webhooks_config(&mut self, c: crate::WebhooksConfig) {
+        self.deliveries.config = c;
+    }
+
     pub(crate) fn delivery_log(&self) -> &[DeliveryRecord] {
         self.deliveries.log()
     }

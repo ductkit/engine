@@ -320,7 +320,7 @@ Stripe made thin events for API v1 resources generally available in `2026-09-30.
 - **Ordering**: deliveries inside `reorder_window` may be reordered; delivery delay comes from a distribution with a long tail.
 - **Retries**: non-2xx, connection failure or a response slower than `response_timeout` counts as failure. Retries follow a Stripe-like exponential backoff up to `max_retry_duration`; in virtual time the schedule can be compressed. A slow-but-successful handler therefore receives a duplicate.
 - **Disabling**: an endpoint that keeps failing is disabled, as Stripe does; the control API can re-enable it.
-- **Signatures**: `Stripe-Signature: t=<ts>,v1=<hmac-sha256>`. Supports secret rotation (several `v1` values), timestamps outside tolerance (`clock_skew`), and an invalid-signature fault for negative tests.
+- **Signatures**: `Stripe-Signature: t=<ts>,v1=<hmac-sha256>`. Supports secret rotation (several `v1` values), timestamps outside tolerance (`clock_skew`), and an invalid-signature fault for negative tests. The signature timestamp `t` is real wall-clock time, so receivers can verify it; event `created` is simulated time.
 - **Payload staleness**: because snapshot payloads are snapshots, a delayed or retried delivery carries an outdated object. Each delivery's truth-log version is recorded so tests can tell whether the consumer applied an old version over a newer one.
 - **Endpoint downtime**: the control API can make deliveries to an endpoint fail for a period ("outage"), building a retry backlog that later floods in.
 
@@ -373,7 +373,7 @@ Separately from the subscription, the control API exposes the **delivery log** (
 Separate from the Stripe surface. Available as a Rust handle in-process and as HTTP under `/control` standalone.
 
 - **Run control**: `pause`, `resume`, `step(duration)`, `advance_to(time)`, `set_speed`.
-- **Quiesce**: stop generation, flush every pending webhook and retry, make every event visible, then return. Used before a final end-state comparison.
+- **Quiesce**: stop generation, flush every pending webhook and retry, make every event visible, then return. Used before a final end-state comparison. Simulated time does not move; pending retries are attempted immediately until they succeed or exhaust their schedule. Generation stays off until `resume_generation`.
 - **Triggers**: run a named action now; run a script.
 - **Faults at runtime**: change any `[api]`, `[events]`, `[webhooks]` setting; start or stop an endpoint outage; force a rate-limit storm.
 - **Delivery targets**: add, remove, enable or disable snapshot and thin destinations; rotate a signing secret.

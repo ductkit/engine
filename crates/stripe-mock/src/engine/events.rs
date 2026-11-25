@@ -109,6 +109,13 @@ impl EventStore {
         r.visible_at <= now && r.created.0 > now.0 - retention_ms
     }
 
+    /// Makes every event visible by `now` at the latest.
+    pub(crate) fn flush_visibility(&mut self, now: SimTime) {
+        for r in &mut self.records {
+            r.visible_at = r.visible_at.min(now);
+        }
+    }
+
     pub(crate) fn all(&self) -> &[EventRecord] {
         &self.records
     }

@@ -31,6 +31,7 @@ struct Scheduled {
 #[derive(Debug)]
 pub(crate) struct Generator {
     actions: Vec<Scheduled>,
+    enabled: bool,
 }
 
 impl Generator {
@@ -65,16 +66,41 @@ impl Generator {
                 }
             })
             .collect();
-        Generator { actions }
+        Generator {
+            actions,
+            enabled: true,
+        }
     }
 
-    /// The earliest due action time.
+    /// The earliest due action time (`None` while disabled).
     pub(crate) fn next_due(&self) -> Option<SimTime> {
+        if !self.enabled {
+            return None;
+        }
         self.actions.iter().filter_map(|a| a.next_due).min()
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Turns generation off or on. Re-enabling redraws each action's next due time
+    /// from `now`, using its own stream.
+    pub(crate) fn set_enabled(&mut self, on: bool, now: SimTime) {
+        if on && !self.enabled {
+            for a in &mut self.actions {
+                a.next_due = a.rng.exp_interval_ms(a.rate).map(|ms| now.plus_ms(ms));
+            }
+        }
+        self.enabled = on;
     }
 
     /// Performs every action due at or before `target`, then sets the time to `target`.
     pub(crate) fn run_until(&mut self, engine: &mut Engine, target: SimTime) {
+        if !self.enabled {
+            engine.set_now(target);
+            return;
+        }
         // Earliest due action; `min_by_key` keeps the first on ties, which is the fixed order.
         while let Some(i) = self
             .actions

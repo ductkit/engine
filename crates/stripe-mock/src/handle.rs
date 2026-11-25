@@ -17,7 +17,10 @@ use crate::model::customer::{
 };
 use crate::rng::{RngStreams, SimRng};
 use crate::stream::{SubscribeFilter, SubscribeOptions, Subscription};
-use crate::{ClockMode, Config, DestinationConfig, EventsConfig, MockError, ObjectType, SimTime};
+use crate::{
+    ClockMode, Config, DestinationConfig, EventsConfig, MockError, ObjectType, SimTime,
+    WebhooksConfig,
+};
 
 /// Everything behind the lock.
 #[derive(Debug)]
@@ -310,6 +313,69 @@ impl MockStripe {
     /// The latest truth-log entry for an object, deleted or not.
     pub fn get(&self, t: ObjectType, id: &str) -> Option<StateUpdate> {
         self.shared.lock().engine.latest(t, id).cloned()
+    }
+
+    /// Delivers everything now: turns generation off, makes every event visible,
+    /// and attempts every pending delivery (retries included) until each succeeds
+    /// or exhausts its schedule. Simulated time does not move.
+    pub async fn quiesce(&self) -> Result<(), MockError> {
+        let _step = self.shared.step_lock.lock().await;
+        {
+            let mut sim = self.shared.lock();
+            let now = sim.engine.now();
+            sim.generator.set_enabled(false, now);
+            sim.engine.begin_quiesce();
+        }
+        loop {
+            let next = {
+                let mut sim = self.shared.lock();
+                sim.engine.rush_deliveries();
+                let now = sim.engine.now();
+                match sim.engine.due_batch(now) {
+                    Some(b) => Some(b),
+                    None if sim.engine.has_pending_deliveries() => None,
+                    None => break,
+                }
+            };
+            let Some((_, batch)) = next else {
+                // Wall mode: the ticker has attempts in flight; wait for them.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            };
+            let results = self.send_batch(&batch).await;
+            let mut sim = self.shared.lock();
+            let now = sim.engine.now();
+            for (a, (outcome, elapsed)) in batch.iter().zip(results) {
+                sim.engine.record_outcome(a, outcome, elapsed, now);
+            }
+        }
+        self.shared.lock().engine.end_quiesce();
+        Ok(())
+    }
+
+    /// Turns generation back on after `quiesce`; next due times are redrawn from now.
+    pub fn resume_generation(&self) {
+        let mut sim = self.shared.lock();
+        let now = sim.engine.now();
+        sim.generator.set_enabled(true, now);
+    }
+
+    /// Whether generated traffic is running.
+    pub fn generation_enabled(&self) -> bool {
+        self.shared.lock().generator.enabled()
+    }
+
+    /// Changes webhook settings (validated); affects future scheduling and attempts only.
+    pub fn update_webhooks_config(
+        &self,
+        f: impl FnOnce(&mut WebhooksConfig),
+    ) -> Result<(), MockError> {
+        let mut sim = self.shared.lock();
+        let mut cfg = sim.engine.webhooks_config().clone();
+        f(&mut cfg);
+        cfg.validate()?;
+        sim.engine.set_webhooks_config(cfg);
+        Ok(())
     }
 
     /// Changes Events API settings for events created from now on.

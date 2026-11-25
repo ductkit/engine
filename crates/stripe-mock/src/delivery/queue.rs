@@ -108,6 +108,9 @@ struct Delivery {
     object_version: u64,
     /// When the queued attempt is due (its queue key).
     next_at: Option<SimTime>,
+    /// When the next attempt is nominally due on the retry schedule; equal to
+    /// `next_at` except while quiescing.
+    timeline_at: SimTime,
     first_attempt_at: Option<SimTime>,
 }
 
@@ -133,6 +136,8 @@ pub(crate) struct PreparedAttempt {
 #[derive(Debug)]
 pub(crate) struct Deliveries {
     pub config: WebhooksConfig,
+    /// Retries are queued at `now` instead of after their backoff.
+    pub quiescing: bool,
     list: Vec<Delivery>,
     by_event: HashMap<String, Vec<usize>>,
     /// `(due, index)`; `index` breaks ties in scheduling order.
@@ -148,6 +153,7 @@ impl Deliveries {
     pub(crate) fn new(config: &WebhooksConfig, streams: &RngStreams) -> Self {
         Deliveries {
             config: config.clone(),
+            quiescing: false,
             list: Vec::new(),
             by_event: HashMap::new(),
             queue: BTreeSet::new(),
@@ -196,6 +202,7 @@ impl Deliveries {
             state: State::Queued,
             object_version: ev.object_version,
             next_at: Some(attempt_at),
+            timeline_at: attempt_at,
             first_attempt_at: None,
         });
         self.by_event.entry(ev.id.clone()).or_default().push(index);
@@ -270,7 +277,7 @@ impl Deliveries {
                 secrets: dest.signing_secrets(due),
                 signature,
                 attempt: d.attempts,
-                scheduled_at: due,
+                scheduled_at: d.timeline_at,
                 timeout_ms: self.config.response_timeout.ms().max(0) as u64,
                 object_version: d.object_version,
                 outage: dest.outage_until.is_some_and(|until| until > due),
@@ -338,6 +345,8 @@ impl Deliveries {
         dests: &mut Destinations,
     ) {
         let success = matches!(outcome, AttemptOutcome::Success { .. });
+        // While quiescing, `now` stands still; failures count on the nominal timeline.
+        let effective = now.max(a.scheduled_at);
         let mut next_retry_at = None;
         let mut abandon = None;
         let mut disable = false;
@@ -350,8 +359,8 @@ impl Deliveries {
             None => abandon = Some(AbandonReason::DestinationRemoved),
             Some(d) if !d.info.enabled => abandon = Some(AbandonReason::DestinationDisabled),
             Some(d) => {
-                let since = *d.first_failure_since_success.get_or_insert(now);
-                if now.0 - since.0 >= self.config.disable_after_failures.ms() {
+                let since = *d.first_failure_since_success.get_or_insert(effective);
+                if effective.0 - since.0 >= self.config.disable_after_failures.ms() {
                     d.info.enabled = false;
                     disable = true;
                 } else {
@@ -365,7 +374,9 @@ impl Deliveries {
                             if a.scheduled_at.0 + ms - first.0
                                 <= self.config.max_retry_duration.ms() =>
                         {
-                            next_retry_at = Some(a.scheduled_at.plus_ms(ms));
+                            let nominal = a.scheduled_at.plus_ms(ms);
+                            self.list[a.index].timeline_at = nominal;
+                            next_retry_at = Some(if self.quiescing { now } else { nominal });
                         }
                         _ => abandon = Some(AbandonReason::RetriesExhausted),
                     }
@@ -403,6 +414,28 @@ impl Deliveries {
                 now,
             );
         }
+    }
+
+    /// Moves every queued attempt due after `now` to `now`.
+    pub(crate) fn rush_all(&mut self, now: SimTime) {
+        let later: Vec<(SimTime, usize)> = self
+            .queue
+            .iter()
+            .copied()
+            .filter(|(t, _)| *t > now)
+            .collect();
+        for key in later {
+            self.queue.remove(&key);
+            self.queue.insert((now, key.1));
+            self.list[key.1].next_at = Some(now);
+        }
+    }
+
+    /// Whether any delivery is queued or in flight.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.list
+            .iter()
+            .any(|d| matches!(d.state, State::Queued | State::InFlight))
     }
 
     pub(crate) fn log(&self) -> &[DeliveryRecord] {
