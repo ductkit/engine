@@ -14,7 +14,7 @@ use crate::rng::{RngStreams, SimRng};
 use crate::{DestinationConfig, MockError, PayloadFormat, RetrySchedule, SimTime};
 
 /// Public view of a destination, including its current signing secret.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DestinationInfo {
     pub id: String,
     pub name: String,
@@ -147,7 +147,7 @@ impl Destinations {
             enabled_events: d.enabled_events,
             connect: d.connect,
             events_from,
-            enabled: true,
+            enabled: d.enabled,
             secret,
             created: now,
         };
@@ -180,8 +180,10 @@ impl Destinations {
             .ok_or_else(|| MockError::NoSuchDestination(id.to_string()))
     }
 
-    /// Replaces the secret; the old one keeps signing until `until`.
+    /// Replaces the secret; the old one keeps signing until `until`. An unknown ID
+    /// draws no secret, so a failed call leaves later secrets unchanged.
     pub(crate) fn rotate_secret(&mut self, id: &str, until: SimTime) -> Result<String, MockError> {
+        self.get_mut(id)?;
         let secret = self.new_secret();
         let d = self.get_mut(id)?;
         let old = std::mem::replace(&mut d.info.secret, secret.clone());

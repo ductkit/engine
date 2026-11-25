@@ -870,6 +870,17 @@ pub struct DestinationConfig {
     pub events_from: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+    /// `false` creates the destination disabled.
+    #[serde(default = "enabled_default", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
+}
+
+fn enabled_default() -> bool {
+    true
+}
+
+fn is_enabled(enabled: &bool) -> bool {
+    *enabled
 }
 
 impl DestinationConfig {

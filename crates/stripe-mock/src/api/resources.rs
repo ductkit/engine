@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use crate::api::expand::expand;
 use crate::api::list::{ListParams, array_base, decode, paginate, parse_list_params};
 use crate::api::{ApiError, RequestScope, ensure_connected};
+use crate::control::ControlOp;
 use crate::engine::store::{ObjectStore, StoredObject};
 use crate::engine::{Engine, Scope, StateUpdate};
 use crate::handle::{Shared, Sim};
@@ -256,6 +257,11 @@ async fn list(
     ensure_connected(&sim.engine, &scope)?;
     // A write during pagination runs before the view is taken, so this page sees it.
     if (p.starting_after.is_some() || p.ending_before.is_some()) && sim.api.pagination_write() {
+        // Journalled first, so a replay runs the same write at the same time.
+        sim.record(ControlOp::PaginationWrite {
+            account: scope.clone(),
+            object_type: r.t,
+        });
         let Sim {
             engine, generators, ..
         } = &mut *sim;

@@ -15,6 +15,7 @@ use crate::api::events_v2::{decode_token, encode_token};
 use crate::api::list::decode;
 use crate::api::resources::{View, stale_at};
 use crate::api::{ApiError, RequestScope};
+use crate::control::ControlOp;
 use crate::engine::store::StoredObject;
 use crate::engine::{ChangeKind, StateUpdate};
 use crate::handle::{Shared, Sim};
@@ -156,6 +157,11 @@ pub(crate) async fn list_v2(
     let mut sim = shared.lock();
     // A write during pagination runs before the view is taken, so this page sees it.
     if q.cursor.is_some() && sim.api.pagination_write() {
+        // Journalled first, so a replay runs the same write at the same time.
+        sim.record(ControlOp::PaginationWrite {
+            account: scope.clone(),
+            object_type: ObjectType::Account,
+        });
         let Sim {
             engine, generators, ..
         } = &mut *sim;

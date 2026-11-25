@@ -21,6 +21,7 @@ async fn config_and_control_destinations_are_listed() {
             connect: false,
             events_from: None,
             secret: None,
+            enabled: true,
         })
         .unwrap();
     assert!(thin.id.starts_with("ed_test_") && thin.secret.starts_with("whsec_"));
@@ -60,6 +61,7 @@ async fn config_and_control_destinations_are_listed() {
             connect: false,
             events_from: None,
             secret: None,
+            enabled: true,
         })
         .is_err()
     );

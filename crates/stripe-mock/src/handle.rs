@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::control::{ControlOp, JournalEntry};
 use crate::delivery::sender::send;
 use crate::delivery::{DeliveryRecord, DestinationInfo, PreparedAttempt};
 use crate::engine::events::EventInfo;
@@ -20,7 +21,8 @@ use crate::rng::{RngStreams, SimRng};
 use crate::stream::{SubscribeFilter, SubscribeOptions, Subscription};
 use crate::{
     AccountApi, AccountKind, ActionsConfig, ApiConfig, ClockMode, Config, Configuration,
-    DestinationConfig, EventsConfig, MockError, ObjectType, PayloadFormat, SimTime, WebhooksConfig,
+    DestinationConfig, DurationStr, EventsConfig, MockError, ObjectType, PayloadFormat, SimTime,
+    WebhooksConfig,
 };
 
 /// Everything behind the lock.
@@ -34,6 +36,47 @@ pub(crate) struct Sim {
     pub api_rng: SimRng,
     /// Runtime `[api]` settings and fault state.
     pub api: ApiFaults,
+    /// Every op that changed truth, the projection or delivery, in order.
+    pub journal: Vec<JournalEntry>,
+}
+
+impl Sim {
+    /// Journals `op` at the current simulated time. Draws nothing.
+    pub(crate) fn record(&mut self, op: ControlOp) {
+        let at = self.engine.now();
+        self.journal.push(JournalEntry { at, op });
+    }
+
+    /// `UnknownAccount` unless `scope` is the platform or a connected account.
+    fn check_scope(&self, scope: &Scope) -> Result<(), MockError> {
+        match scope {
+            Some(id) if !self.engine.account_meta(id).is_some_and(|m| m.connected) => {
+                Err(MockError::UnknownAccount(id.clone()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Runs a journalled mutation. On success `f`'s op is recorded; on failure the
+    /// action numbers `f` took are given back, so a failed call leaves no trace.
+    fn journalled<R>(
+        &mut self,
+        f: impl FnOnce(&mut Sim) -> Result<(R, ControlOp), MockError>,
+    ) -> Result<R, MockError> {
+        let mark = self.engine.action_mark();
+        let logged = self.engine.log().len();
+        match f(self) {
+            Ok((r, op)) => {
+                self.record(op);
+                Ok(r)
+            }
+            Err(e) => {
+                debug_assert_eq!(self.engine.log().len(), logged, "failed op mutated truth");
+                self.engine.rewind_actions(mark);
+                Err(e)
+            }
+        }
+    }
 }
 
 /// State shared by the handle, the HTTP server and the wall-clock ticker.
@@ -168,7 +211,7 @@ pub struct AccountInfo {
 /// A running mock. Drop it or call `shutdown` to stop it.
 #[derive(Debug)]
 pub struct MockStripe {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     api_addr: SocketAddr,
     stop: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<()>>,
@@ -199,6 +242,7 @@ impl MockStripe {
             control_rng: streams.stream("control"),
             api_rng: streams.stream("api.request_ids"),
             api: ApiFaults::new(&config.api, &streams),
+            journal: Vec::new(),
         };
         let shared = Arc::new(Shared {
             sim: Mutex::new(sim),
@@ -290,14 +334,85 @@ impl MockStripe {
                     now,
                 })?
         };
-        self.advance_locked(target).await
+        self.advance_locked(target).await?;
+        self.record_reached();
+        Ok(())
     }
 
     /// Advances virtual time to `t`. Equal to now is a no-op; earlier is an error.
     pub async fn advance_to(&self, t: SimTime) -> Result<(), MockError> {
         self.require_virtual()?;
         let _step = self.shared.step_lock.lock().await;
+        self.advance_locked(t).await?;
+        self.record_reached();
+        Ok(())
+    }
+
+    /// Journals a finished `step` or `advance_to` as the time it reached.
+    fn record_reached(&self) {
+        let mut sim = self.shared.lock();
+        let time = sim.engine.now().to_datetime();
+        sim.record(ControlOp::AdvanceTo { time });
+    }
+
+    /// Replay: `advance_to` without journalling it.
+    pub(crate) async fn advance_unjournalled(&self, t: SimTime) -> Result<(), MockError> {
+        self.require_virtual()?;
+        let _step = self.shared.step_lock.lock().await;
         self.advance_locked(t).await
+    }
+
+    /// Replay: a journalled pagination write, run directly in its scope.
+    pub(crate) fn pagination_write(&self, scope: &Scope, t: ObjectType) -> Result<(), MockError> {
+        let mut sim = self.shared.lock();
+        sim.check_scope(scope)?;
+        sim.record(ControlOp::PaginationWrite {
+            account: scope.clone(),
+            object_type: t,
+        });
+        let Sim {
+            engine, generators, ..
+        } = &mut *sim;
+        generators.pagination_write(scope, t, engine);
+        Ok(())
+    }
+
+    /// Wall mode: catches simulated time up with real time, so a control call
+    /// applies after everything due by now (no-op in virtual mode).
+    fn wall_tick(&self) {
+        if self.shared.config.clock.mode == ClockMode::Wall {
+            self.shared.tick();
+        }
+    }
+
+    /// A journalled mutation: ticks in wall mode, then runs `f` and records its op
+    /// under one sim-lock acquisition.
+    fn journalled<R>(
+        &self,
+        f: impl FnOnce(&mut Sim) -> Result<(R, ControlOp), MockError>,
+    ) -> Result<R, MockError> {
+        self.wall_tick();
+        self.shared.lock().journalled(f)
+    }
+
+    /// A journalled mutation in `scope`, which must be the platform or connected.
+    fn journalled_in<R>(
+        &self,
+        scope: &Scope,
+        op: ControlOp,
+        f: impl FnOnce(&mut Engine, &mut SimRng, &mut Generators) -> Result<R, MockError>,
+    ) -> Result<R, MockError> {
+        self.journalled(|sim| {
+            sim.check_scope(scope)?;
+            let Sim {
+                engine,
+                control_rng,
+                generators,
+                ..
+            } = sim;
+            let r = engine.in_scope(scope.clone(), |e| f(e, control_rng, generators))?;
+            Ok((r, op))
+        })
     }
 
     /// The body of `advance_to`; the caller holds the step lock.
@@ -348,8 +463,16 @@ impl MockStripe {
         self.create_customer_in(&None, p)
     }
 
-    fn create_customer_in(&self, scope: &Scope, p: NewCustomer) -> Result<String, MockError> {
-        self.scoped(scope, |engine, control_rng, _| {
+    pub(crate) fn create_customer_in(
+        &self,
+        scope: &Scope,
+        p: NewCustomer,
+    ) -> Result<String, MockError> {
+        let op = ControlOp::CreateCustomer {
+            account: scope.clone(),
+            customer: p.clone(),
+        };
+        self.journalled_in(scope, op, |engine, control_rng, _| {
             let id = control_rng.id(ObjectType::Customer.id_prefix());
             let prefix = control_rng.alnum_upper(8);
             let state = new_customer_json(&id, engine.now().unix_seconds(), &prefix, &p);
@@ -370,13 +493,18 @@ impl MockStripe {
         self.update_customer_in(&None, id, u)
     }
 
-    fn update_customer_in(
+    pub(crate) fn update_customer_in(
         &self,
         scope: &Scope,
         id: &str,
         u: CustomerUpdate,
     ) -> Result<Option<u64>, MockError> {
-        self.scoped(scope, |engine, _, _| {
+        let op = ControlOp::UpdateCustomer {
+            account: scope.clone(),
+            id: id.to_string(),
+            update: u.clone(),
+        };
+        self.journalled_in(scope, op, |engine, _, _| {
             let cause = engine.begin_action("control.update_customer");
             let update = engine.update(
                 ObjectType::Customer,
@@ -395,8 +523,12 @@ impl MockStripe {
         self.delete_customer_in(&None, id)
     }
 
-    fn delete_customer_in(&self, scope: &Scope, id: &str) -> Result<(), MockError> {
-        self.scoped(scope, |engine, _, _| {
+    pub(crate) fn delete_customer_in(&self, scope: &Scope, id: &str) -> Result<(), MockError> {
+        let op = ControlOp::DeleteCustomer {
+            account: scope.clone(),
+            id: id.to_string(),
+        };
+        self.journalled_in(scope, op, |engine, _, _| {
             let cause = engine.begin_action("control.delete_customer");
             delete_customer_cascade(engine, id, &cause)
         })
@@ -411,47 +543,37 @@ impl MockStripe {
         }
     }
 
-    /// Runs `f` in `scope`, failing with `UnknownAccount` for an account that is
+    /// Reads in `scope`, failing with `UnknownAccount` for an account that is
     /// unknown or disconnected.
-    fn scoped<R>(
-        &self,
-        scope: &Scope,
-        f: impl FnOnce(&mut Engine, &mut SimRng, &mut Generators) -> Result<R, MockError>,
-    ) -> Result<R, MockError> {
+    fn read_scoped<R>(&self, scope: &Scope, f: impl FnOnce(&Engine) -> R) -> Result<R, MockError> {
         let mut sim = self.shared.lock();
-        let Sim {
-            engine,
-            control_rng,
-            generators,
-            ..
-        } = &mut *sim;
-        if let Some(id) = scope
-            && !engine.account_meta(id).is_some_and(|m| m.connected)
-        {
-            return Err(MockError::UnknownAccount(id.clone()));
-        }
-        engine.in_scope(scope.clone(), |e| f(e, control_rng, generators))
+        sim.check_scope(scope)?;
+        Ok(sim.engine.in_scope(scope.clone(), |e| f(e)))
     }
 
     /// Connects a new account through the given Accounts API now and returns its ID.
     /// The v1 type, or the v2 configurations, are drawn from the config mixes.
     pub fn connect_account(&self, api: AccountApi) -> Result<String, MockError> {
         self.require_connect()?;
-        let mut sim = self.shared.lock();
-        let Sim {
-            engine, generators, ..
-        } = &mut *sim;
-        Ok(generators.connect_account(engine, api))
+        self.journalled(|sim| {
+            let Sim {
+                engine, generators, ..
+            } = sim;
+            let id = generators.connect_account(engine, api);
+            Ok((id, ControlOp::ConnectAccount { api }))
+        })
     }
 
     /// Disconnects a connected account now (the platform loses access to it).
     pub fn disconnect_account(&self, id: &str) -> Result<(), MockError> {
         self.require_connect()?;
-        let mut sim = self.shared.lock();
-        let Sim {
-            engine, generators, ..
-        } = &mut *sim;
-        generators.disconnect_account(engine, id)
+        self.journalled(|sim| {
+            let Sim {
+                engine, generators, ..
+            } = sim;
+            generators.disconnect_account(engine, id)?;
+            Ok(((), ControlOp::DisconnectAccount { id: id.to_string() }))
+        })
     }
 
     /// Every account ever connected, in connection order.
@@ -485,8 +607,12 @@ impl MockStripe {
         self.run_action_in(&None, a)
     }
 
-    fn run_action_in(&self, scope: &Scope, a: Action) -> Result<Cause, MockError> {
-        self.scoped(scope, |engine, _, generators| {
+    pub(crate) fn run_action_in(&self, scope: &Scope, a: Action) -> Result<Cause, MockError> {
+        let op = ControlOp::RunAction {
+            account: scope.clone(),
+            action: a.clone(),
+        };
+        self.journalled_in(scope, op, |engine, _, generators| {
             generators.run_action(scope, engine, a)
         })
     }
@@ -515,12 +641,12 @@ impl MockStripe {
     /// or exhausts its schedule. Simulated time does not move.
     pub async fn quiesce(&self) -> Result<(), MockError> {
         let _step = self.shared.step_lock.lock().await;
-        {
-            let mut sim = self.shared.lock();
+        self.journalled(|sim| {
             let now = sim.engine.now();
             sim.generators.set_enabled(false, now);
             sim.engine.begin_quiesce();
-        }
+            Ok(((), ControlOp::Quiesce))
+        })?;
         let _quiescing = QuiesceGuard(&self.shared);
         loop {
             let next = {
@@ -546,9 +672,12 @@ impl MockStripe {
 
     /// Turns generation back on after `quiesce`; next due times are redrawn from now.
     pub fn resume_generation(&self) {
-        let mut sim = self.shared.lock();
-        let now = sim.engine.now();
-        sim.generators.set_enabled(true, now);
+        let resumed = self.journalled(|sim| {
+            let now = sim.engine.now();
+            sim.generators.set_enabled(true, now);
+            Ok(((), ControlOp::ResumeGeneration))
+        });
+        resumed.expect("resuming generation cannot fail");
     }
 
     /// Whether generated traffic is running.
@@ -561,23 +690,25 @@ impl MockStripe {
         &self,
         f: impl FnOnce(&mut WebhooksConfig),
     ) -> Result<(), MockError> {
-        let mut sim = self.shared.lock();
-        let mut cfg = sim.engine.webhooks_config().clone();
-        f(&mut cfg);
-        cfg.validate()?;
-        sim.engine.set_webhooks_config(cfg);
-        Ok(())
+        self.journalled(|sim| {
+            let mut cfg = sim.engine.webhooks_config().clone();
+            f(&mut cfg);
+            cfg.validate()?;
+            sim.engine.set_webhooks_config(cfg.clone());
+            Ok(((), ControlOp::SetWebhooksConfig { config: cfg }))
+        })
     }
 
     /// Changes `[api]` settings (validated) for requests from now on. A changed
     /// `rate_limit` starts with a full bucket.
     pub fn update_api_config(&self, f: impl FnOnce(&mut ApiConfig)) -> Result<(), MockError> {
-        let mut sim = self.shared.lock();
-        let mut cfg = sim.api.config().clone();
-        f(&mut cfg);
-        cfg.validate()?;
-        sim.api.set_config(cfg, Instant::now());
-        Ok(())
+        self.journalled(|sim| {
+            let mut cfg = sim.api.config().clone();
+            f(&mut cfg);
+            cfg.validate()?;
+            sim.api.set_config(cfg.clone(), Instant::now());
+            Ok(((), ControlOp::SetApiConfig { config: cfg }))
+        })
     }
 
     /// A rate-limit storm: every Stripe API request gets 429 for `d` of wall time.
@@ -591,66 +722,93 @@ impl MockStripe {
         &self,
         f: impl FnOnce(&mut ActionsConfig),
     ) -> Result<(), MockError> {
-        let mut sim = self.shared.lock();
-        let mut cfg = sim.generators.actions_config().clone();
-        f(&mut cfg);
-        cfg.validate()?;
-        let sim = &mut *sim;
-        sim.generators.set_actions_config(cfg, &mut sim.engine);
-        Ok(())
+        self.journalled(|sim| {
+            let mut cfg = sim.generators.actions_config().clone();
+            f(&mut cfg);
+            cfg.validate()?;
+            sim.generators
+                .set_actions_config(cfg.clone(), &mut sim.engine);
+            Ok(((), ControlOp::SetActionsConfig { config: cfg }))
+        })
     }
 
     /// Changes Events API settings for events created from now on.
     pub fn update_events_config(&self, f: impl FnOnce(&mut EventsConfig)) -> Result<(), MockError> {
-        let mut sim = self.shared.lock();
-        let mut cfg = sim.engine.projector_mut().config.clone();
-        f(&mut cfg);
-        cfg.validate()?;
-        sim.engine.projector_mut().config = cfg;
-        Ok(())
+        self.journalled(|sim| {
+            let mut cfg = sim.engine.projector_mut().config.clone();
+            f(&mut cfg);
+            cfg.validate()?;
+            sim.engine.projector_mut().config = cfg.clone();
+            Ok(((), ControlOp::SetEventsConfig { config: cfg }))
+        })
     }
 
     /// Adds a delivery target (validated like config destinations).
     pub fn add_destination(&self, d: DestinationConfig) -> Result<DestinationInfo, MockError> {
-        let mut sim = self.shared.lock();
-        let now = sim.engine.now();
-        sim.engine.destinations_mut().add(d, now)
+        self.journalled(|sim| {
+            let now = sim.engine.now();
+            let op = ControlOp::AddDestination {
+                destination: d.clone(),
+            };
+            Ok((sim.engine.destinations_mut().add(d, now)?, op))
+        })
     }
 
     /// Removes a delivery target.
     pub fn remove_destination(&self, id: &str) -> Result<(), MockError> {
-        self.shared.lock().engine.remove_destination(id)
+        self.journalled(|sim| {
+            sim.engine.remove_destination(id)?;
+            Ok(((), ControlOp::RemoveDestination { id: id.to_string() }))
+        })
     }
 
     /// Enables or disables a delivery target.
     pub fn set_destination_enabled(&self, id: &str, enabled: bool) -> Result<(), MockError> {
-        self.shared
-            .lock()
-            .engine
-            .set_destination_enabled(id, enabled)
+        self.journalled(|sim| {
+            sim.engine.set_destination_enabled(id, enabled)?;
+            let op = ControlOp::SetDestinationEnabled {
+                id: id.to_string(),
+                enabled,
+            };
+            Ok(((), op))
+        })
     }
 
     /// Starts a simulated outage: attempts to the destination fail with `Outage`,
     /// without HTTP, until `duration` of simulated time has passed or `end_outage`.
     pub fn start_outage(&self, id: &str, duration: Duration) -> Result<(), MockError> {
-        let mut sim = self.shared.lock();
-        let until = sim.engine.now().plus_ms(duration.as_millis() as i64);
-        sim.engine.destinations_mut().get_mut(id)?.outage_until = Some(until);
-        Ok(())
+        let ms = duration_ms(duration);
+        self.journalled(|sim| {
+            let until = sim.engine.now().plus_ms(ms);
+            sim.engine.destinations_mut().get_mut(id)?.outage_until = Some(until);
+            let op = ControlOp::StartOutage {
+                id: id.to_string(),
+                duration: DurationStr(ms),
+            };
+            Ok(((), op))
+        })
     }
 
     /// Ends a simulated outage now.
     pub fn end_outage(&self, id: &str) -> Result<(), MockError> {
-        let mut sim = self.shared.lock();
-        sim.engine.destinations_mut().get_mut(id)?.outage_until = None;
-        Ok(())
+        self.journalled(|sim| {
+            sim.engine.destinations_mut().get_mut(id)?.outage_until = None;
+            Ok(((), ControlOp::EndOutage { id: id.to_string() }))
+        })
     }
 
     /// Replaces a destination's secret; the old one keeps signing for `overlap`.
     pub fn rotate_secret(&self, id: &str, overlap: Duration) -> Result<String, MockError> {
-        let mut sim = self.shared.lock();
-        let until = sim.engine.now().plus_ms(overlap.as_millis() as i64);
-        sim.engine.destinations_mut().rotate_secret(id, until)
+        let ms = duration_ms(overlap);
+        self.journalled(|sim| {
+            let until = sim.engine.now().plus_ms(ms);
+            let secret = sim.engine.destinations_mut().rotate_secret(id, until)?;
+            let op = ControlOp::RotateSecret {
+                id: id.to_string(),
+                overlap: DurationStr(ms),
+            };
+            Ok((secret, op))
+        })
     }
 
     /// All delivery targets, in creation order.
@@ -695,6 +853,7 @@ impl MockStripe {
                     connect: i.connect,
                     events_from: thin.then(|| i.events_from.clone()),
                     secret: Some(i.secret.clone()),
+                    enabled: i.enabled,
                 }
             })
             .collect();
@@ -782,6 +941,11 @@ impl MockStripe {
     }
 }
 
+/// Whole milliseconds, as the journal stores durations.
+fn duration_ms(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
 impl Drop for MockStripe {
     fn drop(&mut self) {
         if let Some(ticker) = self.ticker.take() {
@@ -825,8 +989,7 @@ impl AccountHandle<'_> {
 
     /// The latest truth-log entry for an object of the account, deleted or not.
     pub fn get(&self, t: ObjectType, id: &str) -> Result<Option<StateUpdate>, MockError> {
-        self.mock.scoped(&self.scope, |engine, _, _| {
-            Ok(engine.latest(t, id).cloned())
-        })
+        self.mock
+            .read_scoped(&self.scope, |engine| engine.latest(t, id).cloned())
     }
 }

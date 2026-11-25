@@ -1,7 +1,7 @@
 //! Simulated time.
 
 use chrono::{DateTime, Utc};
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A point in simulated time: milliseconds since the Unix epoch.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -38,6 +38,13 @@ impl std::fmt::Display for SimTime {
 impl Serialize for SimTime {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.collect_str(self)
+    }
+}
+
+/// Any RFC 3339 time, truncated to milliseconds.
+impl<'de> Deserialize<'de> for SimTime {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        DateTime::<Utc>::deserialize(d).map(SimTime::from_datetime)
     }
 }
 

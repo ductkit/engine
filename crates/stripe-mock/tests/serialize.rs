@@ -1,6 +1,6 @@
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::mock_with;
 use ductkit_stripe_mock::{
@@ -284,8 +284,33 @@ async fn effective_config_reflects_updates() {
             connect: false,
             events_from: None,
             secret: None,
+            enabled: true,
         })
         .unwrap();
+    let off = m
+        .add_destination(DestinationConfig {
+            name: "off".into(),
+            url: "http://127.0.0.1:9/c".into(),
+            payload: PayloadFormat::Snapshot,
+            enabled_events: vec!["*".into()],
+            connect: false,
+            events_from: None,
+            secret: None,
+            enabled: false,
+        })
+        .unwrap();
+    assert!(!off.enabled, "created disabled");
+    m.set_destination_enabled(&info.id, false).unwrap();
+    m.set_destination_enabled(&info.id, true).unwrap();
+    let c = m.effective_config();
+    assert_eq!(c.destinations.len(), 3);
+    assert!(c.destinations[0].enabled);
+    assert!(c.destinations[1].enabled);
+    assert!(!c.destinations[2].enabled);
+    let toml = toml::to_string(&c).unwrap();
+    assert!(toml.contains("enabled = false"), "{toml}");
+    assert_eq!(toml.matches("enabled = ").count(), 1, "{toml}");
+    m.remove_destination(&off.id).unwrap();
     let c = m.effective_config();
     assert_eq!(c.api.stale_read.probability, 0.5);
     assert_eq!(c.webhooks.duplicate_probability, 0.25);
@@ -325,12 +350,34 @@ async fn set_speed_changes_rate() {
             "{bad}"
         );
     }
-    let before = m.now();
     m.set_speed(3600.0).unwrap();
+    let before = m.now();
+    let real = Instant::now();
     tokio::time::sleep(Duration::from_millis(200)).await;
+    // `pause` ticks, so `now` is current; the elapsed time is measured right after.
+    m.pause().unwrap();
+    let elapsed_secs = real.elapsed().as_secs_f64();
     let minutes = (m.now().0 - before.0) as f64 / 60_000.0;
+    let expected = elapsed_secs * 60.0;
     assert!(
-        (9.0..=15.0).contains(&minutes),
-        "advanced {minutes} minutes"
+        (minutes - expected).abs() <= expected * 0.2,
+        "advanced {minutes} simulated minutes in {elapsed_secs} s (expected about {expected})"
     );
+
+    // Slowing down does not make simulated time jump.
+    m.resume().unwrap();
+    let before = m.now();
+    let real = Instant::now();
+    m.set_speed(1.0).unwrap();
+    let after = m.now();
+    let bound_ms = real.elapsed().as_secs_f64() * 3600.0 * 1000.0 * 1.2 + 1.0;
+    assert!(
+        ((after.0 - before.0) as f64) <= bound_ms,
+        "jumped {} ms (bound {bound_ms})",
+        after.0 - before.0
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    m.pause().unwrap();
+    let slow_ms = m.now().0 - after.0;
+    assert!(slow_ms < 10_000, "advanced {slow_ms} ms at speed 1");
 }

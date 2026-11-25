@@ -41,7 +41,7 @@ pub enum ChangeKind {
 }
 
 /// The business action that caused a mutation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Cause {
     pub action: String,
     pub action_id: String,
@@ -365,6 +365,17 @@ impl Engine {
     pub(crate) fn set_now(&mut self, t: SimTime) {
         debug_assert!(t >= self.now, "time moved backwards");
         self.now = t;
+    }
+
+    /// The number the next `begin_action` takes.
+    pub(crate) fn action_mark(&self) -> u64 {
+        self.next_action
+    }
+
+    /// Gives back action numbers taken since `mark` by a call that failed before
+    /// mutating anything, so the failure leaves no trace in later causes.
+    pub(crate) fn rewind_actions(&mut self, mark: u64) {
+        self.next_action = mark;
     }
 
     /// Starts a business action; all its mutations share the returned cause.

@@ -4,6 +4,7 @@
 
 mod api;
 mod config;
+mod control;
 mod delivery;
 mod engine;
 mod error;
@@ -22,6 +23,10 @@ pub use config::{
     EventRetentionConfig, EventsConfig, HistoryConfig, LateTail, PINNED_API_VERSION,
     PaginationWrites, PayloadFormat, PayloadsConfig, RateLimit, RenewMode, RetrySchedule,
     StaleRead, UpdateChurn, WebhooksConfig,
+};
+pub use control::{
+    ControlOp, JournalEntry, OpResult, RUN_FORMAT, ReplayGuard, ReplayOptions, RunExport,
+    ScriptError,
 };
 pub use delivery::signing::verify_signature;
 pub use delivery::{
