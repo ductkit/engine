@@ -1,0 +1,44 @@
+//! OpenAPI-to-Rust generator for the generated Stripe types (design section 6.2).
+//!
+//! It lives only in the test tree and is compiled through `tests/openapi_codegen.rs`.
+
+// The emitter (a later task) consumes most of this module; until then parts are unused.
+#![allow(dead_code)]
+
+pub mod ir;
+pub mod names;
+
+/// The root schemas to generate. The generator emits each root plus the closure over
+/// non-expandable `$ref`s.
+pub const ROOTS: &[&str] = &[
+    "customer",
+    "deleted_customer",
+    "product",
+    "deleted_product",
+    "price",
+    "deleted_price",
+    "subscription",
+    "subscription_item",
+    "deleted_subscription_item",
+    "invoice",
+    "deleted_invoice",
+    "line_item",
+    "account",
+    "deleted_account",
+    "application",
+    "v2.core.account",
+    "event",
+    "v2.core.event",
+    "webhook_endpoint",
+    "v2.core.event_destination",
+    "error",
+    "payment_intent",
+    "charge",
+    "refund",
+    "dispute",
+    "balance_transaction",
+    "payment_method",
+    "setup_intent",
+    "checkout.session",
+    "invoice_payment",
+];
