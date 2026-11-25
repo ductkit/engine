@@ -25,3 +25,17 @@ async fn spec_rates_90_days_is_fast() {
     assert!(customers >= 20_000, "{customers}");
     assert!(took < Duration::from_secs(60), "{took:?}");
 }
+
+/// Run with `cargo test -p ductkit-stripe-mock --release --test perf -- --ignored`.
+#[tokio::test]
+#[ignore]
+async fn history_90d_spec_rates_is_fast() {
+    let started = Instant::now();
+    let m = mock_with(&format!("{SPEC_RATES}[history]\nduration = \"90d\"\n")).await;
+    let took = started.elapsed();
+    println!(
+        "90 days of history at spec rates: {took:?}, {} truth-log entries",
+        m.truth_log().len()
+    );
+    assert!(took < Duration::from_secs(60), "{took:?}");
+}

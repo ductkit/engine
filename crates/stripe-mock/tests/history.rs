@@ -161,3 +161,61 @@ async fn history_is_deterministic() {
         serde_json::to_value(b.truth_log()).unwrap()
     );
 }
+
+#[tokio::test]
+async fn backfill_race_converges() {
+    use std::collections::BTreeMap;
+    let m = mock_with(
+        "[actions]\nnew_customer = 4.0\n[churn.customer]\nupdate = 2.0\ndelete = 0.2\n[history]\nduration = \"7d\"\n[event_retention]\nwindow = \"2d\"\n[api]\npagination_writes = { probability = 0.3 }\n",
+    )
+    .await;
+    // 1-2. Backfill while live generation (and pagination writes) continue.
+    let t0 = m.now().unix_seconds();
+    let mut synced: BTreeMap<String, Value> = BTreeMap::new();
+    let mut page = json(&m, "/v1/customers?limit=20").await;
+    loop {
+        for c in page["data"].as_array().unwrap() {
+            synced.insert(c["id"].as_str().unwrap().to_string(), c.clone());
+        }
+        if page["has_more"] != true {
+            break;
+        }
+        m.step(Duration::from_secs(60)).await.unwrap();
+        let last = page["data"].as_array().unwrap().last().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        page = json(&m, &format!("/v1/customers?limit=20&starting_after={last}")).await;
+    }
+    // 3-4. Then apply every event since the backfill started, oldest first.
+    m.quiesce().await.unwrap();
+    let mut events = walk_v1(&m, &format!("/v1/events?created[gte]={t0}")).await;
+    events.reverse();
+    assert!(
+        events.iter().any(|e| e["type"] == "customer.created"),
+        "live generation ran during the backfill"
+    );
+    for e in events {
+        let obj = &e["data"]["object"];
+        let id = obj["id"].as_str().unwrap().to_string();
+        match e["type"].as_str().unwrap() {
+            "customer.created" | "customer.updated" => {
+                synced.insert(id, obj.clone());
+            }
+            "customer.deleted" => {
+                synced.remove(&id);
+            }
+            other => panic!("unexpected event {other}"),
+        }
+    }
+    let mut truth: BTreeMap<String, Value> = BTreeMap::new();
+    for u in m.truth_log() {
+        if u.kind == ChangeKind::Deleted {
+            truth.remove(&u.object_id);
+        } else {
+            truth.insert(u.object_id.clone(), u.state.clone());
+        }
+    }
+    assert_eq!(synced.len(), truth.len());
+    assert!(synced == truth, "backfill plus events did not converge");
+}

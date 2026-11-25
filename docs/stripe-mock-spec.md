@@ -106,8 +106,9 @@ account_types = { standard = 0.5, express = 0.3, custom = 0.2 }   # v1 accounts
 [history]
 # Pre-generated data that exists before the sync starts.
 # Some of it is older than the event retention window, so only backfill can see it.
+# The default is no history (duration = "0s"); this example opts in.
 duration = "90d"
-scale = 1.0
+scale = 1.0                          # multiplies every action and churn rate during history
 
 [event_retention]
 window = "30d"
@@ -143,10 +144,11 @@ update = 0.5         # metadata
 
 [api]
 keys = ["sk_test_mock"]   # accepted API keys (section 7.1)
-latency = { distribution = "lognormal", median_ms = 40, p99_ms = 400 }
-rate_limit = { requests_per_second = 25, burst = 25 }
+latency = { distribution = "lognormal", median_ms = 40, p99_ms = 400 }   # real (wall) time in both clock modes
+rate_limit = { requests_per_second = 25, burst = 25 }   # wall-time token bucket; off when absent
 errors = { "500" = 0.001, "503" = 0.001, timeout = 0.0005, reset = 0.0005 }
 stale_read = { probability = 0.0, max_lag = "2s" }   # retrieve/list may return an older version
+pagination_writes = { probability = 0.0 }   # a list page after the first may follow a fresh mutation of the listed type
 
 [events]
 # Delay between an event's `created` and when it appears in /v1/events.
@@ -271,6 +273,8 @@ Scripted scenarios are the regression suite for specific races; random runs look
 
 Before the run starts, `history` generates data over a past period. Data older than the event retention window exists only through list endpoints, which forces the sync engine to backfill. Live generation continues during the backfill, so the race between backfill and live changes is always exercised.
 
+History events are listed by the Events APIs while inside retention, but never delivered: destinations start at `clock.start`.
+
 ## 7. Stripe-compatible API surface
 
 ### 7.1 Requests and responses
@@ -304,6 +308,10 @@ Before the run starts, `history` generates data over a past period. Data older t
 - **Stale reads** (optional): retrieve/list may briefly return an older version of an object.
 - **Writes during pagination**: objects created, changed or deleted while a client pages through a list, so a backfill can see an object twice, miss a new one, or page past a deleted one.
 - Rate limiting (429) with a token bucket, plus random 5xx, timeouts and connection resets per `[api]`.
+- A `timeout` holds the response for 80 s (Stripe's own request limit) or until the mock shuts down, then drops the connection; a `reset` drops it at once. Either way the client gets no complete response.
+- 429, 500 and 503 responses carry `Stripe-Should-Retry: true`, the usual error envelope and a `Request-Id`.
+- Faults apply only to requests that pass authentication and the other request checks, in this order: rate limit (a forced storm, then the bucket), then a random error, then latency, then the handler.
+- `api.pagination_writes`: when it fires on a list request that carries a cursor, one random action of the listed type runs before the page is served, so the race happens in virtual time too. It does nothing while generation is off (after quiesce).
 
 ## 8. Events API
 
@@ -390,7 +398,7 @@ Separate from the Stripe surface. Available as a Rust handle in-process and as H
 - **Run control**: `pause`, `resume`, `step(duration)`, `advance_to(time)`, `set_speed`.
 - **Quiesce**: stop generation, flush every pending webhook and retry, make every event visible, then return. Used before a final end-state comparison. Simulated time does not move; pending retries are attempted immediately until they succeed or exhaust their schedule. Generation stays off until `resume_generation`.
 - **Triggers**: run a named action now; run a script.
-- **Faults at runtime**: change any `[api]`, `[events]`, `[webhooks]` setting; start or stop an endpoint outage; force a rate-limit storm.
+- **Faults at runtime**: change any `[api]` (`update_api_config`), `[events]`, `[webhooks]` setting; start or stop an endpoint outage; force a rate-limit storm (`force_rate_limit`).
 - **Delivery targets**: add, remove, enable or disable snapshot and thin destinations; rotate a signing secret.
 - **Subscription**: the latest-state subscription (section 10).
 - **Accounts**: connect a new v1 or v2 connected account, or disconnect one.
