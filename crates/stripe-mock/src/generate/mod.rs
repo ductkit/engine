@@ -311,7 +311,12 @@ impl Generator {
 
     /// Replaces `[actions]`. Poisson actions whose rate changed redraw their next
     /// due time from `now`; everything else applies to later draws.
-    pub(crate) fn set_actions_config(&mut self, config: ActionsConfig, now: SimTime) {
+    /// Turning natural renewals back on queues a renewal for every live
+    /// subscription that has none pending.
+    pub(crate) fn set_actions_config(&mut self, config: ActionsConfig, engine: &mut Engine) {
+        let now = engine.now();
+        let resume_renewals = self.ctx.config.renew_subscription_cycle != crate::RenewMode::Natural
+            && config.renew_subscription_cycle == crate::RenewMode::Natural;
         for a in &mut self.actions {
             let rate = match a.kind {
                 ActionKind::NewCustomer => config.new_customer,
@@ -327,6 +332,30 @@ impl Generator {
             }
         }
         self.ctx.config = config;
+        if resume_renewals {
+            let queued: Vec<String> = self
+                .ctx
+                .queue
+                .values()
+                .filter_map(|(c, _)| match c {
+                    Continuation::Renew { sub } => Some(sub.clone()),
+                    _ => None,
+                })
+                .collect();
+            let subs: Vec<String> = engine
+                .store()
+                .in_creation_order(ObjectType::Subscription)
+                .into_iter()
+                .map(|o| o.latest.object_id.clone())
+                .filter(|id| subscriptions::renewable(engine, id) && !queued.contains(id))
+                .collect();
+            if !subs.is_empty() {
+                let cause = engine.begin_action("control.resume_renewals");
+                for sub in subs {
+                    subscriptions::schedule_renewal(engine, &mut self.ctx, &sub, &cause);
+                }
+            }
+        }
     }
 
     /// Turns generation off or on. Re-enabling redraws each Poisson action's next due

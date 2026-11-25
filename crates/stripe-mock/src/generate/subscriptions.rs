@@ -5,7 +5,8 @@ use serde_json::{Value, json};
 
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::generate::billing::{
-    attempt_payment, create_draft_invoice, finalize, mark_uncollectible, resolve_customer, void,
+    attempt_payment, create_draft_invoice, delete_draft, finalize, mark_uncollectible,
+    resolve_customer, void,
 };
 use crate::generate::catalog::{active_ids, create_product_now, draw_new_product};
 use crate::generate::{Continuation, Ctx, pick};
@@ -307,6 +308,10 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
             );
         }
         Continuation::FinalizeFirstInvoice { sub, invoice } => {
+            if sub_status(engine, &sub).as_deref() != Some("incomplete") {
+                delete_draft(engine, &invoice, &cause);
+                return;
+            }
             if finalize(engine, &invoice, &cause) {
                 ctx.then(
                     engine,
@@ -368,11 +373,19 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
             );
         }
         Continuation::FinalizeRenewal { sub, invoice } => {
+            if !renewable(engine, &sub) {
+                delete_draft(engine, &invoice, &cause);
+                return;
+            }
             if finalize(engine, &invoice, &cause) {
                 ctx.then(engine, Continuation::PayRenewal { sub, invoice }, cause);
             }
         }
         Continuation::PayRenewal { sub, invoice } => {
+            if !renewable(engine, &sub) {
+                void(engine, &invoice, &cause);
+                return;
+            }
             if attempt_payment(engine, ctx, &invoice, &cause) {
                 if sub_status(engine, &sub).as_deref() == Some("past_due") {
                     set_status(engine, &sub, "active", &cause);
@@ -390,6 +403,10 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
                 .latest(ObjectType::Invoice, &invoice)
                 .is_some_and(|u| u.state["status"] == "open");
             if !open {
+                return;
+            }
+            if !renewable(engine, &sub) {
+                void(engine, &invoice, &cause);
                 return;
             }
             if attempt_payment(engine, ctx, &invoice, &cause) {
@@ -410,8 +427,10 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
 /// How long a failed renewal waits for its one retry.
 const DUNNING_RETRY_MS: i64 = 3 * 86_400_000;
 
-/// Queues `Renew` at the end of the subscription's current period (natural renewals only).
-fn schedule_renewal(engine: &Engine, ctx: &mut Ctx, sub: &str, cause: &Cause) {
+/// Queues `Renew` at the end of the subscription's current period, or now when
+/// that end has passed (after a quiesce or with renewals off), so missed periods
+/// renew back to back (natural renewals only).
+pub(super) fn schedule_renewal(engine: &Engine, ctx: &mut Ctx, sub: &str, cause: &Cause) {
     if ctx.config.renew_subscription_cycle != RenewMode::Natural {
         return;
     }
@@ -422,7 +441,7 @@ fn schedule_renewal(engine: &Engine, ctx: &mut Ctx, sub: &str, cause: &Cause) {
         return;
     };
     ctx.schedule(
-        SimTime(end * 1000),
+        SimTime(end * 1000).max(engine.now()),
         Continuation::Renew {
             sub: sub.to_string(),
         },
@@ -430,7 +449,7 @@ fn schedule_renewal(engine: &Engine, ctx: &mut Ctx, sub: &str, cause: &Cause) {
     );
 }
 
-fn renewable(engine: &Engine, sub: &str) -> bool {
+pub(super) fn renewable(engine: &Engine, sub: &str) -> bool {
     matches!(
         sub_status(engine, sub).as_deref(),
         Some("active" | "past_due")
@@ -570,19 +589,25 @@ pub(crate) fn delete_customer_cascade(
             _ => {}
         }
     }
-    let open: Vec<String> = engine
+    // Pending drafts are deleted and open invoices voided, so no later step
+    // finalizes or pays an invoice of the deleted customer.
+    let unsettled: Vec<(String, bool)> = engine
         .store()
         .in_creation_order(ObjectType::Invoice)
         .into_iter()
-        .filter(|o| {
-            !o.deleted
-                && o.latest.state["customer"] == json!(id)
-                && o.latest.state["status"] == "open"
+        .filter(|o| !o.deleted && o.latest.state["customer"].as_str() == Some(id))
+        .filter_map(|o| match o.latest.state["status"].as_str() {
+            Some("draft") => Some((o.latest.object_id.clone(), true)),
+            Some("open") => Some((o.latest.object_id.clone(), false)),
+            _ => None,
         })
-        .map(|o| o.latest.object_id.clone())
         .collect();
-    for invoice in open {
-        void(engine, &invoice, cause);
+    for (invoice, draft) in unsettled {
+        if draft {
+            delete_draft(engine, &invoice, cause);
+        } else {
+            void(engine, &invoice, cause);
+        }
     }
     engine.delete(
         ObjectType::Customer,

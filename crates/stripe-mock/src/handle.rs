@@ -451,8 +451,8 @@ impl MockStripe {
         let mut cfg = sim.generator.actions_config().clone();
         f(&mut cfg);
         cfg.validate()?;
-        let now = sim.engine.now();
-        sim.generator.set_actions_config(cfg, now);
+        let sim = &mut *sim;
+        sim.generator.set_actions_config(cfg, &mut sim.engine);
         Ok(())
     }
 

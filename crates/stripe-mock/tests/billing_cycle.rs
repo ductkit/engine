@@ -207,3 +207,100 @@ async fn customer_delete_cancels_subscriptions_first() {
     assert_eq!(s.state["status"], "canceled");
     assert_eq!(s.state["customer"], customer.as_str());
 }
+
+fn monotonic(m: &MockStripe) {
+    let log = m.truth_log();
+    assert!(
+        log.windows(2).all(|w| w[0].at <= w[1].at),
+        "truth log time went backwards"
+    );
+}
+
+#[tokio::test]
+async fn long_quiesce_catches_up_renewals() {
+    let m = mock_with("").await;
+    let sub = start(&m, Some(recurring_prices(&m, 1, "month")));
+    m.quiesce().await.unwrap();
+    m.step(Duration::from_secs(100 * DAY)).await.unwrap();
+    m.resume_generation();
+    m.step(Duration::from_secs(3600)).await.unwrap();
+    monotonic(&m);
+    let invoices = sub_invoices(&m, &sub);
+    assert!(invoices.len() >= 4, "{} invoices", invoices.len());
+    for w in invoices.windows(2) {
+        assert_eq!(w[1].state["period_start"], w[0].state["period_end"]);
+    }
+    let item = &m.get(ObjectType::Subscription, &sub).unwrap().state["items"]["data"][0];
+    assert!(item["current_period_end"].as_i64().unwrap() * 1000 > m.now().0);
+}
+
+#[tokio::test]
+async fn pending_steps_never_bill_after_customer_delete() {
+    let m = mock_with("[actions]\nstep_delay = { distribution = \"fixed\", ms = 7200000 }").await;
+    let sub = start(&m, Some(recurring_prices(&m, 1, "month")));
+    // Run until the renewal draft exists but has not been finalized.
+    let mut hours = 0;
+    while sub_invoices(&m, &sub).len() < 2 {
+        m.step(Duration::from_secs(3600)).await.unwrap();
+        hours += 1;
+        assert!(hours < 40 * 24);
+    }
+    let renewal = sub_invoices(&m, &sub).pop().unwrap();
+    assert_eq!(renewal.state["status"], "draft");
+    m.run_action(Action::OneOffInvoice {
+        customer: Some(renewal.state["customer"].as_str().unwrap().to_string()),
+        outcome: Some(ductkit_stripe_mock::InvoiceOutcome::Paid),
+    })
+    .unwrap();
+    let customer = renewal.state["customer"].as_str().unwrap().to_string();
+    m.delete_customer(&customer).unwrap();
+    let deleted_at = m.truth_log().len();
+    m.step(Duration::from_secs(2 * DAY)).await.unwrap();
+    let after = &m.truth_log()[deleted_at..];
+    assert!(
+        !after.iter().any(|u| u.object_type == ObjectType::Invoice
+            && u.state["customer"] == customer.as_str()
+            && matches!(u.state["status"].as_str(), Some("open" | "paid"))),
+        "an invoice of a deleted customer was finalized or paid"
+    );
+}
+
+#[tokio::test]
+async fn cancel_now_drops_pending_renewal_invoice() {
+    let m = mock_with("[actions]\nstep_delay = { distribution = \"fixed\", ms = 7200000 }").await;
+    let sub = start(&m, Some(recurring_prices(&m, 1, "month")));
+    while sub_invoices(&m, &sub).len() < 2 {
+        m.step(Duration::from_secs(3600)).await.unwrap();
+    }
+    let renewal = sub_invoices(&m, &sub).pop().unwrap().object_id;
+    m.run_action(Action::CancelSubscription {
+        id: Some(sub.clone()),
+        at_period_end: Some(false),
+    })
+    .unwrap();
+    m.step(Duration::from_secs(2 * DAY)).await.unwrap();
+    let inv = m.get(ObjectType::Invoice, &renewal).unwrap();
+    assert!(
+        inv.kind == ChangeKind::Deleted || inv.state["status"] == "void",
+        "{}",
+        inv.state["status"]
+    );
+}
+
+#[tokio::test]
+async fn renewals_resume_after_renew_mode_off() {
+    use ductkit_stripe_mock::RenewMode;
+    let m = mock_with("").await;
+    let sub = start(&m, Some(recurring_prices(&m, 1, "month")));
+    m.update_actions_config(|a| a.renew_subscription_cycle = RenewMode::Off)
+        .unwrap();
+    m.step(Duration::from_secs(40 * DAY)).await.unwrap();
+    assert_eq!(sub_invoices(&m, &sub).len(), 1);
+    m.update_actions_config(|a| a.renew_subscription_cycle = RenewMode::Natural)
+        .unwrap();
+    m.step(Duration::from_secs(40 * DAY)).await.unwrap();
+    monotonic(&m);
+    assert!(sub_invoices(&m, &sub).len() >= 3);
+    let item = &m.get(ObjectType::Subscription, &sub).unwrap().state["items"]["data"][0];
+    assert!(item["current_period_end"].as_i64().unwrap() * 1000 > m.now().0);
+}
