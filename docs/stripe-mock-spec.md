@@ -1,6 +1,8 @@
 # Stripe mock: specification
 
-Status: draft · Crate: `crates/stripe-mock` (package `ductkit-stripe-mock`)
+Status: draft · Crate: `crates/stripe-mock` (package `ductkit-stripe-mock`) · Pinned Stripe API version: `2026-11-18.endive`
+
+Decisions taken so far are listed in [section 17](#17-decisions); open questions are in [section 18](#18-open-questions).
 
 ## 1. Purpose
 
@@ -12,7 +14,7 @@ Those conditions are hard to reproduce against real Stripe and impossible to rep
 - creates, updates and deletes entities realistically over time,
 - exposes them through a Stripe-compatible REST API, a pollable Events API and signed webhooks,
 - injects configurable disruptions, and
-- publishes an authoritative **change stream** so tests can verify the sync target *as changes happen*, not only by comparing final states.
+- offers a subscription to the **latest state of every object**, so tests can check the sync target *as changes happen*, not only by comparing final states.
 
 ### Goals
 
@@ -24,7 +26,9 @@ Those conditions are hard to reproduce against real Stripe and impossible to rep
 
 ### Non-goals
 
-- Write-side fidelity for the full Stripe API (payments flows, card validation, Radar, tax computation). The mock *generates* writes internally; its public write surface is limited to what the sync engine needs (e.g. webhook endpoint management).
+- **Accepting writes from the sync engine.** The Stripe-compatible API is read-only: every `POST`/`DELETE` returns a Stripe-style `invalid_request_error`. All mutations come from the mock's own generator, scripts or control API. Webhook endpoints and event destinations are configured through config or the control API, not through the Stripe API.
+- Write-side fidelity for the Stripe API (payments flows, card validation, Radar, tax computation).
+- **A verifier.** Checking that a sync target is correct belongs to the sync engine's test suite and will be built with it. The mock only provides what a verifier needs: a subscription to the latest state of every object (section 10).
 - Covering every Stripe object type from day one.
 - Replacing occasional calibration runs against real Stripe test mode.
 
@@ -34,13 +38,13 @@ The mock maintains two distinct layers. Keeping them separate is the central des
 
 ```
           ┌────────────────────────────┐
- actions →│  Truth log (authoritative) │──► Change stream  (for test verification)
+ actions →│  Truth log (authoritative) │──► Latest-state subscription
           │  per-object versions       │
           └─────────────┬──────────────┘
                         │ projection (lossy, delayed, reordered, faulty)
           ┌─────────────▼──────────────┐
           │  Stripe-visible surface    │──► REST objects / lists
-          │                            │──► Events API (/v1/events)
+          │                            │──► Events API (/v1/events, /v2/core/events)
           │                            │──► Webhook deliveries
           └────────────────────────────┘
 ```
@@ -48,7 +52,7 @@ The mock maintains two distinct layers. Keeping them separate is the central des
 - **Truth log**: every mutation, in the order it really happened. Each object has a monotonically increasing `version` (1 on create). The truth log is never faulty.
 - **Projection**: what a Stripe client can observe. All fault injection lives here. Faults never alter the truth log.
 
-Tests assert the sync target against the truth log, using the change stream.
+Tests (and, later, the verifier) assert the sync target against the truth log, using the latest-state subscription.
 
 ## 3. Architecture
 
@@ -57,21 +61,30 @@ ductkit-stripe-mock
 ├── engine      clock, RNG, truth log, entity store, scheduler
 ├── model       entity schemas + per-type lifecycle state machines
 ├── generate    action generators (stochastic + scripted scenarios)
-├── project     event creation, visibility scheduling, webhook queue
+├── project     snapshot + thin event creation, visibility scheduling, delivery queue
 ├── faults      fault policies applied by `project` and the HTTP layer
-├── api         Stripe-compatible HTTP API (axum)
+├── api         read-only Stripe-compatible HTTP API, v1 and v2 (axum)
 ├── control     control/admin API (separate router + Rust handle)
-└── stream      change stream (async channel in-process; SSE/WebSocket over HTTP)
+└── stream      latest-state subscription (async stream in-process; SSE/WebSocket over HTTP)
 ```
 
 Two run modes share one engine:
 
-| Mode | Use | Change stream | Clock |
+| Mode | Use | Subscription | Clock |
 |------|-----|---------------|-------|
-| In-process (`MockStripe::start(config)` returns a handle) | Fast integration tests in `cargo test` | `tokio::sync::broadcast` / `Stream` | Virtual (default) or wall |
+| In-process (`MockStripe::start(config)` returns a handle) | Fast integration tests in `cargo test` | Rust `Stream` | Virtual (default) or wall |
 | Standalone server (`ductkit-stripe-mock serve --config mock.toml`) | E2E tests, CLI tests, manual exploration | SSE and WebSocket on the control port | Wall (default) or virtual, driven via control API |
 
 The Stripe-compatible API and the control API listen on **separate ports** (or routers), so a sync engine under test can never reach control endpoints by accident.
+
+### 3.1 Packaging
+
+One crate, `crates/stripe-mock` (package `ductkit-stripe-mock`), ships both:
+
+- **A library** (`src/lib.rs`) that tests import, typically as a `[dev-dependencies]` entry. It exposes `MockStripe::start(config)`, the control handle, scripting and the latest-state subscription as Rust APIs.
+- **A binary** (`src/main.rs`, command `ductkit-stripe-mock`) that runs the standalone server from a config file. It is a thin wrapper around the library.
+
+No container image is produced.
 
 ## 4. Configuration
 
@@ -79,14 +92,16 @@ Configuration is a TOML file (or the equivalent Rust struct). All rates are per 
 
 ```toml
 seed = 42
-api_version = "2025-xx-xx"          # pinned Stripe API version stamped on payloads
+api_version = "2026-11-18.endive"   # pinned; the only version the mock serves (section 7.1)
 clock = { mode = "virtual", start = "2026-01-01T00:00:00Z", speed = 60.0 }  # speed only for wall-paced virtual time
 
 [accounts]
 platforms = 1
 connect = true
 connected_accounts = { initial = 20, connect_rate = 0.5, deauthorize_rate = 0.1 }
-account_types = { standard = 0.5, express = 0.3, custom = 0.2 }
+account_api = { v1 = 0.5, v2 = 0.5 }                       # share of connected accounts created through each Accounts API
+account_types = { standard = 0.5, express = 0.3, custom = 0.2 }   # v1 accounts
+# v2 accounts get a mix of configurations (merchant, customer, recipient); see section 5.4
 
 [history]
 # Pre-generated data that exists before the sync starts.
@@ -140,10 +155,23 @@ signature_tolerance = "300s"
 clock_skew = { probability = 0.0, max = "10m" }    # signatures outside tolerance
 
 [payloads]
-snapshot_events = true               # data.object as of event time
-thin_events = false                  # v2-style reference-only events
 nested_list_page_size = 10           # force has_more on embedded lists
-expand_probability = 0.0             # chance an expandable field is returned expanded unasked (should be 0 for fidelity)
+
+# Delivery targets. Configured here or via the control API, never via the Stripe API.
+# Each target receives either snapshot or thin payloads, and has its own signing secret.
+[[destinations]]
+name = "snapshot"
+url = "http://localhost:4000/webhooks/stripe"
+payload = "snapshot"                 # v1 webhook endpoint semantics
+enabled_events = ["*"]
+connect = true                       # also receive events from connected accounts
+
+[[destinations]]
+name = "thin"
+url = "http://localhost:4000/webhooks/stripe-thin"
+payload = "thin"                     # v2 event destination semantics
+enabled_events = ["v1.customer.*", "v1.invoice.*"]
+events_from = ["self", "other_accounts"]   # other_accounts: events from connected accounts
 ```
 
 Configuration can be changed at runtime through the control API (section 11). Changes are recorded in the truth log, so replays reproduce them.
@@ -164,7 +192,9 @@ Chosen to cover each deletion style and the main relationship shapes:
 | `invoice` | `in_` | Drafts hard-delete; otherwise `void` / `uncollectible` | customer, subscription, lines |
 | `invoice line item` | `il_` | Embedded list in invoice | invoice, price |
 
-Phase 2 candidates: `payment_intent`, `charge`, `refund`, `dispute`, `payment_method`, `coupon`, `promotion_code`, `account` (Connect), `balance_transaction`, `payout`.
+Connected accounts themselves are covered in section 5.4.
+
+Phase 2 candidates: `payment_intent`, `charge`, `refund`, `dispute`, `payment_method`, `coupon`, `promotion_code`, `balance_transaction`, `payout`.
 
 ### 5.2 Lifecycle state machines
 
@@ -180,6 +210,17 @@ Each type has a state machine that only allows legal transitions, for example:
 - Metadata with Unicode, maximum key/value lengths and empty strings.
 - Nullable fields that really are null; optional fields that are absent.
 - Bursts of many updates to one object within the same second.
+
+### 5.4 Connect accounts
+
+The mock models connected accounts created through **both** Accounts APIs, in the proportion set by `accounts.account_api`:
+
+- **v1 accounts** (`/v1/accounts`): `type` standard, express or custom. Lifecycle events include `account.updated`, `account.application.authorized` and `account.application.deauthorized`, with thin `v1.` equivalents.
+- **v2 accounts** (`/v2/core/accounts`): modelled with Accounts v2 configurations (merchant, customer, recipient). As v2 resources they emit thin events only (`v2.core.account.*`), never snapshot events.
+- Both kinds use `acct_` IDs and are addressed with the `Stripe-Account` header. Whether a v2 account is also readable through `/v1/accounts` follows Stripe's documented behaviour for the pinned version (section 18).
+- Accounts can be connected and disconnected during a run (`connect_rate`, `deauthorize_rate`, control API).
+
+**Event coverage is identical for platform and connected accounts.** Every action, entity type, lifecycle and event type the mock generates for a platform account is generated for each connected account too, with the same rates. Connected-account events reach snapshot destinations with `connect = true` (carrying `account`) and thin destinations with `other_accounts` in `events_from` (carrying `context`). All faults apply to them in the same way.
 
 ## 6. Action generation
 
@@ -222,16 +263,17 @@ Before the run starts, `history` generates data over a past period. Data older t
 - `Authorization: Bearer sk_test_…` (any key from config; unknown keys → 401).
 - `Stripe-Account: acct_…` for Connect; objects are scoped per account.
 - Stripe error envelope (`{"error": {"type", "code", "message", ...}}`), `Request-Id` header, `Stripe-Should-Retry` on retryable errors.
-- `Stripe-Version` header honoured only if it equals the pinned version (otherwise an error), until multi-version support exists.
-- Form-encoded request bodies, as Stripe uses.
+- **One API version**: `2026-11-18.endive`, the latest stable version when this spec was written. Requests with no `Stripe-Version` header are served at that version; a different `Stripe-Version` gets an error. All snapshot payloads use this version. Moving to a newer version is a deliberate change to the mock (update the OpenAPI spec it is generated from, section 14).
+- **Read-only**: every `POST`, `PUT`, `PATCH` and `DELETE` returns a Stripe-style `invalid_request_error` explaining that the mock is read-only.
 
 ### 7.2 Endpoints (phase 1)
 
 - Retrieve and list for every phase-1 type: `GET /v1/{type}/{id}`, `GET /v1/{type}`.
 - Sub-lists for embedded collections: `GET /v1/subscription_items?subscription=…`, `GET /v1/invoices/{id}/lines`.
-- `GET /v1/events`, `GET /v1/events/{id}`.
-- `POST/GET/DELETE /v1/webhook_endpoints` (with `enabled_events`, `connect: true`, secret returned on create).
-- `GET /v1/accounts`, `GET /v1/accounts/{id}` for Connect.
+- Snapshot events: `GET /v1/events`, `GET /v1/events/{id}`.
+- Thin events: `GET /v2/core/events`, `GET /v2/core/events/{id}` (section 8.2).
+- Connect: `GET /v1/accounts`, `GET /v1/accounts/{id}`, `GET /v2/core/accounts`, `GET /v2/core/accounts/{id}`.
+- Read-only views of configured delivery targets: `GET /v1/webhook_endpoints` (snapshot targets) and `GET /v2/core/event_destinations` (thin targets), so the sync engine can check its setup.
 
 ### 7.3 List semantics
 
@@ -249,27 +291,55 @@ Before the run starts, `history` generates data over a past period. Data older t
 
 ## 8. Events API
 
-- Every truth-log mutation that Stripe would announce produces an event (`evt_…`) with `type`, `created`, `data.object` (snapshot at event time), `data.previous_attributes` (for `*.updated`), `account` (Connect), `api_version`, `livemode: false`, `request {id, idempotency_key}` and `pending_webhooks`.
+Every truth-log mutation that Stripe would announce produces **one snapshot event and one thin event**. They share timing (`created`, visibility) and the thin event's `snapshot_event` points at the snapshot event's ID. Both formats are always generated; destinations choose which one they receive.
+
+### 8.1 Snapshot events (v1)
+
+- `evt_…` with `type` (e.g. `customer.updated`), `created`, `data.object` (snapshot at event time), `data.previous_attributes` (for `*.updated`), `account` (Connect), `api_version` (`2026-11-18.endive`), `livemode: false`, `request {id, idempotency_key}` and `pending_webhooks`.
 - **Visibility scheduling**: each event gets a hidden `visible_at = created + visibility_lag (+ late_tail)`. `/v1/events` only returns events whose `visible_at` has passed. An event can therefore become visible *after* a newer one did, so "poll with `ending_before` = last seen" silently misses events. Catching this bug is a primary goal of the fixture.
 - **Same-second ordering**: events sharing a `created` second have no guaranteed relative order (`same_second_shuffle`).
 - **Retention**: events older than `event_retention.window` disappear from the API. A poller that falls further behind must detect the gap (e.g. its cursor event 404s) and fall back to a full backfill.
 - `type` / `types[]` / `created` filters and `delivery_success`.
-- Optional **thin events** (`payloads.thin_events`): reference-only payloads that force the consumer to fetch the current object.
+
+### 8.2 Thin events (v2)
+
+Stripe made thin events for API v1 resources generally available in `2026-09-30.endive`. The mock implements them for every phase-1 type.
+
+- **Naming**: the snapshot type with a `v1.` prefix, e.g. `customer.created` → `v1.customer.created`.
+- **Notification** (what a destination receives): `id`, `object: "v2.core.event"`, `type`, `created`, `livemode`, `context` (the connected account, for Connect), `reason` (`type`, `request {id, idempotency_key}`), and `related_object {id, type, url}`. `related_object.type` is the v1 object name (e.g. `customer`) and `url` is an API path such as `/v1/customers/cus_…`. The notification has **no** object data.
+- **Full event**: `GET /v2/core/events/{id}` adds `snapshot_event` (the matching `evt_…`) and the change details that Stripe includes on the full event (`changes`, `data`). Exact fields are generated from the OpenAPI spec (section 14).
+- **List**: `GET /v2/core/events` with `types` filtering and v2-style pagination. It is subject to the same visibility lag, same-second shuffling and 30-day retention as snapshot events.
+- **Why thin events matter for testing**: the consumer must fetch the related object, so it always reads the *current* state rather than a snapshot. That interacts with stale reads (section 7.4), deleted objects (the fetch returns the deleted stub or 404) and rate limits (every event costs an API call), all of which the mock can provoke.
 
 ## 9. Webhooks
 
-- Endpoints registered through the API or config. Separate account and Connect endpoints; Connect events carry `account`.
+- Delivery targets come from `[[destinations]]` in the config or from the control API. Each is either a **snapshot** target (v1 webhook endpoint semantics) or a **thin** target (v2 event destination semantics), with its own `enabled_events` and its own signing secret. Snapshot targets can be account or Connect endpoints; Connect events carry `account` (snapshot) or `context` (thin).
+- All delivery behaviour below applies equally to both payload formats.
 - **At-least-once delivery**: duplicates are a baseline behaviour (`duplicate_probability`), not only a fault.
 - **Ordering**: deliveries inside `reorder_window` may be reordered; delivery delay comes from a distribution with a long tail.
 - **Retries**: non-2xx, connection failure or a response slower than `response_timeout` counts as failure. Retries follow a Stripe-like exponential backoff up to `max_retry_duration`; in virtual time the schedule can be compressed. A slow-but-successful handler therefore receives a duplicate.
 - **Disabling**: an endpoint that keeps failing is disabled, as Stripe does; the control API can re-enable it.
 - **Signatures**: `Stripe-Signature: t=<ts>,v1=<hmac-sha256>`. Supports secret rotation (several `v1` values), timestamps outside tolerance (`clock_skew`), and an invalid-signature fault for negative tests.
-- **Payload staleness**: because payloads are snapshots, a delayed or retried delivery carries an outdated object. Each delivery's truth-log version is recorded so tests can tell whether the consumer applied an old version over a newer one.
+- **Payload staleness**: because snapshot payloads are snapshots, a delayed or retried delivery carries an outdated object. Each delivery's truth-log version is recorded so tests can tell whether the consumer applied an old version over a newer one.
 - **Endpoint downtime**: the control API can make deliveries to an endpoint fail for a period ("outage"), building a retry backlog that later floods in.
 
-## 10. Change stream
+## 10. Latest-state subscription
 
-The change stream is the authoritative feed tests subscribe to. It carries truth-log entries, never projections.
+Through the control API and the Rust handle, a test can subscribe to **the latest state of every object**. This is the mock's only verification-related feature; the verifier itself is out of scope (section 1).
+
+### 10.1 Semantics
+
+- On subscribe, the subscriber first receives the current state of every object (optionally filtered by account and object type), then a `synced` marker, then every subsequent change as it happens in the truth log.
+- Every message carries the object's full state after the change and its per-object `version`.
+- Deleted objects are sent as tombstones (`kind: "deleted"`, `state` = Stripe's deleted stub), so a subscriber can tell "deleted" from "never seen".
+- A subscriber that falls too far behind is not allowed to slow the mock down. It is told it lagged and must resubscribe, which gives it a fresh snapshot. Because every message is a complete latest state, nothing is lost by skipping intermediate versions.
+- The stream carries truth-log entries only, never projections.
+
+### 10.2 Version contract for consumers
+
+Per-object `version` starts at 1 and increases by one per mutation. A sync target may legitimately **skip** versions (e.g. it applies version 5 without ever seeing 3 or 4) but must never **regress** (go from 5 back to 4). The future verifier will enforce exactly this; the mock guarantees the versions needed to check it.
+
+### 10.3 Message format
 
 ```jsonc
 {
@@ -279,16 +349,23 @@ The change stream is the authoritative feed tests subscribe to. It carries truth
   "object_type": "customer",
   "object_id": "cus_abc",
   "version": 3,                      // per-object, starts at 1
-  "kind": "updated",                 // created | updated | deleted | archived | state_changed
-  "state": { /* full object after the mutation, API-shaped */ },
-  "events": ["evt_1", "evt_2"],      // Stripe events this mutation produced
+  "kind": "updated",                 // snapshot | created | updated | deleted | archived | state_changed
+  "state": { /* full object after the mutation, API-shaped at the pinned version */ },
+  "events": { "snapshot": ["evt_1"], "thin": ["evt_v2_1"] },   // events this mutation produced
   "cause": { "action": "start_subscription", "action_id": "act_77" }
 }
 ```
 
-A second stream (or a flag on the same subscription) carries **projection records** (event became visible, delivery attempted, succeeded, failed, duplicated, reordered, dropped after retries), for debugging and delivery-aware assertions.
+Messages in the initial snapshot have `kind: "snapshot"` and no `events` or `cause`.
 
-Subscribers can start from `seq = 0` (full replay) or from "now". In-process it is a Rust `Stream`; standalone it is SSE (`GET /control/stream?from=…`) and WebSocket.
+### 10.4 Transport
+
+- In-process: `handle.subscribe(filter) -> impl Stream<Item = StateUpdate>`.
+- Standalone: SSE (`GET /control/subscribe?account=…&types=…`) and WebSocket on the control port.
+
+### 10.5 Delivery log (debugging)
+
+Separately from the subscription, the control API exposes the **delivery log** (event became visible, delivery attempted, succeeded, failed, duplicated, reordered, abandoned after retries), so a failing test can be explained. It is a log to query, not part of the subscription.
 
 ## 11. Control API
 
@@ -298,7 +375,9 @@ Separate from the Stripe surface. Available as a Rust handle in-process and as H
 - **Quiesce**: stop generation, flush every pending webhook and retry, make every event visible, then return. Used before a final end-state comparison.
 - **Triggers**: run a named action now; run a script.
 - **Faults at runtime**: change any `[api]`, `[events]`, `[webhooks]` setting; start or stop an endpoint outage; force a rate-limit storm.
-- **Accounts**: connect or deauthorize a Connect account.
+- **Delivery targets**: add, remove, enable or disable snapshot and thin destinations; rotate a signing secret.
+- **Subscription**: the latest-state subscription (section 10).
+- **Accounts**: connect a new v1 or v2 connected account, or disconnect one.
 - **Inspection**: current truth state (by type/ID or full dump), delivery log with the reason for every decision, event visibility timeline, effective config.
 - **Export**: snapshot state to JSON; export the run (seed + config + runtime changes + scripted steps) as a replayable script.
 
@@ -309,47 +388,55 @@ Separate from the Stripe surface. Available as a Rust handle in-process and as H
 - In wall-clock mode the HTTP layer still uses real latencies; such runs are not exactly reproducible, but the seed still governs generation.
 - **Replay**: any run can be reproduced from its exported seed, config and runtime changes. Test failures should print the seed and the replay command.
 
-## 13. Verification helpers
+## 13. Future verifier (out of scope)
 
-A companion module (`ductkit-stripe-mock::verify`) holds property checks that tests run against the change stream and a target database adapter:
+The verifier will be built with the sync engine, not in this crate. These notes record what it is expected to check, so the mock keeps providing what it needs:
 
-- **Eventual convergence**: for every object, the target eventually holds the latest truth version (after quiesce, exactly).
-- **No regression**: a row in the target never goes from version *n* to a lower version.
+- **Eventual convergence**: every object eventually reaches its latest truth version in the target (exactly, after quiesce).
+- **No regression**: versions may be skipped, but a row never goes back to a lower version (section 10.2).
 - **No resurrection**: a hard-deleted object never reappears.
-- **Convergence latency**: time from truth mutation to target reflection stays under a bound (per percentile).
-- **Referential integrity**: the target never holds a child whose parent is missing past a grace period (or the sync engine's chosen policy for orphans is respected).
-- **Final state equality** after quiesce, as a last check.
+- **Convergence latency**: time from a truth mutation to the target reflecting it.
+- **Referential integrity**: whatever orphan policy the sync engine chooses.
 
-The target adapter trait is database-agnostic, so the same checks apply to Postgres, MySQL and later targets.
+The mock supports all of these through the latest-state subscription, per-object versions, tombstones and quiesce.
 
 ## 14. Fidelity
 
 - Generate object types and response shapes from Stripe's published **OpenAPI spec** for the pinned version, and validate every mock response against it in the mock's own tests. This prevents the mock from drifting away from real Stripe.
 - Stripe's official `stripe-mock` is stateless and doesn't fit this purpose, but its OpenAPI-based fixtures can seed realistic example values.
 - **Calibration**: periodically run equivalent scripted actions against real Stripe test mode and compare event fan-out, ordering and latency distributions with the mock's defaults. Calibration is a manual or scheduled job, not part of the regular test suite.
-- One pinned API version at first. Multi-version payload rendering is a later extension.
+- One pinned API version (`2026-11-18.endive`). The OpenAPI spec for that version, covering both v1 and v2 endpoints, is the source for generated types. Multi-version payload rendering is not planned.
 
 ## 15. Performance
 
 - Must sustain load tests: many accounts, thousands of mutations per simulated minute, large histories (hundreds of thousands of objects) for backfill testing.
 - Storage is in memory by default, with an optional on-disk snapshot so large histories don't regenerate on every run.
-- Change stream subscribers must not be able to slow down generation; slow subscribers get bounded buffers and a clear error on overflow.
+- Subscribers must not be able to slow down generation; slow subscribers get bounded buffers and are told to resubscribe on overflow (section 10.1).
 
 ## 16. Phasing
 
-1. **Engine skeleton**: clock, RNG, truth log, versions, change stream, control handle; `customer` only; retrieve/list; in-process mode.
-2. **Events and webhooks**: event projection with visibility lag, retention, signatures, retries, duplicates, reordering; delivery log.
+1. **Engine skeleton**: clock, RNG, truth log, versions, latest-state subscription, control handle; `customer` only; read-only retrieve/list; in-process mode.
+2. **Events and delivery**: snapshot and thin event projection, `/v1/events` and `/v2/core/events`, visibility lag, retention, signatures, retries, duplicates, reordering; snapshot and thin destinations; delivery log.
 3. **Phase-1 types and fan-out**: product, price, subscription, items, invoice, lines; business actions; nested list truncation; deletion styles.
 4. **History and backfill races**; API faults (rate limits, 5xx, stale reads, writes during pagination).
-5. **Connect**: multiple accounts, `Stripe-Account`, connect/deauthorize.
-6. **Standalone server**, SSE/WebSocket stream, HTTP control API, run export and replay.
-7. **Verification helpers** wired against the Postgres sync target.
-8. Phase-2 entity types, thin events, OpenAPI validation in CI, calibration job.
+5. **Connect**: v1 and v2 connected accounts, `Stripe-Account`, connect/disconnect, full event coverage for connected accounts through snapshot and thin destinations.
+6. **Standalone server binary**, SSE/WebSocket subscription, HTTP control API, run export and replay.
+7. Phase-2 entity types, OpenAPI validation in CI, calibration job.
 
-## 17. Open questions
+## 17. Decisions
 
-- Which Stripe API version to pin first?
-- Should the mock also accept writes from the sync engine (e.g. creating webhook endpoints only, or more), or remain strictly read-only beyond endpoint management?
-- How should the verifier tolerate legitimate intermediate states (e.g. a target that skips version 2 and goes straight to 3)? Proposal: allow skips, forbid regressions.
-- Should thin events / v2 event destinations be in scope for the first sync engine release?
-- Orphan policy for out-of-order children: should the mock's verifier assume deferred foreign keys, placeholder parents, or a retry queue? This depends on sync engine design and should be decided there.
+| # | Decision | Where it applies |
+|---|----------|------------------|
+| 1 | Pin the latest stable Stripe API version, `2026-11-18.endive`. | 7.1, 14 |
+| 2 | The mock accepts no writes from the sync engine. The Stripe API surface is read-only; delivery targets are configured via config or the control API. | 1, 7.1, 7.2, 9 |
+| 3 | Version skips are allowed; regressions are forbidden. | 10.2, 13 |
+| 4 | Thin events are in scope, alongside snapshot events. | 8.2, 9 |
+| 5 | The verifier is out of scope. The mock provides a subscription to the latest state of every object via the control API and Rust bindings. | 1, 10, 13 |
+| 6 | Connected accounts are modelled for both Accounts v1 and Accounts v2. | 4, 5.4, 7.2 |
+| 7 | Connected accounts get the same event coverage as platform accounts, through both snapshot and thin destinations. | 5.4, 9 |
+| 8 | Packaged as one crate with a library (imported by tests) and a binary (standalone server). No container image. | 3.1 |
+
+## 18. Open questions
+
+- **v1/v2 account interoperability**: how a v2 account appears through `/v1/accounts` and in v1 events (and the reverse) at the pinned version. To be taken from Stripe's docs and OpenAPI spec during implementation.
+- **v2 list details** (pagination parameters, filters beyond `types`): to be taken from the OpenAPI spec for the pinned version rather than decided here.
