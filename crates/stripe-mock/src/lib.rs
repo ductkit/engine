@@ -15,6 +15,7 @@ mod handle;
 mod model;
 mod rng;
 mod stream;
+pub mod stripe;
 mod time;
 
 pub use config::{

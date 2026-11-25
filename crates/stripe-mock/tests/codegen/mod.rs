@@ -2,11 +2,19 @@
 //!
 //! It lives only in the test tree and is compiled through `tests/openapi_codegen.rs`.
 
-// The emitter (a later task) consumes most of this module; until then parts are unused.
-#![allow(dead_code)]
+use std::collections::BTreeMap;
 
+use serde_json::Value;
+
+pub mod emit;
 pub mod ir;
 pub mod names;
+
+/// Generates every file of `src/stripe/generated`, keyed by path relative to it.
+pub fn generate(spec: &Value) -> Result<BTreeMap<String, String>, String> {
+    let ir = ir::build_ir(spec, ROOTS)?;
+    emit::emit(&ir, ROOTS)
+}
 
 /// The root schemas to generate. The generator emits each root plus the closure over
 /// non-expandable `$ref`s.

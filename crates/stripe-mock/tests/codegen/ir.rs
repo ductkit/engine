@@ -31,6 +31,8 @@ pub struct StructDef {
     pub fields: Vec<FieldDef>,
     /// JSON names of the fields that can be expanded (type `Expandable`, or a `Vec` of it).
     pub expandable: Vec<String>,
+    /// The schema's `description`.
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -40,6 +42,8 @@ pub struct FieldDef {
     pub ty: TypeRef,
     pub required: bool,
     pub nullable: bool,
+    /// The property's `description`.
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -199,6 +203,7 @@ impl<'a> Builder<'a> {
                 ty,
                 required: required.contains(json.as_str()),
                 nullable: nullable_through(p),
+                description: description(p),
             });
         }
         Ok(StructDef {
@@ -206,6 +211,7 @@ impl<'a> Builder<'a> {
             object,
             fields,
             expandable,
+            description: description(s),
         })
     }
 
@@ -395,6 +401,16 @@ impl<'a> Builder<'a> {
             origin.to_string(),
             TypeDef::Enum(EnumDef { values: unique }),
         )
+    }
+}
+
+/// The `description` of `s` or of the element of a single-element wrapper inside it.
+fn description(mut s: &Value) -> Option<String> {
+    loop {
+        if let Some(d) = s.get("description").and_then(Value::as_str) {
+            return Some(d.to_string());
+        }
+        s = single_wrapped(s)?;
     }
 }
 
