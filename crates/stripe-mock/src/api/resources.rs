@@ -4,16 +4,17 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::extract::{Path, RawQuery, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{Value, json};
 
-use crate::api::ApiError;
 use crate::api::expand::expand;
 use crate::api::list::{ListParams, array_base, decode, paginate, parse_list_params};
-use crate::engine::store::StoredObject;
-use crate::engine::{Engine, StateUpdate};
+use crate::api::{ApiError, RequestScope, ensure_connected};
+use crate::engine::store::{ObjectStore, StoredObject};
+use crate::engine::{Engine, Scope, StateUpdate};
 use crate::handle::{Shared, Sim};
 use crate::{ChangeKind, ObjectType, SimTime};
 
@@ -80,6 +81,14 @@ pub(crate) static INVOICES: Resource = Resource {
     required: None,
 };
 
+pub(crate) static ACCOUNTS: Resource = Resource {
+    t: ObjectType::Account,
+    path: "/v1/accounts",
+    filters: &[],
+    order: Order::CreatedDesc,
+    required: None,
+};
+
 fn bool_param(p: &ListParams, name: &str) -> Result<Option<bool>, ApiError> {
     match p.extra.get(name).map(String::as_str) {
         None => Ok(None),
@@ -94,33 +103,40 @@ fn bool_param(p: &ListParams, name: &str) -> Result<Option<bool>, ApiError> {
 }
 
 /// What one request sees: the latest state, or (a stale read) every object as
-/// it was at `at` (spec section 7.4).
-#[derive(Clone, Copy)]
+/// it was at `at` (spec section 7.4), in the request's `scope`.
+#[derive(Clone)]
 pub(crate) struct View<'a> {
     pub engine: &'a Engine,
     pub at: Option<SimTime>,
+    pub scope: Scope,
 }
 
 impl<'a> View<'a> {
+    /// The objects this view reads; empty while the scope has none.
+    pub(crate) fn store(&self) -> &'a ObjectStore {
+        self.engine.scope_store(&self.scope)
+    }
+
     /// The version this view shows of `o`; `None` if it did not exist yet.
     pub(crate) fn state(&self, o: &'a StoredObject) -> Option<&'a StateUpdate> {
         match self.at {
             None => Some(&o.latest),
-            Some(at) => self
-                .engine
-                .as_of(o.latest.object_type, &o.latest.object_id, at),
+            Some(at) => {
+                self.engine
+                    .as_of_in(&self.scope, o.latest.object_type, &o.latest.object_id, at)
+            }
         }
     }
 
     /// The version a list shows: existing in this view and not deleted.
-    fn listed(&self, o: &'a StoredObject) -> Option<&'a StateUpdate> {
+    pub(crate) fn listed(&self, o: &'a StoredObject) -> Option<&'a StateUpdate> {
         self.state(o).filter(|u| u.kind != ChangeKind::Deleted)
     }
 
     /// The state retrieve shows: a deleted customer is its stub, other deleted
     /// objects (and objects not yet created in this view) are missing.
     pub(crate) fn visible(&self, t: ObjectType, id: &str) -> Option<Value> {
-        let u = self.state(self.engine.store().get(t, id)?)?;
+        let u = self.state(self.store().get(t, id)?)?;
         if u.kind == ChangeKind::Deleted && t != ObjectType::Customer {
             return None;
         }
@@ -162,8 +178,7 @@ fn matches(
             status_ok
                 && eq("customer", "customer")
                 && f.get("price").is_none_or(|want| {
-                    view.engine
-                        .store()
+                    view.store()
                         .children(
                             ObjectType::SubscriptionItem,
                             "subscription",
@@ -186,10 +201,10 @@ fn matches(
     }
 }
 
-fn ordered<'a>(engine: &'a Engine, r: &Resource) -> Vec<&'a StoredObject> {
+fn ordered<'a>(view: &View<'a>, r: &Resource) -> Vec<&'a StoredObject> {
     match r.order {
-        Order::CreatedDesc => engine.store().list_order(r.t),
-        Order::CreationAsc => engine.store().in_creation_order(r.t),
+        Order::CreatedDesc => view.store().list_order(r.t),
+        Order::CreationAsc => view.store().in_creation_order(r.t),
     }
 }
 
@@ -198,11 +213,20 @@ pub(crate) fn routes(router: Router<Arc<Shared>>, r: &'static Resource) -> Route
     router
         .route(
             r.path,
-            get(move |s: State<Arc<Shared>>, q: RawQuery| list(r, s, q)),
+            get(
+                move |s: State<Arc<Shared>>, sc: Extension<RequestScope>, q: RawQuery| {
+                    list(r, s, sc, q)
+                },
+            ),
         )
         .route(
             &format!("{}/{{id}}", r.path),
-            get(move |s: State<Arc<Shared>>, id: Path<String>, q: RawQuery| retrieve(r, s, id, q)),
+            get(
+                move |s: State<Arc<Shared>>,
+                      sc: Extension<RequestScope>,
+                      id: Path<String>,
+                      q: RawQuery| retrieve(r, s, sc, id, q),
+            ),
         )
 }
 
@@ -210,6 +234,7 @@ pub(crate) fn routes(router: Router<Arc<Shared>>, r: &'static Resource) -> Route
 async fn list(
     r: &'static Resource,
     State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let p = parse_list_params(decode(query), r.filters, &["expand"])?;
@@ -228,23 +253,24 @@ async fn list(
         None
     };
     let mut sim = shared.lock();
+    ensure_connected(&sim.engine, &scope)?;
     // A write during pagination runs before the view is taken, so this page sees it.
     if (p.starting_after.is_some() || p.ending_before.is_some()) && sim.api.pagination_write() {
         let Sim {
             engine, generators, ..
         } = &mut *sim;
-        let scope = engine.scope().clone();
         generators.pagination_write(&scope, r.t, engine);
     }
     let at = stale_at(&mut sim);
     let view = View {
         engine: &sim.engine,
         at,
+        scope,
     };
     // A required filter is always a parent field, so its children index serves it.
     let all = match r.required {
-        Some(name) => view.engine.store().children(r.t, name, &p.extra[name]),
-        None => ordered(view.engine, r),
+        Some(name) => view.store().children(r.t, name, &p.extra[name]),
+        None => ordered(&view, r),
     };
     let (page, has_more) = paginate(
         &all,
@@ -271,7 +297,7 @@ async fn list(
 }
 
 /// Draws whether this object read is stale, and if so the time it shows.
-fn stale_at(sim: &mut Sim) -> Option<SimTime> {
+pub(crate) fn stale_at(sim: &mut Sim) -> Option<SimTime> {
     let lag = sim.api.stale_lag()?;
     Some(sim.engine.now().plus_ms(-lag))
 }
@@ -300,6 +326,7 @@ fn no_such(t: ObjectType, id: &str) -> ApiError {
 async fn retrieve(
     r: &'static Resource,
     State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
     Path(id): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
@@ -319,6 +346,7 @@ async fn retrieve(
     let view = View {
         engine: &sim.engine,
         at,
+        scope,
     };
     let mut obj = view.visible(r.t, &id).ok_or_else(|| no_such(r.t, &id))?;
     expand(&view, r.t, &mut obj, &paths)?;
@@ -328,6 +356,7 @@ async fn retrieve(
 /// `GET /v1/invoices/{id}/lines`.
 pub(crate) async fn invoice_lines(
     State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
     Path(id): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
@@ -337,12 +366,12 @@ pub(crate) async fn invoice_lines(
     let view = View {
         engine: &sim.engine,
         at,
+        scope,
     };
     if view.visible(ObjectType::Invoice, &id).is_none() {
         return Err(no_such(ObjectType::Invoice, &id));
     }
     let lines = view
-        .engine
         .store()
         .children(ObjectType::InvoiceLineItem, "invoice", &id);
     let (page, has_more) = paginate(&lines, |o| view.listed(o).is_some(), &p)?;

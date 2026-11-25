@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Path, RawQuery, State};
+use axum::{Extension, Json};
 use serde_json::{Value, json};
 
-use crate::api::ApiError;
 use crate::api::list::decode;
 use crate::api::list::{paginate, parse_list_params};
+use crate::api::{ApiError, RequestScope};
 use crate::engine::Engine;
 use crate::engine::events::{EventFormat, EventRecord};
 use crate::handle::Shared;
@@ -38,6 +38,7 @@ fn missing_cursor(param: &str, id: &str) -> ApiError {
 
 pub(crate) async fn list(
     State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let p = parse_list_params(decode(query), &["type", "delivery_success"], &["types"])?;
@@ -79,7 +80,9 @@ pub(crate) async fn list(
     ] {
         if let Some(id) = cursor {
             let listed = store.get(id).is_some_and(|r| {
-                r.format == EventFormat::Snapshot && store.is_listed(r, now, retention)
+                r.format == EventFormat::Snapshot
+                    && r.account == scope
+                    && store.is_listed(r, now, retention)
             });
             if !listed {
                 return Err(missing_cursor(param, id));
@@ -90,7 +93,8 @@ pub(crate) async fn list(
     let (page, has_more) = paginate(
         &ordered,
         |r| {
-            store.is_listed(r, now, retention)
+            r.account == scope
+                && store.is_listed(r, now, retention)
                 && p.created.matches(r.created.unix_seconds())
                 && single
                     .as_deref()
@@ -113,6 +117,7 @@ pub(crate) async fn list(
 
 pub(crate) async fn retrieve(
     State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let sim = shared.lock();
@@ -121,6 +126,7 @@ pub(crate) async fn retrieve(
     match store.get(&id) {
         Some(r)
             if r.format == EventFormat::Snapshot
+                && r.account == scope
                 && store.is_listed(r, engine.now(), engine.retention_ms()) =>
         {
             Ok(Json(served(engine, r)))

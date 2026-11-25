@@ -25,6 +25,27 @@ pub async fn get(m: &MockStripe, path: &str) -> reqwest::Response {
         .expect("request sent")
 }
 
+/// `GET path` with extra request headers.
+pub async fn get_with(m: &MockStripe, path: &str, headers: &[(&str, &str)]) -> reqwest::Response {
+    let mut req = reqwest::Client::new()
+        .get(format!("{}{path}", m.api_url()))
+        .bearer_auth("sk_test_mock");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    req.send().await.expect("request sent")
+}
+
+/// `GET path` scoped to a connected account with `Stripe-Account`.
+pub async fn get_as(m: &MockStripe, path: &str, acct: &str) -> reqwest::Response {
+    get_with(m, path, &[("Stripe-Account", acct)]).await
+}
+
+/// `GET path` scoped to a connected account with `Stripe-Context`.
+pub async fn get_ctx(m: &MockStripe, path: &str, acct: &str) -> reqwest::Response {
+    get_with(m, path, &[("Stripe-Context", acct)]).await
+}
+
 /// One `[[destinations]]` block with `secret = "whsec_test"`.
 pub fn dest(url: &str, payload: &str, events: &str) -> String {
     format!(

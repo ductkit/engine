@@ -56,7 +56,7 @@ fn lookup(view: &View, id: &str) -> Option<Value> {
     let t = ObjectType::ALL
         .into_iter()
         .find(|t| t.id_prefix() == prefix)?;
-    let u = view.state(view.engine.store().get(t, id)?)?;
+    let u = view.state(view.store().get(t, id)?)?;
     if u.kind == ChangeKind::Deleted && t != ObjectType::Customer {
         return Some(Value::Null);
     }

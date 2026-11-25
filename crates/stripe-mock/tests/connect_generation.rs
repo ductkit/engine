@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Receiver, dest, get, mock_with};
+use common::{Receiver, dest, get_as, get_ctx, mock_with};
 use ductkit_stripe_mock::{
     AccountApi, Action, ChangeKind, CustomerUpdate, DeliveryRecordKind, EventFormat, EventInfo,
     MockError, MockStripe, NewCustomer, ObjectType, SimTime,
@@ -26,9 +26,8 @@ fn types(events: &[EventInfo], format: EventFormat) -> Vec<&str> {
         .collect()
 }
 
-async fn payload(m: &MockStripe, path: &str) -> Value {
-    let r = get(m, path).await;
-    assert_eq!(r.status(), 200, "{path}");
+async fn payload(r: reqwest::Response) -> Value {
+    assert_eq!(r.status(), 200);
     r.json().await.unwrap()
 }
 
@@ -51,11 +50,11 @@ async fn connect_v1_emits_authorized() {
         .iter()
         .find(|e| e.format == EventFormat::Snapshot)
         .unwrap();
-    let body = payload(&m, &format!("/v1/events/{}", snap.id)).await;
+    let body = payload(get_as(&m, &format!("/v1/events/{}", snap.id), &id).await).await;
     assert_eq!(body["data"]["object"]["object"], "application");
     assert_eq!(body["account"], id.as_str());
     let thin = evs.iter().find(|e| e.format == EventFormat::Thin).unwrap();
-    let body = payload(&m, &format!("/v2/core/events/{}", thin.id)).await;
+    let body = payload(get_ctx(&m, &format!("/v2/core/events/{}", thin.id), &id).await).await;
     assert_eq!(body["related_object"]["id"], id.as_str());
     assert_eq!(body["related_object"]["type"], "account");
     assert_eq!(body["context"], id.as_str());
@@ -127,8 +126,9 @@ async fn disconnect_emits_deauthorized_and_closed() {
         .find(|e| e.event_type == "account.application.deauthorized")
         .unwrap();
     assert_eq!(deauth.account.as_deref(), Some(&*v2));
-    let body = payload(&m, &format!("/v1/events/{}", deauth.id)).await;
-    assert_eq!(body["data"]["object"]["object"], "application");
+    // The account is disconnected, so its events are no longer reachable.
+    let r = get_as(&m, &format!("/v1/events/{}", deauth.id), &v2).await;
+    assert_eq!(r.status(), 403);
     for a in m.accounts() {
         assert!(!a.connected, "{a:?}");
     }

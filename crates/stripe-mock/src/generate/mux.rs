@@ -192,14 +192,17 @@ impl Generators {
         }
     }
 
-    /// A write during pagination of a `t` list in `scope`. The platform's Accounts
-    /// list gets an account update; an unknown scope does nothing.
+    /// A write during pagination of a `t` list in `scope`, a no-op while generation is
+    /// off. The platform's Accounts list gets an account update. The request gate only
+    /// lets connected scopes through, so an unknown one is a bug.
     pub(crate) fn pagination_write(&mut self, scope: &Scope, t: ObjectType, engine: &mut Engine) {
         match scope {
             None if t == ObjectType::Account => self.accounts.pagination_update(engine),
             None => self.platform.pagination_write(engine, t),
             Some(id) => {
-                if let Ok(g) = self.connected_mut(id) {
+                let g = self.connected_mut(id).ok();
+                debug_assert!(g.is_some(), "pagination write in unconnected scope {id}");
+                if let Some(g) = g {
                     engine.in_scope(scope.clone(), |e| g.pagination_write(e, t));
                 }
             }

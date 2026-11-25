@@ -1,5 +1,6 @@
 //! Read-only Stripe-compatible HTTP API (spec section 7).
 
+mod accounts;
 mod destinations;
 mod events_v1;
 mod events_v2;
@@ -20,6 +21,7 @@ use axum::routing::get;
 use serde_json::{Map, Value, json};
 
 use crate::PINNED_API_VERSION;
+use crate::engine::{Engine, Scope};
 use crate::faults::api::Fault;
 use crate::handle::Shared;
 
@@ -62,6 +64,19 @@ impl ApiError {
         }
     }
 
+    /// The scope header names an account that is unknown or no longer connected.
+    pub(crate) fn account_invalid(acct: &str) -> Self {
+        ApiError {
+            status: StatusCode::FORBIDDEN,
+            error_type: "invalid_request_error",
+            message: format!(
+                "The provided key does not have access to account '{acct}' (or that account does not exist). Application access may have been revoked."
+            ),
+            code: Some("account_invalid"),
+            param: None,
+        }
+    }
+
     fn unauthorized() -> Self {
         ApiError {
             status: StatusCode::UNAUTHORIZED,
@@ -92,6 +107,10 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The account a request acts in, resolved by the gate: `None` is the platform.
+#[derive(Debug, Clone)]
+pub(crate) struct RequestScope(pub Scope);
+
 /// The router with every route and the request gate.
 pub(crate) fn router(shared: Arc<Shared>) -> Router {
     let mut router = Router::new();
@@ -102,11 +121,14 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         &resources::SUBSCRIPTIONS,
         &resources::SUBSCRIPTION_ITEMS,
         &resources::INVOICES,
+        &resources::ACCOUNTS,
     ] {
         router = resources::routes(router, r);
     }
     router
         .route("/v1/invoices/{id}/lines", get(resources::invoice_lines))
+        .route("/v2/core/accounts", get(accounts::list_v2))
+        .route("/v2/core/accounts/{id}", get(accounts::retrieve_v2))
         .route("/v1/events", get(events_v1::list))
         .route("/v1/events/{id}", get(events_v1::retrieve))
         .route("/v1/webhook_endpoints", get(destinations::list_v1))
@@ -128,16 +150,17 @@ async fn fallback(req: Request) -> ApiError {
 
 /// Checks that apply to every request, in spec order, then the injected faults
 /// (rate limit, error, latency) for requests that pass, and sets `Request-Id`.
-async fn gate(State(shared): State<Arc<Shared>>, req: Request, next: Next) -> Response {
+async fn gate(State(shared): State<Arc<Shared>>, mut req: Request, next: Next) -> Response {
     let (request_id, decision) = {
         let mut sim = shared.lock();
         let request_id = sim.api_rng.id("req");
-        let decision = check(&sim.api.config().keys, &req).map(|()| sim.api.decide(Instant::now()));
+        let decision = check(&sim.api.config().keys, &shared, &sim.engine, &req)
+            .map(|scope| (scope, sim.api.decide(Instant::now())));
         (request_id, decision)
     };
     let mut response = match decision {
         Err(e) => e.into_response(),
-        Ok((Some(Fault::Timeout), _)) => {
+        Ok((_, (Some(Fault::Timeout), _))) => {
             // Hold before any response exists, so no status line is ever sent;
             // then abort the connection like a reset.
             let mut shutdown = shared.shutdown.subscribe();
@@ -147,11 +170,12 @@ async fn gate(State(shared): State<Arc<Shared>>, req: Request, next: Next) -> Re
             }
             fault_response(Fault::Reset)
         }
-        Ok((Some(fault), _)) => fault_response(fault),
-        Ok((None, latency_ms)) => {
+        Ok((_, (Some(fault), _))) => fault_response(fault),
+        Ok((scope, (None, latency_ms))) => {
             if latency_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(latency_ms)).await;
             }
+            req.extensions_mut().insert(RequestScope(scope));
             next.run(req).await
         }
     };
@@ -213,7 +237,14 @@ fn fault_response(fault: Fault) -> Response {
     }
 }
 
-fn check(keys: &[String], req: &Request) -> Result<(), ApiError> {
+/// The request's checks, in spec order: auth, version, scope, method. Returns the
+/// scope the request acts in.
+fn check(
+    keys: &[String],
+    shared: &Shared,
+    engine: &Engine,
+    req: &Request,
+) -> Result<Scope, ApiError> {
     let headers = req.headers();
     let key = headers
         .get(header::AUTHORIZATION)
@@ -235,13 +266,7 @@ fn check(keys: &[String], req: &Request) -> Result<(), ApiError> {
             None,
         ));
     }
-    if headers.contains_key("stripe-account") {
-        return Err(ApiError::bad_request(
-            "Connected accounts are not enabled in this mock.",
-            None,
-            None,
-        ));
-    }
+    let scope = resolve_scope(shared.config.accounts.connect, engine, req)?;
     if req.method() != Method::GET {
         return Err(ApiError::bad_request(
             format!(
@@ -253,5 +278,75 @@ fn check(keys: &[String], req: &Request) -> Result<(), ApiError> {
             None,
         ));
     }
-    Ok(())
+    Ok(scope)
+}
+
+/// Whether `path` is `base` or below it.
+fn is_under(path: &str, base: &str) -> bool {
+    path.strip_prefix(base)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// The scope headers: `Stripe-Account` or `Stripe-Context` select a connected
+/// account that is connected right now (spec section 5.4).
+fn resolve_scope(connect: bool, engine: &Engine, req: &Request) -> Result<Scope, ApiError> {
+    let headers = req.headers();
+    if !connect
+        && (headers.contains_key("stripe-account") || headers.contains_key("stripe-context"))
+    {
+        return Err(ApiError::bad_request(
+            "Connected accounts are not enabled in this mock.",
+            None,
+            None,
+        ));
+    }
+    let value = |name: &str| {
+        headers
+            .get(name)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+            .filter(|v| !v.is_empty())
+    };
+    let (account, context) = (value("stripe-account"), value("stripe-context"));
+    if let (Some(a), Some(c)) = (&account, &context)
+        && a != c
+    {
+        return Err(ApiError::bad_request(
+            "Stripe-Account and Stripe-Context name different accounts.",
+            None,
+            None,
+        ));
+    }
+    let path = req.uri().path();
+    if account.is_some() && path.starts_with("/v2/") {
+        return Err(ApiError::bad_request(
+            "Use the Stripe-Context header with v2 endpoints.",
+            None,
+            None,
+        ));
+    }
+    let Some(id) = account.or(context) else {
+        return Ok(None);
+    };
+    if !engine.account_meta(&id).is_some_and(|m| m.connected) {
+        return Err(ApiError::account_invalid(&id));
+    }
+    if is_under(path, "/v1/accounts") || is_under(path, "/v2/core/accounts") {
+        return Err(ApiError::bad_request(
+            "Accounts endpoints must be called by the platform.",
+            None,
+            None,
+        ));
+    }
+    Ok(Some(id))
+}
+
+/// Re-checks, under the lock a handler holds, that `scope` is still connected: a
+/// disconnect can land between the gate and the handler.
+pub(crate) fn ensure_connected(engine: &Engine, scope: &Scope) -> Result<(), ApiError> {
+    match scope {
+        Some(id) if !engine.account_meta(id).is_some_and(|m| m.connected) => {
+            Err(ApiError::account_invalid(id))
+        }
+        _ => Ok(()),
+    }
 }

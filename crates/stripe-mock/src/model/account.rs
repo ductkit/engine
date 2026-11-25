@@ -133,7 +133,6 @@ pub(crate) fn apply_content(state: &mut Value, c: &AccountContent) {
 }
 
 /// The `/v2/core/accounts` view of an account's v1 `state`.
-#[allow(dead_code)] // served by the /v2 account endpoints (Task 4)
 pub(crate) fn v2_view(state: &Value, meta: &AccountMeta, closed: bool) -> Value {
     let mut applied: Vec<Configuration> = meta.configurations.clone();
     applied.sort();

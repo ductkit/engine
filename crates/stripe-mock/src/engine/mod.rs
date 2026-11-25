@@ -456,8 +456,20 @@ impl Engine {
     }
 
     /// The object's latest version with `at <= at`; `None` if it did not exist yet.
+    #[cfg(test)]
     pub(crate) fn as_of(&self, t: ObjectType, id: &str, at: SimTime) -> Option<&StateUpdate> {
-        self.store()
+        self.as_of_in(&self.scope, t, id, at)
+    }
+
+    /// Like [`as_of`](Self::as_of), reading the object in `scope`.
+    pub(crate) fn as_of_in(
+        &self,
+        scope: &Scope,
+        t: ObjectType,
+        id: &str,
+        at: SimTime,
+    ) -> Option<&StateUpdate> {
+        self.store_in(scope)?
             .get(t, id)?
             .versions
             .iter()
@@ -476,8 +488,13 @@ impl Engine {
 
     /// The current scope's store (an empty one if the scope has no objects yet).
     pub(crate) fn store(&self) -> &ObjectStore {
+        self.scope_store(&self.scope)
+    }
+
+    /// `scope`'s store, or an empty one if it has no objects yet.
+    pub(crate) fn scope_store(&self, scope: &Scope) -> &ObjectStore {
         static EMPTY: OnceLock<ObjectStore> = OnceLock::new();
-        self.store_in(&self.scope)
+        self.store_in(scope)
             .unwrap_or_else(|| EMPTY.get_or_init(ObjectStore::default))
     }
 
@@ -489,6 +506,7 @@ impl Engine {
         self.stores.entry(self.scope.clone()).or_default()
     }
 
+    #[cfg(test)]
     pub(crate) fn scope(&self) -> &Scope {
         &self.scope
     }

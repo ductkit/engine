@@ -2,16 +2,17 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
+use axum::{Extension, Json};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::SimTime;
-use crate::api::ApiError;
 use crate::api::events_v1::type_matches;
 use crate::api::list::decode;
+use crate::api::{ApiError, RequestScope};
 use crate::engine::events::{EventFormat, EventRecord};
 use crate::handle::Shared;
 
@@ -33,6 +34,39 @@ struct Created {
     gte: Option<String>,
     lt: Option<String>,
     lte: Option<String>,
+}
+
+/// The opaque `page` token for a v2 list: the query and cursor, hex-encoded JSON.
+pub(crate) fn encode_token<Q: Serialize>(q: &Q) -> String {
+    hex::encode(serde_json::to_vec(q).expect("token serializes"))
+}
+
+pub(crate) fn decode_token<Q: DeserializeOwned>(token: &str) -> Result<Q, ApiError> {
+    hex::decode(token)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Q>(&b).ok())
+        .ok_or_else(|| bad("Invalid page token.", "parameter_invalid", "page"))
+}
+
+/// The slice of `ids` one v2 page covers, from its direction and cursor. `None`
+/// when the cursor is not among `ids`.
+pub(crate) fn window(
+    ids: &[&str],
+    limit: usize,
+    dir: Option<&str>,
+    cursor: Option<&str>,
+) -> Option<(usize, usize)> {
+    Some(match (dir, cursor) {
+        (Some(dir), Some(cursor)) => {
+            let pos = ids.iter().position(|id| *id == cursor)?;
+            if dir == "before" {
+                (pos.saturating_sub(limit), pos)
+            } else {
+                (pos + 1, (pos + 1 + limit).min(ids.len()))
+            }
+        }
+        _ => (0, limit.min(ids.len())),
+    })
 }
 
 fn bad(message: impl Into<String>, code: &'static str, param: &str) -> ApiError {
@@ -60,10 +94,7 @@ fn parse_query(pairs: Vec<(String, String)>) -> Result<Query, ApiError> {
                 Some("page"),
             ));
         }
-        return hex::decode(token)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Query>(&b).ok())
-            .ok_or_else(|| bad("Invalid page token.", "parameter_invalid", "page"));
+        return decode_token(token);
     }
     let mut q = Query {
         limit: 10,
@@ -137,12 +168,12 @@ fn page_url(q: &Query, dir: &str, cursor: &str) -> String {
         cursor: Some(cursor.to_string()),
         ..q.clone()
     };
-    let bytes = serde_json::to_vec(&token).expect("token serializes");
-    format!("/v2/core/events?page={}", hex::encode(bytes))
+    format!("/v2/core/events?page={}", encode_token(&token))
 }
 
 pub(crate) async fn list(
     State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let q = parse_query(decode(query))?;
@@ -153,28 +184,18 @@ pub(crate) async fn list(
     let filtered: Vec<&EventRecord> = store
         .list_order(EventFormat::Thin)
         .into_iter()
-        .filter(|r| store.is_listed(r, now, retention) && matches(&q, r))
+        .filter(|r| r.account == scope && store.is_listed(r, now, retention) && matches(&q, r))
         .collect();
-    let (start, end) = match (q.dir.as_deref(), q.cursor.as_deref()) {
-        (Some(dir), Some(cursor)) => {
-            let pos = filtered
-                .iter()
-                .position(|r| r.id == cursor)
-                .ok_or_else(|| {
-                    bad(
-                        format!("No such event: '{cursor}'"),
-                        "resource_missing",
-                        "page",
-                    )
-                })?;
-            if dir == "before" {
-                (pos.saturating_sub(q.limit), pos)
-            } else {
-                (pos + 1, (pos + 1 + q.limit).min(filtered.len()))
-            }
-        }
-        _ => (0, q.limit.min(filtered.len())),
-    };
+    let ids: Vec<&str> = filtered.iter().map(|r| r.id.as_str()).collect();
+    let (start, end) =
+        window(&ids, q.limit, q.dir.as_deref(), q.cursor.as_deref()).ok_or_else(|| {
+            let cursor = q.cursor.as_deref().unwrap_or_default();
+            bad(
+                format!("No such event: '{cursor}'"),
+                "resource_missing",
+                "page",
+            )
+        })?;
     let page = &filtered[start..end];
     let next = (end < filtered.len())
         .then(|| page.last().map(|r| page_url(&q, "after", &r.id)))
@@ -192,6 +213,7 @@ pub(crate) async fn list(
 
 pub(crate) async fn retrieve(
     State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let sim = shared.lock();
@@ -200,6 +222,7 @@ pub(crate) async fn retrieve(
     match store.get(&id) {
         Some(r)
             if r.format == EventFormat::Thin
+                && r.account == scope
                 && store.is_listed(r, engine.now(), engine.retention_ms()) =>
         {
             Ok(Json(r.payload.clone()))
