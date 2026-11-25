@@ -8,7 +8,7 @@ use ductkit_stripe_mock::{
     SubscriptionItem,
 };
 use futures_util::StreamExt;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 async fn next(s: &mut Subscription) -> Option<SubscriptionItem> {
     tokio::time::timeout(Duration::from_secs(5), s.next())

@@ -216,6 +216,7 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // private helper; every field is part of the entry
     fn record(
         &mut self,
         t: ObjectType,
