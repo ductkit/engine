@@ -4,6 +4,9 @@ pub enum MockError {
     /// The configuration is invalid or uses something not implemented yet.
     #[error("invalid config: {0}")]
     Config(String),
+    /// The operation needs the other clock mode.
+    #[error("{0}")]
+    ClockMode(String),
     /// Asked to move simulated time backwards.
     #[error("cannot move time back to {requested}; current time is {now}")]
     TimeTravel {

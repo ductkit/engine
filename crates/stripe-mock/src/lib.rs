@@ -3,13 +3,11 @@
 //! See `docs/stripe-mock-spec.md` in the repository.
 
 mod config;
-#[allow(dead_code)]
 mod engine;
 mod error;
-#[allow(dead_code)]
+mod generate;
+mod handle;
 mod model;
-// Used from Task 5 on; remove this allow once the generator uses every helper.
-#[allow(dead_code)]
 mod rng;
 mod time;
 
@@ -19,6 +17,7 @@ pub use config::{
 };
 pub use engine::{Cause, ChangeKind, EventRefs, StateUpdate};
 pub use error::MockError;
+pub use handle::MockStripe;
 pub use model::ObjectType;
 pub use model::customer::{CustomerUpdate, NewCustomer};
 pub use time::SimTime;

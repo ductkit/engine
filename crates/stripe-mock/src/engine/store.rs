@@ -6,6 +6,8 @@ use crate::ObjectType;
 use crate::engine::{ChangeKind, StateUpdate};
 
 /// One object's latest state and list position.
+// `created`/`creation_index` are read by the list API (Task 8).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct StoredObject {
     pub latest: StateUpdate,
@@ -35,6 +37,7 @@ impl ObjectStore {
 
     /// Every object of `t` (deleted included), newest `created` first,
     /// ties broken by later creation first.
+    #[allow(dead_code)] // used by the list API (Task 8)
     pub(crate) fn list_order(&self, t: ObjectType) -> Vec<&StoredObject> {
         let mut all = self.in_creation_order(t);
         all.sort_by(|a, b| {
