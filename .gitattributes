@@ -1,0 +1,2 @@
+crates/stripe-mock/openapi/spec3.json -diff linguist-generated eol=lf
+crates/stripe-mock/src/stripe/generated/** linguist-generated eol=lf
