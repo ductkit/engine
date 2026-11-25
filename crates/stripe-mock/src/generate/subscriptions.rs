@@ -3,6 +3,7 @@
 
 use serde_json::{Value, json};
 
+use crate::engine::store::StoredObject;
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::generate::billing::{
     attempt_payment, create_draft_invoice, delete_draft, finalize, mark_uncollectible,
@@ -46,9 +47,9 @@ pub(crate) fn update_sub(
 pub(crate) fn items(engine: &Engine, sub: &str) -> Vec<Value> {
     engine
         .store()
-        .in_creation_order(ObjectType::SubscriptionItem)
+        .children(ObjectType::SubscriptionItem, "subscription", sub)
         .into_iter()
-        .filter(|o| !o.deleted && o.latest.state["subscription"] == json!(sub))
+        .filter(|o| !o.deleted)
         .map(|o| o.latest.state.clone())
         .collect()
 }
@@ -348,7 +349,8 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
                 .latest(ObjectType::Subscription, &sub)
                 .expect("sub")
                 .state["cancel_at_period_end"]
-                == json!(true);
+                .as_bool()
+                == Some(true);
             if cancel {
                 set_status(engine, &sub, "canceled", &cause);
                 return;
@@ -517,17 +519,16 @@ pub(crate) fn cancel_subscription(
             id
         }
         None => {
-            let live: Vec<String> = engine
+            let live: Vec<&String> = engine
                 .store()
-                .in_creation_order(ObjectType::Subscription)
-                .into_iter()
-                .map(|o| o.latest.object_id.clone())
+                .live_ids(ObjectType::Subscription)
+                .iter()
                 .filter(|id| renewable(engine, id))
                 .collect();
             if live.is_empty() {
                 return Ok(None);
             }
-            pick(rng, &live).clone()
+            (*pick(rng, &live)).clone()
         }
     };
     let at_period_end = at_period_end.unwrap_or_else(|| rng.below(2) == 0);
@@ -577,9 +578,8 @@ pub(crate) fn delete_customer_cascade(
     }
     let subs: Vec<String> = engine
         .store()
-        .in_creation_order(ObjectType::Subscription)
+        .children(ObjectType::Subscription, "customer", id)
         .into_iter()
-        .filter(|o| o.latest.state["customer"] == json!(id))
         .map(|o| o.latest.object_id.clone())
         .collect();
     for sub in subs {
@@ -593,9 +593,9 @@ pub(crate) fn delete_customer_cascade(
     // finalizes or pays an invoice of the deleted customer.
     let unsettled: Vec<(String, bool)> = engine
         .store()
-        .in_creation_order(ObjectType::Invoice)
+        .children(ObjectType::Invoice, "customer", id)
         .into_iter()
-        .filter(|o| !o.deleted && o.latest.state["customer"].as_str() == Some(id))
+        .filter(|o| !o.deleted)
         .filter_map(|o| match o.latest.state["status"].as_str() {
             Some("draft") => Some((o.latest.object_id.clone(), true)),
             Some("open") => Some((o.latest.object_id.clone(), false)),
@@ -621,7 +621,7 @@ pub(crate) fn delete_customer_cascade(
 
 /// `churn.subscription.update`: a metadata change on a random subscription that has not ended.
 pub(crate) fn churn_update(rng: &mut SimRng, engine: &mut Engine) {
-    let live: Vec<String> = engine
+    let live: Vec<&StoredObject> = engine
         .store()
         .in_creation_order(ObjectType::Subscription)
         .into_iter()
@@ -631,12 +631,11 @@ pub(crate) fn churn_update(rng: &mut SimRng, engine: &mut Engine) {
                 Some("canceled" | "incomplete_expired")
             )
         })
-        .map(|o| o.latest.object_id.clone())
         .collect();
     if live.is_empty() {
         return;
     }
-    let sub = pick(rng, &live).clone();
+    let sub = pick(rng, &live).latest.object_id.clone();
     let value = random_metadata_value(rng);
     let cause = engine.begin_action("subscription_update");
     update_sub(

@@ -344,10 +344,10 @@ impl Generator {
                 .collect();
             let subs: Vec<String> = engine
                 .store()
-                .in_creation_order(ObjectType::Subscription)
-                .into_iter()
-                .map(|o| o.latest.object_id.clone())
+                .live_ids(ObjectType::Subscription)
+                .iter()
                 .filter(|id| subscriptions::renewable(engine, id) && !queued.contains(id))
+                .cloned()
                 .collect();
             if !subs.is_empty() {
                 let cause = engine.begin_action("control.resume_renewals");
@@ -582,5 +582,5 @@ fn pick_live(rng: &mut SimRng, engine: &Engine) -> Option<String> {
     if live.is_empty() {
         return None;
     }
-    Some(live[rng.below(live.len() as u64) as usize].to_string())
+    Some(live[rng.below(live.len() as u64) as usize].clone())
 }

@@ -255,9 +255,9 @@ pub(crate) fn delete_draft(engine: &mut Engine, id: &str, cause: &Cause) -> bool
     }
     let line_ids: Vec<String> = engine
         .store()
-        .in_creation_order(ObjectType::InvoiceLineItem)
+        .children(ObjectType::InvoiceLineItem, "invoice", id)
         .into_iter()
-        .filter(|o| !o.deleted && o.latest.state["invoice"] == json!(id))
+        .filter(|o| !o.deleted)
         .map(|o| o.latest.object_id.clone())
         .collect();
     for line in line_ids {
@@ -314,16 +314,11 @@ pub(crate) fn resolve_customer(
             Some(_) => Ok(id),
         };
     }
-    let live: Vec<String> = engine
-        .store()
-        .live_ids(ObjectType::Customer)
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let live = engine.store().live_ids(ObjectType::Customer);
     if live.is_empty() {
         return Ok(create_random_customer(rng, engine, cause));
     }
-    Ok(pick(rng, &live).clone())
+    Ok(pick(rng, live).clone())
 }
 
 /// `one_off_invoice`: a manual invoice for one customer, walked to `outcome`
@@ -434,16 +429,11 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
 
 /// `churn.invoice.update`: a metadata change on a random live invoice.
 pub(crate) fn churn_update(rng: &mut SimRng, engine: &mut Engine) {
-    let ids: Vec<String> = engine
-        .store()
-        .live_ids(ObjectType::Invoice)
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let ids = engine.store().live_ids(ObjectType::Invoice);
     if ids.is_empty() {
         return;
     }
-    let id = pick(rng, &ids).clone();
+    let id = pick(rng, ids).clone();
     let value = crate::model::customer::random_metadata_value(rng);
     let cause = engine.begin_action("invoice_update");
     engine

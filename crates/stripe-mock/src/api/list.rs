@@ -161,17 +161,101 @@ pub(crate) fn paginate<'a, T: Cursorable>(
                 )
             })
     };
-    let keep =
-        |slice: &[&'a T]| -> Vec<&'a T> { slice.iter().copied().filter(|o| include(o)).collect() };
-    if let Some(id) = &p.ending_before {
-        let candidates = keep(&ordered[..position("ending_before", id)?]);
-        let start = candidates.len().saturating_sub(p.limit);
-        return Ok((candidates[start..].to_vec(), start > 0));
-    }
-    let candidates = match &p.starting_after {
-        Some(id) => keep(&ordered[position("starting_after", id)? + 1..]),
-        None => keep(ordered),
+    // Evaluate `include` only until the page and one more match are found.
+    let take = |items: &mut dyn Iterator<Item = &&'a T>| {
+        let mut page: Vec<&'a T> = Vec::new();
+        for o in items {
+            if include(o) {
+                if page.len() == p.limit {
+                    return (page, true);
+                }
+                page.push(*o);
+            }
+        }
+        (page, false)
     };
-    let has_more = candidates.len() > p.limit;
-    Ok((candidates.into_iter().take(p.limit).collect(), has_more))
+    if let Some(id) = &p.ending_before {
+        let end = position("ending_before", id)?;
+        let (mut page, has_more) = take(&mut ordered[..end].iter().rev());
+        page.reverse();
+        return Ok((page, has_more));
+    }
+    let from = match &p.starting_after {
+        Some(id) => position("starting_after", id)? + 1,
+        None => 0,
+    };
+    Ok(take(&mut ordered[from..].iter()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Item(String, usize);
+
+    impl Cursorable for Item {
+        fn cursor_id(&self) -> &str {
+            &self.0
+        }
+    }
+
+    /// The pre-phase-4 algorithm: filter everything, then cut.
+    fn reference<'a>(
+        ordered: &[&'a Item],
+        include: impl Fn(&Item) -> bool,
+        p: &ListParams,
+    ) -> (Vec<&'a Item>, bool) {
+        let pos = |id: &str| ordered.iter().position(|o| o.0 == id).unwrap();
+        let keep = |s: &[&'a Item]| -> Vec<&'a Item> {
+            s.iter().copied().filter(|o| include(o)).collect()
+        };
+        if let Some(id) = &p.ending_before {
+            let c = keep(&ordered[..pos(id)]);
+            let start = c.len().saturating_sub(p.limit);
+            return (c[start..].to_vec(), start > 0);
+        }
+        let c = match &p.starting_after {
+            Some(id) => keep(&ordered[pos(id) + 1..]),
+            None => keep(ordered),
+        };
+        let has_more = c.len() > p.limit;
+        (c.into_iter().take(p.limit).collect(), has_more)
+    }
+
+    fn params(limit: usize, after: Option<String>, before: Option<String>) -> ListParams {
+        ListParams {
+            limit,
+            starting_after: after,
+            ending_before: before,
+            created: CreatedFilter::default(),
+            extra: BTreeMap::new(),
+            extra_multi: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn paginate_matches_full_filter() {
+        let items: Vec<Item> = (0..30).map(|i| Item(format!("o_{i}"), i)).collect();
+        let ordered: Vec<&Item> = items.iter().collect();
+        let include = |o: &Item| o.1.is_multiple_of(3);
+        let names = |v: &[&Item]| v.iter().map(|o| o.0.clone()).collect::<Vec<_>>();
+        for limit in 1..=12 {
+            let mut cases = vec![params(limit, None, None)];
+            for o in &items {
+                cases.push(params(limit, Some(o.0.clone()), None));
+                cases.push(params(limit, None, Some(o.0.clone())));
+            }
+            for p in cases {
+                let (got, more) = paginate(&ordered, include, &p).unwrap();
+                let (want, want_more) = reference(&ordered, include, &p);
+                assert_eq!(
+                    (names(&got), more),
+                    (names(&want), want_more),
+                    "{limit} {:?} {:?}",
+                    p.starting_after,
+                    p.ending_before
+                );
+            }
+        }
+    }
 }

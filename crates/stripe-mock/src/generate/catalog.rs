@@ -102,13 +102,13 @@ pub(crate) fn active_ids(engine: &Engine, t: ObjectType) -> Vec<String> {
     engine
         .store()
         .live_ids(t)
-        .into_iter()
+        .iter()
         .filter(|id| {
             engine
                 .latest(t, id)
-                .is_some_and(|u| u.state["active"] == json!(true))
+                .is_some_and(|u| u.state["active"].as_bool() == Some(true))
         })
-        .map(str::to_string)
+        .cloned()
         .collect()
 }
 
@@ -208,16 +208,11 @@ pub(crate) fn archive_by_id(engine: &mut Engine, id: &str) -> Result<Cause, Mock
 
 /// `churn.product.update` / `churn.price.update`: one random change to a random live object.
 pub(crate) fn churn_update(rng: &mut SimRng, engine: &mut Engine, t: ObjectType) {
-    let ids: Vec<String> = engine
-        .store()
-        .live_ids(t)
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let ids = engine.store().live_ids(t);
     if ids.is_empty() {
         return;
     }
-    let id = pick(rng, &ids).to_string();
+    let id = pick(rng, ids).clone();
     let now = engine.now().unix_seconds();
     let (action, event) = if t == ObjectType::Product {
         ("product_update", "product.updated")

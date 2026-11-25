@@ -567,7 +567,8 @@ mod tests {
     fn list_order_breaks_ties_by_creation() {
         let mut e = test_engine();
         let c = e.begin_action("t");
-        for (id, t) in [("cus_1", 5), ("cus_2", 5), ("cus_3", 4)] {
+        // `created` never decreases in creation order (it is always "now").
+        for (id, t) in [("cus_1", 5), ("cus_2", 5), ("cus_3", 6)] {
             e.create(
                 ObjectType::Customer,
                 id.into(),
@@ -582,7 +583,7 @@ mod tests {
             .iter()
             .map(|o| o.latest.object_id.clone())
             .collect();
-        assert_eq!(ids, ["cus_2", "cus_1", "cus_3"]);
+        assert_eq!(ids, ["cus_3", "cus_2", "cus_1"]);
     }
 
     #[test]
