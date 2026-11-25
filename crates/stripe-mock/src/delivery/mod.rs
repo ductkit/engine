@@ -1,9 +1,16 @@
 //! Delivery targets and webhook delivery (spec section 9).
 
-// TEMP: delivery (Tasks 7-8) reads the remaining fields and methods.
+// TEMP: retries and disabling (Task 8) read the remaining fields and methods.
 #![allow(dead_code)]
 
+pub(crate) mod queue;
+pub(crate) mod sender;
 pub(crate) mod signing;
+
+pub use queue::{
+    AbandonReason, AttemptOutcome, DeliveryRecord, DeliveryRecordKind, SignatureFault,
+};
+pub(crate) use queue::{Deliveries, PreparedAttempt};
 
 use crate::engine::events::EventFormat;
 use crate::rng::{RngStreams, SimRng};

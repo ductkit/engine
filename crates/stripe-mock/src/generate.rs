@@ -68,6 +68,11 @@ impl Generator {
         Generator { actions }
     }
 
+    /// The earliest due action time.
+    pub(crate) fn next_due(&self) -> Option<SimTime> {
+        self.actions.iter().filter_map(|a| a.next_due).min()
+    }
+
     /// Performs every action due at or before `target`, then sets the time to `target`.
     pub(crate) fn run_until(&mut self, engine: &mut Engine, target: SimTime) {
         // Earliest due action; `min_by_key` keeps the first on ties, which is the fixed order.

@@ -6,7 +6,7 @@ pub(crate) mod store;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::delivery::Destinations;
+use crate::delivery::{AttemptOutcome, Deliveries, DeliveryRecord, Destinations, PreparedAttempt};
 use crate::rng::RngStreams;
 use crate::stream::{self, SubscribeFilter, SubscribeOptions, Subscriber, Subscription};
 use crate::{Config, MockError, ObjectType, SimTime};
@@ -70,6 +70,7 @@ pub(crate) struct Engine {
     projector: Projector,
     events: EventStore,
     destinations: Destinations,
+    deliveries: Deliveries,
 }
 
 impl Engine {
@@ -91,6 +92,7 @@ impl Engine {
                 }
                 d
             },
+            deliveries: Deliveries::new(&config.webhooks, streams),
         }
     }
 
@@ -106,14 +108,45 @@ impl Engine {
         &self.events
     }
 
-    #[allow(dead_code)] // TEMP: used from Task 4
-    pub(crate) fn events_mut(&mut self) -> &mut EventStore {
-        &mut self.events
+    /// Non-duplicate deliveries of the event that have not succeeded.
+    pub(crate) fn pending_webhooks(&self, event_id: &str) -> usize {
+        self.deliveries.pending_for_event(event_id)
     }
 
-    /// Undelivered snapshot-destination deliveries for an event (delivery arrives in Task 7).
-    pub(crate) fn pending_webhooks(&self, _event_id: &str) -> usize {
-        0
+    /// The earliest queued delivery attempt.
+    pub(crate) fn next_delivery_due(&self) -> Option<SimTime> {
+        self.deliveries.next_due()
+    }
+
+    /// Attempts due at the earliest due time `<= upto`, marked in flight.
+    pub(crate) fn due_batch(&mut self, upto: SimTime) -> Option<(SimTime, Vec<PreparedAttempt>)> {
+        self.deliveries
+            .due_batch(upto, &self.events, &self.destinations)
+    }
+
+    /// Logs a finished attempt at `now`.
+    pub(crate) fn record_outcome(
+        &mut self,
+        a: &PreparedAttempt,
+        outcome: AttemptOutcome,
+        elapsed_ms: u64,
+        now: SimTime,
+    ) {
+        let latest_version = self
+            .events
+            .get(&a.event_id)
+            .and_then(|ev| self.store.get(ev.object_type, &ev.object_id))
+            .map_or(a.object_version, |o| o.latest.version);
+        let success = self
+            .deliveries
+            .record_outcome(a, outcome, elapsed_ms, now, latest_version);
+        if success && let Ok(d) = self.destinations.get_mut(&a.destination_id) {
+            d.first_failure_since_success = None;
+        }
+    }
+
+    pub(crate) fn delivery_log(&self) -> &[DeliveryRecord] {
+        self.deliveries.log()
     }
 
     pub(crate) fn retention_ms(&self) -> i64 {
@@ -266,6 +299,10 @@ impl Engine {
             snapshot: vec![snapshot.id.clone()],
             thin: vec![thin.id.clone()],
         };
+        self.deliveries
+            .schedule_for_event(&snapshot, &self.destinations);
+        self.deliveries
+            .schedule_for_event(&thin, &self.destinations);
         self.events.push(snapshot);
         self.events.push(thin);
         self.log.push(update.clone());

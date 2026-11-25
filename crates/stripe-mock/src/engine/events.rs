@@ -1,9 +1,6 @@
 //! Event projection (spec section 8): each truth-log entry becomes one snapshot
 //! event and one thin event, with a hidden `visible_at`.
 
-// TEMP: the Events APIs and delivery (Tasks 4-7) read the remaining fields and methods.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use serde::Serialize;
@@ -50,6 +47,10 @@ pub struct EventInfo {
     pub visible_at: SimTime,
     pub object_id: String,
     pub object_version: u64,
+    /// The truth-log entry this event was projected from.
+    pub truth_seq: u64,
+    /// The other format's event ID.
+    pub pair_id: String,
 }
 
 impl From<&EventRecord> for EventInfo {
@@ -62,6 +63,8 @@ impl From<&EventRecord> for EventInfo {
             visible_at: r.visible_at,
             object_id: r.object_id.clone(),
             object_version: r.object_version,
+            truth_seq: r.truth_seq,
+            pair_id: r.pair_id.clone(),
         }
     }
 }
@@ -81,10 +84,6 @@ impl EventStore {
 
     pub(crate) fn get(&self, id: &str) -> Option<&EventRecord> {
         self.index.get(id).map(|i| &self.records[*i])
-    }
-
-    pub(crate) fn get_mut(&mut self, id: &str) -> Option<&mut EventRecord> {
-        self.index.get(id).map(|i| &mut self.records[*i])
     }
 
     /// Events of `f`, newest `created` first, then tiebreak, then later insertion first.
@@ -112,10 +111,6 @@ impl EventStore {
 
     pub(crate) fn all(&self) -> &[EventRecord] {
         &self.records
-    }
-
-    pub(crate) fn all_mut(&mut self) -> &mut [EventRecord] {
-        &mut self.records
     }
 }
 

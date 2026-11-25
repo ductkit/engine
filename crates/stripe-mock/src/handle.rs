@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::delivery::DestinationInfo;
+use crate::delivery::sender::send;
+use crate::delivery::{DeliveryRecord, DestinationInfo, PreparedAttempt};
 use crate::engine::events::EventInfo;
 use crate::engine::{Engine, StateUpdate};
 use crate::generate::Generator;
@@ -37,6 +38,8 @@ pub(crate) struct Shared {
     pub step_lock: tokio::sync::Mutex<()>,
     /// Wall-clock pacing; unused in virtual mode.
     pub wall: Mutex<WallState>,
+    /// Sends webhooks.
+    pub client: reqwest::Client,
 }
 
 /// Maps real time to simulated time in wall mode.
@@ -50,8 +53,9 @@ pub(crate) struct WallState {
 const TICK: Duration = Duration::from_millis(10);
 
 impl Shared {
-    /// Wall mode: advances simulated time to match real time (no-op while paused).
-    fn tick(&self) {
+    /// Wall mode: advances simulated time to match real time (no-op while paused),
+    /// then starts every delivery attempt that is due.
+    fn tick(self: &Arc<Self>) {
         let wall = self.wall.lock().expect("wall lock poisoned");
         if wall.paused {
             return;
@@ -66,6 +70,18 @@ impl Shared {
                 engine, generator, ..
             } = &mut *sim;
             generator.run_until(engine, target);
+        }
+        let now = sim.engine.now();
+        while let Some((_, batch)) = sim.engine.due_batch(now) {
+            for a in batch {
+                let shared = self.clone();
+                tokio::spawn(async move {
+                    let (outcome, elapsed) = send(&shared.client, &a).await;
+                    let mut sim = shared.lock();
+                    let now = sim.engine.now();
+                    sim.engine.record_outcome(&a, outcome, elapsed, now);
+                });
+            }
         }
     }
 }
@@ -107,6 +123,7 @@ impl MockStripe {
                 anchor_sim: start,
                 paused: false,
             }),
+            client: reqwest::Client::new(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let api_addr = listener.local_addr()?;
@@ -190,17 +207,55 @@ impl MockStripe {
     }
 
     /// The body of `advance_to`; the caller holds the step lock.
+    ///
+    /// Runs generator actions and delivery batches in time order. Each batch is sent
+    /// with the sim lock released and recorded at its due time.
     async fn advance_locked(&self, t: SimTime) -> Result<(), MockError> {
-        let mut sim = self.shared.lock();
-        let now = sim.engine.now();
-        if t < now {
-            return Err(MockError::TimeTravel { requested: t, now });
+        {
+            let now = self.shared.lock().engine.now();
+            if t < now {
+                return Err(MockError::TimeTravel { requested: t, now });
+            }
         }
-        let Sim {
-            engine, generator, ..
-        } = &mut *sim;
-        generator.run_until(engine, t);
-        Ok(())
+        loop {
+            let (due, batch) = {
+                let mut sim = self.shared.lock();
+                let Sim {
+                    engine, generator, ..
+                } = &mut *sim;
+                let action = generator.next_due().filter(|g| *g <= t);
+                let delivery = engine.next_delivery_due().filter(|d| *d <= t);
+                match (action, delivery) {
+                    (None, None) => {
+                        generator.run_until(engine, t);
+                        return Ok(());
+                    }
+                    // Actions first on ties, so a zero-delay event joins the batch.
+                    (Some(g), d) if d.is_none_or(|d| g <= d) => {
+                        generator.run_until(engine, g);
+                        continue;
+                    }
+                    (_, Some(d)) => {
+                        engine.set_now(d);
+                        match engine.due_batch(d) {
+                            Some(b) => b,
+                            None => continue,
+                        }
+                    }
+                    (Some(_), None) => unreachable!("covered by the action arm"),
+                }
+            };
+            let results = self.send_batch(&batch).await;
+            let mut sim = self.shared.lock();
+            for (a, (outcome, elapsed)) in batch.iter().zip(results) {
+                sim.engine.record_outcome(a, outcome, elapsed, due);
+            }
+        }
+    }
+
+    async fn send_batch(&self, batch: &[PreparedAttempt]) -> Vec<(crate::AttemptOutcome, u64)> {
+        let client = &self.shared.client;
+        futures_util::future::join_all(batch.iter().map(|a| send(client, a))).await
     }
 
     /// Creates a customer now and returns its ID.
@@ -316,6 +371,11 @@ impl MockStripe {
             .iter()
             .map(EventInfo::from)
             .collect()
+    }
+
+    /// A copy of the whole delivery log.
+    pub fn delivery_log(&self) -> Vec<DeliveryRecord> {
+        self.shared.lock().engine.delivery_log().to_vec()
     }
 
     /// A copy of the whole truth log.
