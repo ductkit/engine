@@ -132,6 +132,7 @@ async fn virtual_run() -> MockStripe {
 #[tokio::test]
 async fn virtual_run_replays_exactly() {
     let m = virtual_run().await;
+    assert!(m.truth_log().len() > 50, "{}", m.truth_log().len());
     let export = m.export_run();
     assert!(!export.journal.is_empty());
     let r = MockStripe::replay(export.clone(), ReplayOptions::default())
@@ -176,6 +177,7 @@ async fn wall_run_replays_to_same_truth() {
         .unwrap();
     }
     m.pause().unwrap();
+    assert!(m.truth_log().len() > 50, "{}", m.truth_log().len());
     let export = m.export_run();
     assert!(export.ended_at > SimTime::from_datetime(export.config.clock.start));
     let r = MockStripe::replay(export, ReplayOptions::default())

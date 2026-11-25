@@ -350,27 +350,32 @@ async fn set_speed_changes_rate() {
             "{bad}"
         );
     }
+    // `real` is taken before `set_speed` anchors, and its elapsed time is read after
+    // `pause` ticks, so it spans the whole simulated interval: a sound upper bound.
+    // The 200 ms sleep lies inside the interval: a sound lower bound (with 20%
+    // slack for timer granularity).
+    let real = Instant::now();
     m.set_speed(3600.0).unwrap();
     let before = m.now();
-    let real = Instant::now();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    // `pause` ticks, so `now` is current; the elapsed time is measured right after.
     m.pause().unwrap();
     let elapsed_secs = real.elapsed().as_secs_f64();
     let minutes = (m.now().0 - before.0) as f64 / 60_000.0;
-    let expected = elapsed_secs * 60.0;
+    let upper = elapsed_secs * 60.0;
+    let lower = 0.2 * 60.0 * 0.8;
     assert!(
-        (minutes - expected).abs() <= expected * 0.2,
-        "advanced {minutes} simulated minutes in {elapsed_secs} s (expected about {expected})"
+        (lower..=upper).contains(&minutes),
+        "advanced {minutes} simulated minutes in {elapsed_secs} s (bounds {lower}..={upper})"
     );
 
-    // Slowing down does not make simulated time jump.
+    // Slowing down does not make simulated time jump: everything `set_speed(1.0)`
+    // catches up happened at 3600x since `resume` anchored, after `real`.
+    let real = Instant::now();
     m.resume().unwrap();
     let before = m.now();
-    let real = Instant::now();
     m.set_speed(1.0).unwrap();
     let after = m.now();
-    let bound_ms = real.elapsed().as_secs_f64() * 3600.0 * 1000.0 * 1.2 + 1.0;
+    let bound_ms = real.elapsed().as_secs_f64() * 3600.0 * 1000.0;
     assert!(
         ((after.0 - before.0) as f64) <= bound_ms,
         "jumped {} ms (bound {bound_ms})",
