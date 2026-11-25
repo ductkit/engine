@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -31,6 +31,39 @@ pub(crate) struct Sim {
 pub(crate) struct Shared {
     pub sim: Mutex<Sim>,
     pub config: Config,
+    /// Wall-clock pacing; unused in virtual mode.
+    pub wall: Mutex<WallState>,
+}
+
+/// Maps real time to simulated time in wall mode.
+#[derive(Debug)]
+pub(crate) struct WallState {
+    anchor_real: Instant,
+    anchor_sim: SimTime,
+    paused: bool,
+}
+
+const TICK: Duration = Duration::from_millis(10);
+
+impl Shared {
+    /// Wall mode: advances simulated time to match real time (no-op while paused).
+    fn tick(&self) {
+        let wall = self.wall.lock().expect("wall lock poisoned");
+        if wall.paused {
+            return;
+        }
+        let elapsed_ms = wall.anchor_real.elapsed().as_secs_f64() * 1000.0;
+        let target = wall
+            .anchor_sim
+            .plus_ms((elapsed_ms * self.config.clock.speed) as i64);
+        let mut sim = self.lock();
+        if target > sim.engine.now() {
+            let Sim {
+                engine, generator, ..
+            } = &mut *sim;
+            generator.run_until(engine, target);
+        }
+    }
 }
 
 impl Shared {
@@ -46,6 +79,7 @@ pub struct MockStripe {
     api_addr: SocketAddr,
     stop: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<()>>,
+    ticker: Option<JoinHandle<()>>,
 }
 
 impl MockStripe {
@@ -63,11 +97,26 @@ impl MockStripe {
         let shared = Arc::new(Shared {
             sim: Mutex::new(sim),
             config,
+            wall: Mutex::new(WallState {
+                anchor_real: Instant::now(),
+                anchor_sim: start,
+                paused: false,
+            }),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let api_addr = listener.local_addr()?;
         let (stop, stopped) = oneshot::channel::<()>();
         let app = crate::api::router(shared.clone());
+        let ticker = (shared.config.clock.mode == ClockMode::Wall).then(|| {
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(TICK);
+                loop {
+                    interval.tick().await;
+                    shared.tick();
+                }
+            })
+        });
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app)
                 .with_graceful_shutdown(async {
@@ -80,6 +129,7 @@ impl MockStripe {
             api_addr,
             stop: Some(stop),
             server: Some(server),
+            ticker,
         })
     }
 
@@ -90,6 +140,9 @@ impl MockStripe {
 
     /// Stops the HTTP server (waiting until the port is closed) and ends every subscription.
     pub async fn shutdown(mut self) {
+        if let Some(ticker) = self.ticker.take() {
+            ticker.abort();
+        }
         self.shared.lock().engine.clear_subscribers();
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -184,6 +237,36 @@ impl MockStripe {
         self.shared.lock().engine.log().to_vec()
     }
 
+    /// Wall mode: freezes simulated time.
+    pub fn pause(&self) -> Result<(), MockError> {
+        self.require_wall()?;
+        self.shared.tick();
+        self.shared.wall.lock().expect("wall lock poisoned").paused = true;
+        Ok(())
+    }
+
+    /// Wall mode: continues from the paused simulated time, without a jump.
+    pub fn resume(&self) -> Result<(), MockError> {
+        self.require_wall()?;
+        let now = self.now();
+        let mut wall = self.shared.wall.lock().expect("wall lock poisoned");
+        if wall.paused {
+            wall.anchor_real = Instant::now();
+            wall.anchor_sim = now;
+            wall.paused = false;
+        }
+        Ok(())
+    }
+
+    fn require_wall(&self) -> Result<(), MockError> {
+        match self.shared.config.clock.mode {
+            ClockMode::Wall => Ok(()),
+            ClockMode::Virtual => Err(MockError::ClockMode(
+                "the clock is in virtual mode; pause and resume need wall mode".to_string(),
+            )),
+        }
+    }
+
     fn require_virtual(&self) -> Result<(), MockError> {
         match self.shared.config.clock.mode {
             ClockMode::Virtual => Ok(()),
@@ -196,6 +279,9 @@ impl MockStripe {
 
 impl Drop for MockStripe {
     fn drop(&mut self) {
+        if let Some(ticker) = self.ticker.take() {
+            ticker.abort();
+        }
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
