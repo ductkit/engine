@@ -32,7 +32,8 @@ use crate::{ActionsConfig, Config, MockError, ObjectType, SimTime};
 
 /// A business action to run now with [`crate::MockStripe::run_action`] (spec section 11,
 /// "Triggers").
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
     /// Create a random customer.
     NewCustomer,

@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::MockError;
 
@@ -32,7 +32,7 @@ fn first_unimplemented(table: &toml::Table) -> Option<String> {
 }
 
 /// Full mock configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Seed for every random decision.
@@ -53,7 +53,7 @@ pub struct Config {
 }
 
 /// Connect: the platform and its connected accounts (spec section 4).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccountsConfig {
     /// Only `1` is implemented.
@@ -68,7 +68,7 @@ pub struct AccountsConfig {
 }
 
 /// How many connected accounts exist and how often they come and go.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConnectedAccounts {
     /// Accounts connected at the start of history.
@@ -80,7 +80,7 @@ pub struct ConnectedAccounts {
 }
 
 /// Share of new accounts created through each Accounts API; sums to 1.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccountApiMix {
     pub v1: f64,
@@ -88,7 +88,7 @@ pub struct AccountApiMix {
 }
 
 /// Share of v1 accounts of each type; sums to 1.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccountTypeMix {
     pub standard: f64,
@@ -169,7 +169,7 @@ fn check_mix(name: &str, weights: &[(&str, f64)]) -> Result<(), MockError> {
 }
 
 /// How simulated time moves.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClockConfig {
     pub mode: ClockMode,
@@ -180,7 +180,7 @@ pub struct ClockConfig {
 }
 
 /// Clock mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClockMode {
     /// Time moves only when the test advances it.
@@ -191,7 +191,7 @@ pub enum ClockMode {
 }
 
 /// Pre-generated data that exists before the run starts (spec section 6.3).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HistoryConfig {
     /// How far before `clock.start` generation begins. Default `"0s"`: no history.
@@ -210,7 +210,7 @@ impl Default for HistoryConfig {
 }
 
 /// Stripe-compatible API settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiConfig {
     /// Accepted secret keys; each must start with `sk_test_`.
@@ -218,6 +218,7 @@ pub struct ApiConfig {
     /// Real (wall) delay before each response; never moves simulated time.
     pub latency: Distribution,
     /// Token bucket on wall time; `None` (the default) means no limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
     /// Probabilities of injected failures per request.
     pub errors: ApiErrors,
@@ -228,7 +229,7 @@ pub struct ApiConfig {
 }
 
 /// Writes during pagination (spec section 7.4).
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PaginationWrites {
     /// Per list request that carries a cursor.
@@ -236,7 +237,7 @@ pub struct PaginationWrites {
 }
 
 /// Stale reads on object retrieve and list (spec section 7.4).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StaleRead {
     /// Per request.
@@ -255,7 +256,7 @@ impl Default for StaleRead {
 }
 
 /// A token bucket: `burst` requests at once, refilled at `requests_per_second`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimit {
     pub requests_per_second: f64,
@@ -263,7 +264,7 @@ pub struct RateLimit {
 }
 
 /// Per-request failure probabilities; their sum is at most 1.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiErrors {
     /// 500 `api_error`.
@@ -320,7 +321,7 @@ impl ApiConfig {
 }
 
 /// Business action rates (per simulated hour) and action shaping (spec section 6).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ActionsConfig {
     pub new_customer: f64,
@@ -355,7 +356,7 @@ impl ActionsConfig {
 }
 
 /// Whether subscriptions renew at the end of each billing period.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RenewMode {
     /// Renew at each period end.
@@ -366,7 +367,7 @@ pub enum RenewMode {
 }
 
 /// Per-type churn rates.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChurnConfig {
     pub customer: CustomerChurn,
@@ -378,7 +379,7 @@ pub struct ChurnConfig {
 }
 
 /// Churn for catalog objects, which archive instead of deleting.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CatalogChurn {
     pub update: f64,
@@ -386,14 +387,14 @@ pub struct CatalogChurn {
 }
 
 /// Churn that only updates (metadata).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateChurn {
     pub update: f64,
 }
 
 /// Shape of rendered payloads.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PayloadsConfig {
     /// Embedded lists show at most this many entries (1..=100).
@@ -409,7 +410,7 @@ impl Default for PayloadsConfig {
 }
 
 /// Customer churn rates.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CustomerChurn {
     pub update: f64,
@@ -583,6 +584,27 @@ impl DurationStr {
     }
 }
 
+impl Serialize for DurationStr {
+    /// The compact form: the largest unit that divides evenly.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let ms = self.0;
+        let text = if ms != 0 {
+            [
+                (86_400_000, "d"),
+                (3_600_000, "h"),
+                (60_000, "m"),
+                (1_000, "s"),
+            ]
+            .iter()
+            .find(|(f, _)| ms % f == 0)
+            .map_or_else(|| format!("{ms}ms"), |(f, u)| format!("{}{u}", ms / f))
+        } else {
+            "0s".to_string()
+        };
+        s.serialize_str(&text)
+    }
+}
+
 impl<'de> Deserialize<'de> for DurationStr {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
@@ -595,7 +617,7 @@ impl<'de> Deserialize<'de> for DurationStr {
 }
 
 /// A distribution of delays in milliseconds.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "distribution", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Distribution {
     Fixed { ms: i64 },
@@ -623,7 +645,7 @@ impl Distribution {
 }
 
 /// Occasional extra visibility delay.
-#[derive(Clone, Debug, PartialEq, Default, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LateTail {
     pub probability: f64,
@@ -632,7 +654,7 @@ pub struct LateTail {
 }
 
 /// Events API projection settings (spec section 8).
-#[derive(Clone, Debug, PartialEq, Default, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EventsConfig {
     pub visibility_lag: Distribution,
@@ -652,7 +674,7 @@ impl EventsConfig {
 }
 
 /// How long events stay in the Events APIs.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EventRetentionConfig {
     pub window: DurationStr,
@@ -680,6 +702,15 @@ pub enum RetrySchedule {
 enum StringOrList {
     S(String),
     L(Vec<DurationStr>),
+}
+
+impl Serialize for RetrySchedule {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            RetrySchedule::StripeLike => s.serialize_str("stripe_like"),
+            RetrySchedule::Explicit(l) => l.serialize(s),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for RetrySchedule {
@@ -713,6 +744,15 @@ impl DisableAfter {
     }
 }
 
+impl Serialize for DisableAfter {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            DisableAfter::StripeLike => s.serialize_str("stripe_like"),
+            DisableAfter::After(d) => d.serialize(s),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for DisableAfter {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
@@ -730,7 +770,7 @@ impl<'de> Deserialize<'de> for DisableAfter {
 }
 
 /// Signatures with timestamps outside the receiver's tolerance.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClockSkew {
     pub probability: f64,
@@ -747,7 +787,7 @@ impl Default for ClockSkew {
 }
 
 /// Webhook delivery behaviour (spec section 9).
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebhooksConfig {
     pub delivery_delay: Distribution,
@@ -809,7 +849,7 @@ impl WebhooksConfig {
 }
 
 /// Snapshot or thin payloads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PayloadFormat {
     Snapshot,
@@ -817,7 +857,7 @@ pub enum PayloadFormat {
 }
 
 /// A webhook delivery target (spec section 9).
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DestinationConfig {
     pub name: String,
@@ -826,9 +866,9 @@ pub struct DestinationConfig {
     pub enabled_events: Vec<String>,
     #[serde(default)]
     pub connect: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events_from: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 }
 

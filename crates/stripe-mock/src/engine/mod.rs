@@ -350,6 +350,10 @@ impl Engine {
         self.projector.retention_ms
     }
 
+    pub(crate) fn projector(&self) -> &Projector {
+        &self.projector
+    }
+
     pub(crate) fn projector_mut(&mut self) -> &mut Projector {
         &mut self.projector
     }
@@ -609,6 +613,32 @@ impl Engine {
         let (subscriber, subscription) = stream::pair(filter, options, snapshot);
         self.subscribers.push(subscriber);
         subscription
+    }
+
+    /// Latest state of every live object matching `filter`, per scope (platform
+    /// first) and type, in creation order. Types without live objects are omitted.
+    pub(crate) fn dump_state(&self, filter: &SubscribeFilter) -> Value {
+        let scopes: Vec<Value> = self
+            .stores
+            .iter()
+            .filter(|(scope, _)| filter.matches_scope(scope))
+            .map(|(scope, store)| {
+                let mut objects = serde_json::Map::new();
+                for t in ObjectType::ALL.into_iter().filter(|t| filter.matches(*t)) {
+                    let live: Vec<Value> = store
+                        .in_creation_order(t)
+                        .into_iter()
+                        .filter(|o| !o.deleted)
+                        .map(|o| o.latest.state.clone())
+                        .collect();
+                    if !live.is_empty() {
+                        objects.insert(t.as_str().to_string(), Value::Array(live));
+                    }
+                }
+                serde_json::json!({"account": scope, "objects": objects})
+            })
+            .collect();
+        serde_json::json!({"at": self.now, "scopes": scopes})
     }
 
     /// Ends every subscription (used on shutdown).

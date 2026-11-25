@@ -8,14 +8,16 @@ use serde_json::{Value, json};
 use crate::rng::SimRng;
 
 /// Which Accounts API created an account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AccountApi {
     V1,
     V2,
 }
 
 /// The account's `type` in `/v1/accounts`. `V2` accounts show `type: "none"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AccountKind {
     Standard,
     Express,
@@ -24,7 +26,10 @@ pub enum AccountKind {
 }
 
 /// An Accounts v2 configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Configuration {
     Customer,
     Merchant,

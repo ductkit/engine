@@ -4,6 +4,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -18,7 +20,7 @@ use crate::rng::{RngStreams, SimRng};
 use crate::stream::{SubscribeFilter, SubscribeOptions, Subscription};
 use crate::{
     AccountApi, AccountKind, ActionsConfig, ApiConfig, ClockMode, Config, Configuration,
-    DestinationConfig, EventsConfig, MockError, ObjectType, SimTime, WebhooksConfig,
+    DestinationConfig, EventsConfig, MockError, ObjectType, PayloadFormat, SimTime, WebhooksConfig,
 };
 
 /// Everything behind the lock.
@@ -55,6 +57,8 @@ pub(crate) struct WallState {
     anchor_real: Instant,
     anchor_sim: SimTime,
     paused: bool,
+    /// Simulated seconds per real second; starts at `clock.speed`.
+    speed: f64,
 }
 
 const TICK: Duration = Duration::from_millis(10);
@@ -68,9 +72,7 @@ impl Shared {
             return;
         }
         let elapsed_ms = wall.anchor_real.elapsed().as_secs_f64() * 1000.0;
-        let target = wall
-            .anchor_sim
-            .plus_ms((elapsed_ms * self.config.clock.speed) as i64);
+        let target = wall.anchor_sim.plus_ms((elapsed_ms * wall.speed) as i64);
         let mut sim = self.lock();
         if target > sim.engine.now() {
             let Sim {
@@ -153,7 +155,7 @@ impl Shared {
 }
 
 /// A connected account, as the control API shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountInfo {
     pub id: String,
     pub api: AccountApi,
@@ -177,6 +179,7 @@ impl MockStripe {
     /// Validates `config` and starts the mock.
     pub async fn start(config: Config) -> Result<MockStripe, MockError> {
         config.validate()?;
+        let config_speed = config.clock.speed;
         let streams = RngStreams::new(config.seed);
         let start = SimTime::from_datetime(config.clock.start);
         // History (spec section 6.3): generation runs from `start - duration` with
@@ -205,6 +208,7 @@ impl MockStripe {
                 anchor_real: Instant::now(),
                 anchor_sim: start,
                 paused: false,
+                speed: config_speed,
             }),
             // Stripe treats a redirect as a failed delivery, and receivers are local.
             client: reqwest::Client::builder()
@@ -660,6 +664,43 @@ impl MockStripe {
             .collect()
     }
 
+    /// The latest state of every live object matching `filter`:
+    /// `{"at": time, "scopes": [{"account": null | "acct_…", "objects": {"<type>": [state, …]}}]}`.
+    /// Deleted objects are omitted.
+    pub fn dump_state(&self, filter: &SubscribeFilter) -> serde_json::Value {
+        self.shared.lock().engine.dump_state(filter)
+    }
+
+    /// The start config with `[api]`, `[events]`, `[webhooks]` and `[actions]` at
+    /// their current runtime values and `destinations` as they are now.
+    pub fn effective_config(&self) -> Config {
+        let sim = self.shared.lock();
+        let mut config = self.shared.config.clone();
+        config.api = sim.api.config().clone();
+        config.events = sim.engine.projector().config.clone();
+        config.webhooks = sim.engine.webhooks_config().clone();
+        config.actions = sim.generators.actions_config().clone();
+        config.destinations = sim
+            .engine
+            .destinations()
+            .iter()
+            .map(|d| {
+                let i = &d.info;
+                let thin = i.payload == PayloadFormat::Thin;
+                DestinationConfig {
+                    name: i.name.clone(),
+                    url: i.url.clone(),
+                    payload: i.payload,
+                    enabled_events: i.enabled_events.clone(),
+                    connect: i.connect,
+                    events_from: thin.then(|| i.events_from.clone()),
+                    secret: Some(i.secret.clone()),
+                }
+            })
+            .collect();
+        config
+    }
+
     /// Every event in creation order, with its hidden visibility time.
     pub fn event_timeline(&self) -> Vec<EventInfo> {
         self.shared
@@ -687,6 +728,25 @@ impl MockStripe {
         self.require_wall()?;
         self.shared.tick();
         self.shared.wall.lock().expect("wall lock poisoned").paused = true;
+        Ok(())
+    }
+
+    /// Wall mode: changes the simulated seconds per real second. Simulated time
+    /// does not jump; it continues from now at the new speed.
+    pub fn set_speed(&self, speed: f64) -> Result<(), MockError> {
+        self.require_wall()?;
+        if !speed.is_finite() || speed <= 0.0 {
+            return Err(MockError::Config(format!(
+                "speed must be a finite number > 0, got {speed}"
+            )));
+        }
+        // Catch up at the old speed first, then re-anchor like `resume`.
+        self.shared.tick();
+        let now = self.now();
+        let mut wall = self.shared.wall.lock().expect("wall lock poisoned");
+        wall.anchor_real = Instant::now();
+        wall.anchor_sim = now;
+        wall.speed = speed;
         Ok(())
     }
 

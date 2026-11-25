@@ -2,12 +2,14 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::rng::SimRng;
 
 /// Fields for a new customer.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NewCustomer {
     pub email: Option<String>,
     pub name: Option<String>,
@@ -16,7 +18,8 @@ pub struct NewCustomer {
 }
 
 /// A single change to a customer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum CustomerUpdate {
     SetEmail(Option<String>),
     SetName(Option<String>),
