@@ -583,8 +583,9 @@ The mock supports all of these through the latest-state subscription, per-object
 ## 14. Fidelity
 
 - Generate object types and response shapes from Stripe's published **OpenAPI spec** for the pinned version, and validate every mock response against it in the mock's own tests. This prevents the mock from drifting away from real Stripe.
+- **OpenAPI validation is part of the regular test suite.** It runs on every full test run (`cargo test --workspace`), locally or in CI, with no extra command, flag or credentials. The OpenAPI spec for the pinned version is vendored in the repository, so validation runs offline and gives the same result on every machine. Updating the pinned version means replacing the vendored file.
 - Stripe's official `stripe-mock` is stateless and doesn't fit this purpose, but its OpenAPI-based fixtures can seed realistic example values.
-- **Calibration**: periodically run equivalent scripted actions against real Stripe test mode and compare event fan-out, ordering and latency distributions with the mock's defaults. Calibration is a manual or scheduled job, not part of the regular test suite.
+- **Calibration** (deferred; not scheduled in any phase): periodically run equivalent scripted actions against real Stripe test mode and compare event fan-out, ordering and latency distributions with the mock's defaults. When it is built, calibration is a manual or scheduled job, not part of the regular test suite.
 - One pinned API version (`2026-11-18.endive`). The OpenAPI spec for that version, covering both v1 and v2 endpoints, is the source for generated types. Multi-version payload rendering is not planned.
 
 ## 15. Performance
@@ -601,7 +602,9 @@ The mock supports all of these through the latest-state subscription, per-object
 4. **History and backfill races**; API faults (rate limits, 5xx, stale reads, writes during pagination).
 5. **Connect**: v1 and v2 connected accounts, `Stripe-Account`, connect/disconnect, full event coverage for connected accounts through snapshot and thin destinations.
 6. **Standalone server binary**, SSE/WebSocket subscription, HTTP control API, run export and replay.
-7. Phase-2 entity types, OpenAPI validation in CI, calibration job.
+7. **Phase-2 entity types and OpenAPI validation**: more entity types (section 5.1), and validation of every mock response against the vendored OpenAPI spec as part of the regular test suite (section 14).
+
+Calibration against real Stripe test mode (section 14) is deferred to a later, unscheduled phase.
 
 ## 17. Decisions
 
