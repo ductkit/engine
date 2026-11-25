@@ -11,7 +11,7 @@ use crate::api::ApiError;
 use crate::api::list::{paginate, parse_list_params};
 use crate::handle::Shared;
 
-fn decode(query: Option<String>) -> Vec<(String, String)> {
+pub(crate) fn decode(query: Option<String>) -> Vec<(String, String)> {
     form_urlencoded::parse(query.unwrap_or_default().as_bytes())
         .into_owned()
         .collect()
@@ -44,7 +44,7 @@ pub(crate) async fn list(
     State(shared): State<Arc<Shared>>,
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
-    let p = parse_list_params(decode(query), &["email"])?;
+    let p = parse_list_params(decode(query), &["email"], &[])?;
     let email = p.extra.get("email").cloned();
     let sim = shared.lock();
     let ordered = sim.engine.store().list_order(ObjectType::Customer);

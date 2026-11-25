@@ -17,8 +17,8 @@ fn hours(h: u64) -> Duration {
 #[tokio::test]
 async fn same_seed_same_log() {
     let (a, b) = (mock_with(BUSY).await, mock_with(BUSY).await);
-    a.step(hours(48)).unwrap();
-    b.step(hours(48)).unwrap();
+    a.step(hours(48)).await.unwrap();
+    b.step(hours(48)).await.unwrap();
     let (la, lb) = (a.truth_log(), b.truth_log());
     assert!(la.len() > 100, "{}", la.len());
     assert_eq!(la, lb);
@@ -28,8 +28,8 @@ async fn same_seed_same_log() {
 async fn different_seed_different_log() {
     let a = mock_with(BUSY).await;
     let b = mock_with(&BUSY.replace("seed = 7", "seed = 8")).await;
-    a.step(hours(48)).unwrap();
-    b.step(hours(48)).unwrap();
+    a.step(hours(48)).await.unwrap();
+    b.step(hours(48)).await.unwrap();
     assert_ne!(a.truth_log(), b.truth_log());
 }
 
@@ -45,15 +45,15 @@ async fn creates_independent_of_update_rate() {
     let a = mock_with("seed = 7\n[actions]\nnew_customer = 10.0").await;
     let b = mock_with("seed = 7\n[actions]\nnew_customer = 10.0\n[churn.customer]\nupdate = 30.0")
         .await;
-    a.step(hours(24)).unwrap();
-    b.step(hours(24)).unwrap();
+    a.step(hours(24)).await.unwrap();
+    b.step(hours(24)).await.unwrap();
     assert_eq!(created(&a), created(&b));
 }
 
 #[tokio::test]
 async fn rate_roughly_matches() {
     let m = mock_with("[actions]\nnew_customer = 10.0").await;
-    m.step(hours(100)).unwrap();
+    m.step(hours(100)).await.unwrap();
     let n = m.truth_log().len();
     assert!((850..=1150).contains(&n), "{n}");
 }
@@ -61,7 +61,7 @@ async fn rate_roughly_matches() {
 #[tokio::test]
 async fn zero_rates_do_nothing() {
     let m = mock_with("").await;
-    m.step(hours(1000)).unwrap();
+    m.step(hours(1000)).await.unwrap();
     assert!(m.truth_log().is_empty());
 }
 
@@ -69,11 +69,11 @@ async fn zero_rates_do_nothing() {
 async fn clock_moves_exactly() {
     let m = mock_with("").await;
     let t0 = m.now();
-    m.step(Duration::from_millis(1500)).unwrap();
+    m.step(Duration::from_millis(1500)).await.unwrap();
     assert_eq!(m.now(), t0.plus_ms(1500));
-    assert!(m.advance_to(m.now()).is_ok());
+    assert!(m.advance_to(m.now()).await.is_ok());
     assert!(matches!(
-        m.advance_to(t0),
+        m.advance_to(t0).await,
         Err(MockError::TimeTravel { .. })
     ));
 }

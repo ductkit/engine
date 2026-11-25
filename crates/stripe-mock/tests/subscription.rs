@@ -57,10 +57,10 @@ async fn no_gap_between_snapshot_and_live() {
         "seed = 3\n[actions]\nnew_customer = 60.0\n[churn.customer]\nupdate = 120.0\ndelete = 10.0",
     )
     .await;
-    m.step(Duration::from_secs(3600)).unwrap();
+    m.step(Duration::from_secs(3600)).await.unwrap();
     let cut = m.truth_log().len() as u64;
     let mut s = m.subscribe(SubscribeFilter::default());
-    m.step(Duration::from_secs(3600)).unwrap();
+    m.step(Duration::from_secs(3600)).await.unwrap();
     let total = m.truth_log().len() as u64;
     assert!(total > cut);
     let mut live = vec![];

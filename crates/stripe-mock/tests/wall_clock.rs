@@ -35,7 +35,7 @@ async fn pause_freezes_and_resume_does_not_jump() {
 async fn mode_mismatch_errors() {
     let w = mock_with(WALL).await;
     assert!(matches!(
-        w.step(Duration::from_secs(1)),
+        w.step(Duration::from_secs(1)).await,
         Err(MockError::ClockMode(_))
     ));
     let v = mock_with("").await;

@@ -93,12 +93,15 @@ impl Engine {
         &mut self.events
     }
 
-    #[allow(dead_code)] // TEMP: used from Task 4
+    /// Undelivered snapshot-destination deliveries for an event (delivery arrives in Task 7).
+    pub(crate) fn pending_webhooks(&self, _event_id: &str) -> usize {
+        0
+    }
+
     pub(crate) fn retention_ms(&self) -> i64 {
         self.projector.retention_ms
     }
 
-    #[allow(dead_code)] // TEMP: used from Task 4
     pub(crate) fn projector_mut(&mut self) -> &mut Projector {
         &mut self.projector
     }

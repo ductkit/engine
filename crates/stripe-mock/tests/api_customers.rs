@@ -118,7 +118,7 @@ async fn filters() {
             ..Default::default()
         })
         .unwrap();
-    m.step(Duration::from_secs(10)).unwrap();
+    m.step(Duration::from_secs(10)).await.unwrap();
     let b = m.create_customer(NewCustomer::default()).unwrap();
     let t = m.now().unix_seconds();
     assert_eq!(

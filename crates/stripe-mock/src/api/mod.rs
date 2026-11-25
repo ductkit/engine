@@ -1,6 +1,7 @@
 //! Read-only Stripe-compatible HTTP API (spec section 7).
 
 mod customers;
+mod events_v1;
 mod list;
 
 use std::sync::Arc;
@@ -82,6 +83,8 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
     Router::new()
         .route("/v1/customers", get(customers::list))
         .route("/v1/customers/{id}", get(customers::retrieve))
+        .route("/v1/events", get(events_v1::list))
+        .route("/v1/events/{id}", get(events_v1::retrieve))
         .fallback(fallback)
         .layer(middleware::from_fn_with_state(shared.clone(), gate))
         .with_state(shared)

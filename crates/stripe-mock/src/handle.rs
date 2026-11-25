@@ -15,7 +15,7 @@ use crate::model::customer::{
 };
 use crate::rng::{RngStreams, SimRng};
 use crate::stream::{SubscribeFilter, SubscribeOptions, Subscription};
-use crate::{ClockMode, Config, MockError, ObjectType, SimTime};
+use crate::{ClockMode, Config, EventsConfig, MockError, ObjectType, SimTime};
 
 /// Everything behind the lock.
 #[derive(Debug)]
@@ -32,6 +32,8 @@ pub(crate) struct Sim {
 pub(crate) struct Shared {
     pub sim: Mutex<Sim>,
     pub config: Config,
+    /// Serializes `step`/`advance_to`/`quiesce`.
+    pub step_lock: tokio::sync::Mutex<()>,
     /// Wall-clock pacing; unused in virtual mode.
     pub wall: Mutex<WallState>,
 }
@@ -98,6 +100,7 @@ impl MockStripe {
         let shared = Arc::new(Shared {
             sim: Mutex::new(sim),
             config,
+            step_lock: tokio::sync::Mutex::new(()),
             wall: Mutex::new(WallState {
                 anchor_real: Instant::now(),
                 anchor_sim: start,
@@ -159,14 +162,34 @@ impl MockStripe {
     }
 
     /// Advances virtual time by `d`, running every action due on the way.
-    pub fn step(&self, d: Duration) -> Result<(), MockError> {
-        let target = self.now().plus_ms(d.as_millis() as i64);
-        self.advance_to(target)
+    /// Concurrent calls are serialized.
+    pub async fn step(&self, d: Duration) -> Result<(), MockError> {
+        self.require_virtual()?;
+        let _step = self.shared.step_lock.lock().await;
+        let target = {
+            let sim = self.shared.lock();
+            let now = sim.engine.now();
+            i64::try_from(d.as_millis())
+                .ok()
+                .and_then(|ms| now.0.checked_add(ms))
+                .map(SimTime)
+                .ok_or(MockError::TimeTravel {
+                    requested: SimTime(i64::MAX),
+                    now,
+                })?
+        };
+        self.advance_locked(target).await
     }
 
     /// Advances virtual time to `t`. Equal to now is a no-op; earlier is an error.
-    pub fn advance_to(&self, t: SimTime) -> Result<(), MockError> {
+    pub async fn advance_to(&self, t: SimTime) -> Result<(), MockError> {
         self.require_virtual()?;
+        let _step = self.shared.step_lock.lock().await;
+        self.advance_locked(t).await
+    }
+
+    /// The body of `advance_to`; the caller holds the step lock.
+    async fn advance_locked(&self, t: SimTime) -> Result<(), MockError> {
         let mut sim = self.shared.lock();
         let now = sim.engine.now();
         if t < now {
@@ -231,6 +254,16 @@ impl MockStripe {
     /// The latest truth-log entry for an object, deleted or not.
     pub fn get(&self, t: ObjectType, id: &str) -> Option<StateUpdate> {
         self.shared.lock().engine.latest(t, id).cloned()
+    }
+
+    /// Changes Events API settings for events created from now on.
+    pub fn update_events_config(&self, f: impl FnOnce(&mut EventsConfig)) -> Result<(), MockError> {
+        let mut sim = self.shared.lock();
+        let mut cfg = sim.engine.projector_mut().config.clone();
+        f(&mut cfg);
+        cfg.validate()?;
+        sim.engine.projector_mut().config = cfg;
+        Ok(())
     }
 
     /// Every event in creation order, with its hidden visibility time.
