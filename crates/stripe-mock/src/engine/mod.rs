@@ -25,6 +25,10 @@ pub enum ChangeKind {
     Snapshot,
     Created,
     Updated,
+    /// A product or price became `active: false`.
+    Archived,
+    /// A `status` change.
+    StateChanged,
     Deleted,
 }
 
@@ -237,28 +241,38 @@ impl Engine {
         }
     }
 
+    /// Creates an object, announcing `events` (snapshot event types; may be empty).
     pub(crate) fn create(
         &mut self,
         t: ObjectType,
         id: String,
         state: Value,
         cause: Cause,
+        events: &[&str],
     ) -> StateUpdate {
         let created = state["created"].as_i64().unwrap_or(self.now.unix_seconds());
-        let update = self.record(t, id, 1, ChangeKind::Created, state, cause, None);
+        let update = self.record(t, id, 1, ChangeKind::Created, state, cause, None, events);
         self.store.insert(update.clone(), created);
         self.notify(&update);
         update
     }
 
     /// Applies `f` to the object's state; records nothing if the state is unchanged.
+    /// `kind` is `Updated`, `Archived` or `StateChanged`.
+    #[allow(clippy::too_many_arguments)] // every argument is part of the entry
     pub(crate) fn update(
         &mut self,
         t: ObjectType,
         id: &str,
         f: impl FnOnce(&mut Value),
         cause: Cause,
+        kind: ChangeKind,
+        events: &[&str],
     ) -> Result<Option<StateUpdate>, MockError> {
+        debug_assert!(matches!(
+            kind,
+            ChangeKind::Updated | ChangeKind::Archived | ChangeKind::StateChanged
+        ));
         let latest = self.live(t, id)?;
         let mut state = latest.state.clone();
         f(&mut state);
@@ -271,10 +285,11 @@ impl Engine {
             t,
             id.to_string(),
             version,
-            ChangeKind::Updated,
+            kind,
             state,
             cause,
             Some(previous),
+            events,
         );
         self.store.replace(update.clone());
         self.notify(&update);
@@ -287,6 +302,7 @@ impl Engine {
         id: &str,
         tombstone: Value,
         cause: Cause,
+        events: &[&str],
     ) -> Result<StateUpdate, MockError> {
         let latest = self.live(t, id)?;
         let version = latest.version + 1;
@@ -299,6 +315,7 @@ impl Engine {
             tombstone,
             cause,
             Some(previous),
+            events,
         );
         self.store.replace(update.clone());
         self.notify(&update);
@@ -341,6 +358,7 @@ impl Engine {
         state: Value,
         cause: Cause,
         previous: Option<Value>,
+        events: &[&str],
     ) -> StateUpdate {
         let mut update = StateUpdate {
             seq: self.next_seq,
@@ -355,17 +373,16 @@ impl Engine {
             cause: Some(cause),
         };
         self.next_seq += 1;
-        let (snapshot, thin) = self.projector.project(&update, previous.as_ref());
-        update.events = EventRefs {
-            snapshot: vec![snapshot.id.clone()],
-            thin: vec![thin.id.clone()],
-        };
-        self.deliveries
-            .schedule_for_event(&snapshot, &self.destinations);
-        self.deliveries
-            .schedule_for_event(&thin, &self.destinations);
-        self.events.push(snapshot);
-        self.events.push(thin);
+        for (snapshot, thin) in self.projector.project(&update, previous.as_ref(), events) {
+            update.events.snapshot.push(snapshot.id.clone());
+            update.events.thin.push(thin.id.clone());
+            self.deliveries
+                .schedule_for_event(&snapshot, &self.destinations);
+            self.deliveries
+                .schedule_for_event(&thin, &self.destinations);
+            self.events.push(snapshot);
+            self.events.push(thin);
+        }
         self.log.push(update.clone());
         update
     }
@@ -435,6 +452,7 @@ mod tests {
             "cus_a".into(),
             cust("cus_a", 0),
             c.clone(),
+            &["customer.created"],
         );
         let b = e
             .update(
@@ -442,6 +460,8 @@ mod tests {
                 "cus_a",
                 |v| v["email"] = json!("x@example.com"),
                 c.clone(),
+                ChangeKind::Updated,
+                &["customer.updated"],
             )
             .unwrap()
             .unwrap();
@@ -451,6 +471,7 @@ mod tests {
                 "cus_a",
                 json!({"id": "cus_a", "object": "customer", "deleted": true}),
                 c,
+                &["customer.deleted"],
             )
             .unwrap();
         assert_eq!((a.seq, b.seq, d.seq), (1, 2, 3));
@@ -482,9 +503,18 @@ mod tests {
             "cus_a".into(),
             cust("cus_a", 0),
             c.clone(),
+            &["customer.created"],
         );
         assert_eq!(
-            e.update(ObjectType::Customer, "cus_a", |_| {}, c).unwrap(),
+            e.update(
+                ObjectType::Customer,
+                "cus_a",
+                |_| {},
+                c,
+                ChangeKind::Updated,
+                &["customer.updated"]
+            )
+            .unwrap(),
             None
         );
         assert_eq!(e.log().len(), 1);
@@ -495,7 +525,14 @@ mod tests {
         let mut e = test_engine();
         let c = e.begin_action("t");
         assert!(matches!(
-            e.update(ObjectType::Customer, "cus_x", |_| {}, c.clone()),
+            e.update(
+                ObjectType::Customer,
+                "cus_x",
+                |_| {},
+                c.clone(),
+                ChangeKind::Updated,
+                &["customer.updated"]
+            ),
             Err(MockError::NoSuchObject { .. })
         ));
         e.create(
@@ -503,11 +540,24 @@ mod tests {
             "cus_a".into(),
             cust("cus_a", 0),
             c.clone(),
+            &["customer.created"],
         );
-        e.delete(ObjectType::Customer, "cus_a", json!({}), c.clone())
-            .unwrap();
+        e.delete(
+            ObjectType::Customer,
+            "cus_a",
+            json!({}),
+            c.clone(),
+            &["customer.deleted"],
+        )
+        .unwrap();
         assert!(matches!(
-            e.delete(ObjectType::Customer, "cus_a", json!({}), c),
+            e.delete(
+                ObjectType::Customer,
+                "cus_a",
+                json!({}),
+                c,
+                &["customer.deleted"]
+            ),
             Err(MockError::Deleted { .. })
         ));
         assert_eq!(e.log().len(), 2);
@@ -518,7 +568,13 @@ mod tests {
         let mut e = test_engine();
         let c = e.begin_action("t");
         for (id, t) in [("cus_1", 5), ("cus_2", 5), ("cus_3", 4)] {
-            e.create(ObjectType::Customer, id.into(), cust(id, t), c.clone());
+            e.create(
+                ObjectType::Customer,
+                id.into(),
+                cust(id, t),
+                c.clone(),
+                &["customer.created"],
+            );
         }
         let ids: Vec<_> = e
             .store()

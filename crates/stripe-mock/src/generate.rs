@@ -4,6 +4,7 @@
 //! timing, target choice and content. Changing one rate therefore never
 //! changes another action's decisions.
 
+use crate::ChangeKind;
 use crate::engine::Engine;
 use crate::model::customer::{
     apply_update, deleted_stub, new_customer_json, random_new_customer, random_update,
@@ -133,7 +134,7 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine) {
             let params = random_new_customer(rng);
             let state = new_customer_json(&id, engine.now().unix_seconds(), &prefix, &params);
             let cause = engine.begin_action("new_customer");
-            engine.create(t, id, state, cause);
+            engine.create(t, id, state, cause, &["customer.created"]);
         }
         ActionKind::CustomerUpdate => {
             let Some(id) = pick_live(rng, engine) else {
@@ -143,7 +144,14 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine) {
             let update = random_update(rng, state);
             let cause = engine.begin_action("customer_update");
             engine
-                .update(t, &id, |s| apply_update(s, &update), cause)
+                .update(
+                    t,
+                    &id,
+                    |s| apply_update(s, &update),
+                    cause,
+                    ChangeKind::Updated,
+                    &["customer.updated"],
+                )
                 .expect("live customer");
         }
         ActionKind::CustomerDelete => {
@@ -152,7 +160,7 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine) {
             };
             let cause = engine.begin_action("customer_delete");
             engine
-                .delete(t, &id, deleted_stub(&id), cause)
+                .delete(t, &id, deleted_stub(&id), cause, &["customer.deleted"])
                 .expect("live customer");
         }
     }

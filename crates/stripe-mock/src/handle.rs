@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use crate::delivery::sender::send;
 use crate::delivery::{DeliveryRecord, DestinationInfo, PreparedAttempt};
 use crate::engine::events::EventInfo;
-use crate::engine::{Engine, StateUpdate};
+use crate::engine::{ChangeKind, Engine, StateUpdate};
 use crate::generate::Generator;
 use crate::model::customer::{
     CustomerUpdate, NewCustomer, apply_update, deleted_stub, new_customer_json,
@@ -322,7 +322,13 @@ impl MockStripe {
         let prefix = control_rng.alnum_upper(8);
         let state = new_customer_json(&id, engine.now().unix_seconds(), &prefix, &p);
         let cause = engine.begin_action("control.create_customer");
-        engine.create(ObjectType::Customer, id.clone(), state, cause);
+        engine.create(
+            ObjectType::Customer,
+            id.clone(),
+            state,
+            cause,
+            &["customer.created"],
+        );
         Ok(id)
     }
 
@@ -330,9 +336,14 @@ impl MockStripe {
     pub fn update_customer(&self, id: &str, u: CustomerUpdate) -> Result<Option<u64>, MockError> {
         let mut sim = self.shared.lock();
         let cause = sim.engine.begin_action("control.update_customer");
-        let update = sim
-            .engine
-            .update(ObjectType::Customer, id, |s| apply_update(s, &u), cause)?;
+        let update = sim.engine.update(
+            ObjectType::Customer,
+            id,
+            |s| apply_update(s, &u),
+            cause,
+            ChangeKind::Updated,
+            &["customer.updated"],
+        )?;
         Ok(update.map(|u| u.version))
     }
 
@@ -340,8 +351,13 @@ impl MockStripe {
     pub fn delete_customer(&self, id: &str) -> Result<(), MockError> {
         let mut sim = self.shared.lock();
         let cause = sim.engine.begin_action("control.delete_customer");
-        sim.engine
-            .delete(ObjectType::Customer, id, deleted_stub(id), cause)?;
+        sim.engine.delete(
+            ObjectType::Customer,
+            id,
+            deleted_stub(id),
+            cause,
+            &["customer.deleted"],
+        )?;
         Ok(())
     }
 

@@ -142,11 +142,25 @@ impl Projector {
         }
     }
 
-    /// The snapshot and thin events for `u`. `previous` is the state before the mutation.
+    /// One snapshot and one thin event per snapshot type in `types`, in order.
+    /// `previous` is the state before the mutation. Draws nothing for an empty `types`.
     pub(crate) fn project(
         &mut self,
         u: &StateUpdate,
         previous: Option<&Value>,
+        types: &[&str],
+    ) -> Vec<(EventRecord, EventRecord)> {
+        types
+            .iter()
+            .map(|t| self.project_one(u, previous, t))
+            .collect()
+    }
+
+    fn project_one(
+        &mut self,
+        u: &StateUpdate,
+        previous: Option<&Value>,
+        snapshot_type: &str,
     ) -> (EventRecord, EventRecord) {
         let snapshot_id = self.ids.id_len("evt", 24);
         let thin_id = self.ids.id_len("evt_test", 46);
@@ -161,13 +175,8 @@ impl Projector {
         } else {
             0
         };
-        let verb = match u.kind {
-            ChangeKind::Created | ChangeKind::Snapshot => "created",
-            ChangeKind::Updated => "updated",
-            ChangeKind::Deleted => "deleted",
-        };
         let name = u.object_type.as_str();
-        let snapshot_type = format!("{name}.{verb}");
+        let snapshot_type = snapshot_type.to_string();
         let thin_type = format!("v1.{snapshot_type}");
 
         let object = match (u.kind, previous) {
@@ -183,7 +192,7 @@ impl Projector {
         let mut data = Map::new();
         data.insert("object".into(), object);
         let mut changes = Value::Null;
-        if u.kind == ChangeKind::Updated
+        if !matches!(u.kind, ChangeKind::Created | ChangeKind::Deleted)
             && let Some(prev) = previous
         {
             data.insert(
@@ -214,7 +223,7 @@ impl Projector {
             "related_object": {
                 "id": u.object_id,
                 "type": name,
-                "url": format!("/v1/{name}s/{}", u.object_id),
+                "url": u.object_type.api_path(&u.object_id),
             },
             "snapshot_event": snapshot_id,
             "changes": changes,
@@ -332,7 +341,13 @@ mod tests {
     fn every_mutation_yields_a_pair() {
         let mut e = engine_with("");
         let c = e.begin_action("t");
-        let u = e.create(ObjectType::Customer, "cus_1".into(), cust("cus_1"), c);
+        let u = e.create(
+            ObjectType::Customer,
+            "cus_1".into(),
+            cust("cus_1"),
+            c,
+            &["customer.created"],
+        );
         assert_eq!((u.events.snapshot.len(), u.events.thin.len()), (1, 1));
         let s = e.events().get(&u.events.snapshot[0]).unwrap();
         let t = e.events().get(&u.events.thin[0]).unwrap();
@@ -363,6 +378,7 @@ mod tests {
             "cus_1".into(),
             cust("cus_1"),
             c.clone(),
+            &["customer.created"],
         );
         let u = e
             .update(
@@ -373,6 +389,8 @@ mod tests {
                     v["metadata"]["plan"] = json!("pro");
                 },
                 c,
+                ChangeKind::Updated,
+                &["customer.updated"],
             )
             .unwrap()
             .unwrap();
@@ -395,6 +413,7 @@ mod tests {
             "cus_1".into(),
             cust("cus_1"),
             c.clone(),
+            &["customer.created"],
         );
         let u = e
             .delete(
@@ -402,6 +421,7 @@ mod tests {
                 "cus_1",
                 json!({"id": "cus_1", "object": "customer", "deleted": true}),
                 c,
+                &["customer.deleted"],
             )
             .unwrap();
         let s = e.events().get(&u.events.snapshot[0]).unwrap();
@@ -416,7 +436,13 @@ mod tests {
             "[events]\nvisibility_lag = { distribution = \"fixed\", ms = 5000 }\n[event_retention]\nwindow = \"1h\"",
         );
         let c = e.begin_action("t");
-        let u = e.create(ObjectType::Customer, "cus_1".into(), cust("cus_1"), c);
+        let u = e.create(
+            ObjectType::Customer,
+            "cus_1".into(),
+            cust("cus_1"),
+            c,
+            &["customer.created"],
+        );
         let r = e.events().get(&u.events.snapshot[0]).unwrap().clone();
         assert_eq!(r.visible_at, r.created.plus_ms(5000));
         let ret = e.retention_ms();
@@ -433,6 +459,80 @@ mod tests {
         assert_eq!(
             n,
             json!({"id": "evt_test_1", "type": "v1.customer.created"})
+        );
+    }
+
+    #[test]
+    fn unannounced_mutation_has_no_events() {
+        let mut e = engine_with("");
+        let c = e.begin_action("t");
+        let u = e.create(
+            ObjectType::SubscriptionItem,
+            "si_1".into(),
+            json!({"id": "si_1", "object": "subscription_item", "created": 1767225600}),
+            c,
+            &[],
+        );
+        assert_eq!(u.events, crate::engine::EventRefs::default());
+        assert!(e.events().all().is_empty());
+    }
+
+    #[test]
+    fn two_types_two_pairs() {
+        let mut e = engine_with("");
+        let c = e.begin_action("t");
+        e.create(
+            ObjectType::Invoice,
+            "in_x".into(),
+            json!({"id": "in_x", "object": "invoice", "created": 1767225600, "status": "open"}),
+            c.clone(),
+            &["invoice.created"],
+        );
+        let u = e
+            .update(
+                ObjectType::Invoice,
+                "in_x",
+                |v| v["status"] = json!("paid"),
+                c,
+                ChangeKind::StateChanged,
+                &["invoice.paid", "invoice.payment_succeeded"],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!((u.events.snapshot.len(), u.events.thin.len()), (2, 2));
+        assert_eq!(u.kind, ChangeKind::StateChanged);
+        let types: Vec<String> = u
+            .events
+            .thin
+            .iter()
+            .map(|id| e.events().get(id).unwrap().event_type.clone())
+            .collect();
+        assert_eq!(types, ["v1.invoice.paid", "v1.invoice.payment_succeeded"]);
+        for id in &u.events.snapshot {
+            let s = e.events().get(id).unwrap();
+            assert_eq!(s.payload["data"]["previous_attributes"]["status"], "open");
+        }
+        let t = e.events().get(&u.events.thin[0]).unwrap();
+        assert_eq!(t.payload["related_object"]["url"], "/v1/invoices/in_x");
+        assert_eq!(t.payload["related_object"]["type"], "invoice");
+    }
+
+    #[test]
+    fn subscription_related_object() {
+        let mut e = engine_with("");
+        let c = e.begin_action("t");
+        let u = e.create(
+            ObjectType::Subscription,
+            "sub_1".into(),
+            json!({"id": "sub_1", "object": "subscription", "created": 1767225600}),
+            c,
+            &["customer.subscription.created"],
+        );
+        let t = e.events().get(&u.events.thin[0]).unwrap();
+        assert_eq!(t.event_type, "v1.customer.subscription.created");
+        assert_eq!(
+            t.payload["related_object"]["url"],
+            "/v1/subscriptions/sub_1"
         );
     }
 }
