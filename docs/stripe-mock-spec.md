@@ -192,7 +192,7 @@ events_from = ["@self", "@accounts"]   # @accounts: events from connected accoun
 `[accounts]` defaults and rules:
 
 - `platforms` must be `1`; any other value is rejected as not implemented.
-- `connect` defaults to `false`. With `connect = false` a connected-account count or rate above 0, any `Stripe-Account` or `Stripe-Context` header, and the `connect` / `events_from` destination options are errors.
+- `connect` defaults to `false`. With `connect = false` a connected-account count or rate above 0, any `Stripe-Account` or `Stripe-Context` header, and the `connect` / `events_from` destination options are accepted, but there are no connected-account events to route.
 - Defaults: `initial = 0`, `connect_rate = 0`, `deauthorize_rate = 0`, `account_api = { v1 = 0.5, v2 = 0.5 }`, `account_types = { standard = 0.5, express = 0.3, custom = 0.2 }`. Each mix must sum to 1 (±1e-9) with no negative weight.
 - `[churn.account] update` (per hour, default 0) updates a random connected account.
 - Initial accounts are connected at the start of history (`clock.start - history.duration`), so they get history too; their connect events fall inside history and are not delivered.
@@ -261,7 +261,7 @@ The mock models connected accounts created through **both** Accounts APIs, in th
 | Disconnect, any account | `account.application.deauthorized` and thin `v1.account.application.deauthorized` | the account |
 | Disconnect, v2 account | additionally thin `v2.core.account.closed` | none |
 
-The `data.object` of `account.application.*` is the platform application (`{"id": "ca_…", "object": "application", "name": …}`). The thin `related_object` of every account event is the account (`/v1/accounts/{id}`).
+The `data.object` of `account.application.*` is the platform application (`{"id": "ca_…", "object": "application", "name": …}`). The thin `related_object` of a `v1.`-prefixed or snapshot-paired account event is the account (`type: "account"`, `/v1/accounts/{id}`); that of a thin-only `v2.core.account.*` event is `{id, type: "v2.core.account", url: "/v2/core/accounts/{id}"}`, which still resolves after the account closes.
 
 **Disconnect and closed semantics.**
 
@@ -358,7 +358,7 @@ History events are listed by the Events APIs while inside retention, but never d
 
 ## 8. Events API
 
-Every truth-log mutation that Stripe would announce produces **one snapshot event and one thin event**. They share timing (`created`, visibility) and the thin event's `snapshot_event` points at the snapshot event's ID. Both formats are always generated; destinations choose which one they receive.
+Every truth-log mutation that Stripe would announce produces **one snapshot event and one thin event**. They share timing (`created`, visibility) and the thin event's `snapshot_event` points at the snapshot event's ID. Both formats are always generated; destinations choose which one they receive. The one exception is the thin-only `v2.core.account.*` events (section 5.4), which have no snapshot pair: their `snapshot_event` is `null`.
 
 ### 8.1 Snapshot events (v1)
 
@@ -374,7 +374,7 @@ Stripe made thin events for API v1 resources generally available in `2026-09-30.
 
 - **Naming**: the snapshot type with a `v1.` prefix, e.g. `customer.created` → `v1.customer.created`.
 - **Notification** (what a destination receives): `id`, `object: "v2.core.event"`, `type`, `created`, `livemode`, `context` (the connected account, for Connect), `reason` (`type`, `request {id, idempotency_key}`), and `related_object {id, type, url}`. `related_object.type` is the v1 object name (e.g. `customer`) and `url` is an API path such as `/v1/customers/cus_…`. The notification has **no** object data.
-- **Full event**: `GET /v2/core/events/{id}` adds `snapshot_event` (the matching `evt_…`) and the change details that Stripe includes on the full event (`changes`, `data`). Exact fields are generated from the OpenAPI spec (section 14).
+- **Full event**: `GET /v2/core/events/{id}` adds `snapshot_event` (the matching `evt_…`, or `null` for a thin-only `v2.core.account.*` event) and the change details that Stripe includes on the full event (`changes`, `data`). Exact fields are generated from the OpenAPI spec (section 14).
 - **List**: `GET /v2/core/events` with `types` filtering and v2-style pagination. It is subject to the same visibility lag, same-second shuffling and 30-day retention as snapshot events.
 - **Why thin events matter for testing**: the consumer must fetch the related object, so it always reads the *current* state rather than a snapshot. That interacts with stale reads (section 7.4), deleted objects (the fetch returns the deleted stub or 404) and rate limits (every event costs an API call), all of which the mock can provoke.
 
@@ -422,6 +422,8 @@ Per-object `version` starts at 1 and increases by one per mutation. A sync targe
   "cause": { "action": "start_subscription", "action_id": "act_77" }
 }
 ```
+
+`events.snapshot` and `events.thin` normally pair one-to-one; a thin-only `v2.core.account.*` event appears in `events.thin` with no snapshot counterpart. `account` is the object's scope, so an Account object's own truth entries have `account: null` (platform scope) while its v1 events carry the account's ID as their Connect label (section 5.4).
 
 Messages in the initial snapshot have `kind: "snapshot"` (`"deleted"` for tombstones), keep the object's latest `seq`, `at` and `version`, and have empty `events` and no `cause`.
 
