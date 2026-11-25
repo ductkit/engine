@@ -1,7 +1,11 @@
 //! The public control handle (spec section 11, in-process).
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 use crate::engine::{Engine, StateUpdate};
 use crate::generate::Generator;
@@ -18,6 +22,8 @@ pub(crate) struct Sim {
     pub engine: Engine,
     pub generator: Generator,
     pub control_rng: SimRng,
+    /// Draws `Request-Id` values.
+    pub api_rng: SimRng,
 }
 
 /// State shared by the handle, the HTTP server and the wall-clock ticker.
@@ -37,6 +43,9 @@ impl Shared {
 #[derive(Debug)]
 pub struct MockStripe {
     shared: Arc<Shared>,
+    api_addr: SocketAddr,
+    stop: Option<oneshot::Sender<()>>,
+    server: Option<JoinHandle<()>>,
 }
 
 impl MockStripe {
@@ -49,12 +58,45 @@ impl MockStripe {
             engine: Engine::new(start),
             generator: Generator::new(&config, &streams, start),
             control_rng: streams.stream("control"),
+            api_rng: streams.stream("api.request_ids"),
         };
         let shared = Arc::new(Shared {
             sim: Mutex::new(sim),
             config,
         });
-        Ok(MockStripe { shared })
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let api_addr = listener.local_addr()?;
+        let (stop, stopped) = oneshot::channel::<()>();
+        let app = crate::api::router(shared.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await;
+        });
+        Ok(MockStripe {
+            shared,
+            api_addr,
+            stop: Some(stop),
+            server: Some(server),
+        })
+    }
+
+    /// Base URL of the Stripe-compatible API, e.g. `http://127.0.0.1:54321`.
+    pub fn api_url(&self) -> String {
+        format!("http://{}", self.api_addr)
+    }
+
+    /// Stops the HTTP server (waiting until the port is closed) and ends every subscription.
+    pub async fn shutdown(mut self) {
+        self.shared.lock().engine.clear_subscribers();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(server) = self.server.take() {
+            let _ = server.await;
+        }
     }
 
     /// Current simulated time.
@@ -148,6 +190,14 @@ impl MockStripe {
             ClockMode::Wall => Err(MockError::ClockMode(
                 "the clock is in wall mode; step and advance_to need virtual mode".to_string(),
             )),
+        }
+    }
+}
+
+impl Drop for MockStripe {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
         }
     }
 }

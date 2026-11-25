@@ -2,6 +2,7 @@
 //!
 //! See `docs/stripe-mock-spec.md` in the repository.
 
+mod api;
 mod config;
 mod engine;
 mod error;

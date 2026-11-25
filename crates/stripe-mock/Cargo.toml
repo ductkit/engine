@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+axum.workspace = true
 chrono.workspace = true
 futures-core.workspace = true
 rand_chacha.workspace = true
@@ -18,3 +19,4 @@ toml.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true
+reqwest.workspace = true

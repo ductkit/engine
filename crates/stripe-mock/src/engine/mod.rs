@@ -242,6 +242,11 @@ impl Engine {
         subscription
     }
 
+    /// Ends every subscription (used on shutdown).
+    pub(crate) fn clear_subscribers(&mut self) {
+        self.subscribers.clear();
+    }
+
     /// Offers the update to every subscriber without waiting; drops lagging or closed ones.
     fn notify(&mut self, update: &StateUpdate) {
         self.subscribers.retain(|s| s.offer(update));
