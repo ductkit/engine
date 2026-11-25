@@ -86,6 +86,21 @@ One crate, `crates/stripe-mock` (package `ductkit-stripe-mock`), ships both:
 
 No container image is produced.
 
+The binary has three commands:
+
+```
+ductkit-stripe-mock serve  --config F [--api-addr A] [--control-addr A] [--clock virtual|wall] [--seed N] [--export-on-exit F]
+ductkit-stripe-mock replay --run F [--api-addr A] [--control-addr A] [--clock virtual|wall] [--seed N] [--export-on-exit F] [--drop-destinations]
+ductkit-stripe-mock check  --config F
+```
+
+- **Addresses**: the Stripe-compatible API defaults to `127.0.0.1:8420` and the control API to `127.0.0.1:8421`. Port `0` picks a free port.
+- **Ready line**: once both listeners are bound, the binary prints one JSON line to stdout, `{"api_url":"http://…","control_url":"http://…","seed":…}`. Tests and scripts read it, which makes port `0` usable.
+- **Clock**: the standalone default is `wall`. If the config file has no `clock.mode` key, the binary sets `mode = "wall"` before parsing. `--clock` overrides both the file and that default. `replay` always runs on the virtual clock (section 12).
+- **`--seed`** overrides the config's seed. **`--export-on-exit F`** writes the run export (section 12) when the process exits, whether by `POST /control/shutdown`, SIGINT or SIGTERM.
+- **`check`** parses and validates the config without starting anything. It prints `ok` and exits 0, or prints the error (with file line numbers where TOML gives them) to stderr and exits 1. Bad flags exit 2.
+- The control API has no authentication and binds to loopback by default. The binary warns on stderr when `--control-addr` is not a loopback address (section 11).
+
 ## 4. Configuration
 
 Configuration is a TOML file (or the equivalent Rust struct). All rates are per simulated hour unless stated. Every random choice draws from the seeded RNG.
@@ -290,19 +305,20 @@ Mutations inside one action are spaced over a short, configurable span (often th
 
 ### 6.2 Scripted scenarios
 
-Alongside random generation, tests can script exact sequences against the virtual clock, including projection-level decisions:
+Alongside random generation, tests can script exact sequences against the virtual clock. A script is a list of control operations (`ControlOp`, section 11) applied in order: `MockStripe::run_script(&[ControlOp])` in-process, `POST /control/script` over HTTP. Each op is applied at the current simulated time; a script that needs to wait includes `step` or `advance_to` ops. An exported run (section 12) is itself a script: its journal is a list of `{at, op}` entries.
 
-```rust
-mock.script(|s| {
-    let c = s.create_customer(json!({ "email": "a@example.com" }));
-    s.update(&c, json!({ "metadata": { "tier": "gold" } }));    // v2
-    s.update(&c, json!({ "metadata": { "tier": "silver" } }));  // v3
-    s.webhooks().deliver_in_order([c.event(3), c.event(2)]);     // v3 before v2
-    s.events().make_visible_after(c.event(2), Duration::from_secs(60));
-});
+```json
+[
+  {"op": "create_customer", "customer": {"email": "a@example.com"}},
+  {"op": "update_customer", "id": "cus_…", "update": {"type": "set_email", "value": "b@example.com"}}
+]
 ```
 
-Scripted scenarios are the regression suite for specific races; random runs look for new ones. A failing random run can be exported as a script.
+`CustomerUpdate` is adjacently tagged: `{"type": "set_email", "value": …}`. A script stops at its first failing op and reports how many ops completed.
+
+Projection-level script operations (delivering events out of order, making an event visible after a delay) are deferred. They need hooks into the delivery queue that are not built yet, and can be added later as new `ControlOp` variants.
+
+Scripted scenarios are the regression suite for specific races; random runs look for new ones. A failing random run can be exported as a script (section 12).
 
 ### 6.3 Pre-existing history
 
@@ -430,7 +446,22 @@ Messages in the initial snapshot have `kind: "snapshot"` (`"deleted"` for tombst
 ### 10.4 Transport
 
 - In-process: `handle.subscribe(filter) -> impl Stream<Item = SubscriptionItem>`, where `SubscriptionItem` is `Update(StateUpdate) | Synced | Lagged`.
-- Standalone: SSE (`GET /control/subscribe?account=…&types=…`) and WebSocket on the control port.
+- Standalone: SSE (`GET /control/subscribe`) and WebSocket (`GET /control/subscribe/ws`) on the control port.
+
+**Query parameters** (both transports; either may be absent, which means all):
+
+- `types=customer,subscription_item`: comma-separated object types. The `object_type` names used in updates are accepted, and so are Stripe `object` names (`line_item` for `invoice_line_item`). `GET /control/state` keys its objects by the Stripe `object` name.
+- `account=platform,acct_…`: comma-separated scopes; `platform` means the platform scope.
+- An unknown type, or an account that is unknown or disconnected, returns 400 (error envelope, section 11) before the stream starts.
+
+**SSE framing** (`content-type: text/event-stream`):
+
+- `event: update` with `data:` the `StateUpdate` JSON (section 10.3);
+- `event: synced` with `data: {}`, once the initial snapshot is complete;
+- `event: lagged` with `data: {}`, followed by the end of the stream; the consumer must resubscribe (section 10.1);
+- a `: keep-alive` comment every 15 s of wall time.
+
+**WebSocket framing**: one text frame per item: `{"type":"update","update":{…}}`, `{"type":"synced"}` or `{"type":"lagged"}`. After `lagged` the server sends a close frame. Messages from the client are ignored.
 
 ### 10.5 Delivery log (debugging)
 
@@ -448,7 +479,47 @@ Separate from the Stripe surface. Available as a Rust handle in-process and as H
 - **Subscription**: the latest-state subscription (section 10).
 - **Accounts**: connect a new v1 or v2 connected account, or disconnect one.
 - **Inspection**: current truth state (by type/ID or full dump), delivery log with the reason for every decision, event visibility timeline, effective config.
-- **Export**: snapshot state to JSON; export the run (seed + config + runtime changes + scripted steps) as a replayable script.
+- **Export**: snapshot state to JSON; export the run (seed + config + runtime changes + scripted steps) as a replayable script (section 12).
+
+### 11.1 HTTP routes
+
+All routes are under `/control` on the control port. Bodies are JSON. `{d}` is a duration string such as `"90s"`, and times are RFC 3339.
+
+| Method and path | Body or query | Calls |
+|---|---|---|
+| `GET /now` | – | `{"now": time}` |
+| `POST /step` | `{"duration": d}` | `step` |
+| `POST /advance_to` | `{"time": t}` | `advance_to` |
+| `POST /pause`, `POST /resume` | – | `pause` / `resume` |
+| `POST /speed` | `{"speed": f64}` | `set_speed` |
+| `POST /quiesce`, `POST /generation/resume`, `GET /generation` | – | `quiesce` / `resume_generation` / `{"enabled": bool}` |
+| `POST /ops` | one `ControlOp` | `apply` → `OpResult` |
+| `POST /script` | `{"steps": [ControlOp]}` | `run_script` → `[OpResult]`; stops at the first error (409 or 404, with `{"error", "completed": n}`) |
+| `GET /config` | – | the effective config: the start config with `[api]`, `[events]`, `[webhooks]`, `[actions]` and `destinations` at their current runtime values |
+| `POST /rate_limit` | `{"duration": d}` | `force_rate_limit` |
+| `GET /destinations` | – | `destinations` |
+| `GET /accounts` | – | `accounts` |
+| `GET /objects/{type}/{id}` | `?account=` | one object; `null` → 404 |
+| `GET /state` | `?account=&types=` | full dump of live objects |
+| `GET /truth_log` | `?after_seq=&limit=` (default 1000, max 10000) | slice of the truth log, with `has_more` |
+| `GET /events` | `?after=<evt id>&limit=` | slice of the event timeline |
+| `GET /deliveries` | `?limit=` | the last `limit` entries of the delivery log |
+| `GET /export` | – | the run export (section 12) |
+| `GET /subscribe`, `GET /subscribe/ws` | `?types=&account=` | SSE / WebSocket (section 10.4) |
+| `POST /shutdown` | – | 202, then a graceful shutdown of the whole server |
+
+Mutating calls other than `step`, `advance_to`, `quiesce`, pause, resume and speed go through `POST /control/ops`. That gives one route, one schema and the same shape as scripts and the journal. `ControlOp` covers customer create, update and delete (with an optional `account`), `run_action`, connect and disconnect account, config updates (`set_api_config`, `set_events_config`, `set_webhooks_config`, `set_actions_config`), and destination add, remove, enable, outage start and end, and secret rotation.
+
+**Errors** use one JSON envelope: `{"error": {"code": "<snake_case error name>", "message": "<text>"}}`. Status by error:
+
+- `no_such_object`, `no_such_destination`, `unknown_account` → 404;
+- `clock_mode`, `time_travel`, `deleted`, `invalid_action`, `connect_disabled` → 409;
+- `config`, and malformed bodies, queries or JSON → 400;
+- anything else → 500.
+
+**Shutdown**: `POST /control/shutdown` answers 202, then stops the control server and the API server. Shutdown is bounded: each server gets 2 s to finish in-flight requests, then is aborted. The process then exits 0, after writing the `--export-on-exit` file when one was given.
+
+**Security**: the control API has no authentication. It binds to loopback by default and is meant for test and development machines only. Never expose it on a shared network.
 
 ## 12. Determinism and time
 
@@ -459,7 +530,32 @@ Separate from the Stripe surface. Available as a Rust handle in-process and as H
   - Ties at the same instant run in this order: platform, the accounts generator, then connected accounts in connection order.
 - **Virtual clock** by default in-process: time only moves when the test advances it, or at a fixed multiple of wall time. Retry schedules, visibility lags and history all run on virtual time, so a "3 days of retries" scenario finishes in milliseconds.
 - In wall-clock mode the HTTP layer still uses real latencies; such runs are not exactly reproducible, but the seed still governs generation.
-- **Replay**: any run can be reproduced from its exported seed, config and runtime changes. Test failures should print the seed and the replay command.
+- **Replay**: any run can be reproduced from its exported seed, config and runtime changes. Test failures print the seed and the replay command (see `ReplayGuard` below).
+
+### 12.1 Run export and replay
+
+`GET /control/export` (in-process: `MockStripe::export_run`) returns the run as JSON:
+
+```json
+{
+  "format": "ductkit-stripe-mock/run@1",
+  "seed": 11,
+  "config": { "...": "..." },
+  "ended_at": "2026-01-01T04:00:00.000Z",
+  "journal": [{ "at": "2026-01-01T02:00:00.000Z", "op": { "op": "connect_account", "api": "v2" } }]
+}
+```
+
+- `config` is the config the run **started** with; runtime changes are in the journal.
+- **Journalled** (every op that changes truth, the projection or delivery): customer create, update and delete, `run_action`, connect and disconnect account, each config update (recorded as the full resulting section, because closures cannot be serialized), destination add, remove, enable, outage start and end and secret rotation, `quiesce` and `resume_generation`, `step` and `advance_to` (recorded as the time they reached), and pagination writes fired by API requests.
+- **Not journalled**: `pause`, `resume` and `set_speed`, which only shape wall time (ops carry their own `at`); `force_rate_limit` and other API-only faults, which never touch truth; every read. A failed control call is not journalled and does not use up an action number.
+- In wall mode every journalled control call first ticks the clock, so everything due by the op's `at` has already run.
+
+**Replay** (`MockStripe::replay(export, options)`, or `ductkit-stripe-mock replay --run F`) always runs on the virtual clock. Before applying each op it advances time to the op's `at`, running every action and delivery due at or before it, then applies the op. After the last op it advances to `ended_at` and stops there. Replay rejects an unknown `format` with a config error.
+
+- **Guarantee**: replay reproduces the **truth log** and the **event timeline** of the original. It does not guarantee the delivery log: destinations are kept, so deliveries are attempted again against the same URLs, and real HTTP outcomes can differ. `--drop-destinations` (`ReplayOptions { drop_destinations: true }`) removes them for offline replays.
+- A wall-mode run replays exactly up to the tick boundary.
+- **`ReplayGuard`**: `MockStripe::replay_guard(dir)` returns a guard that, when dropped during a panic, writes `<dir>/run-<seed>-<ended_at ms>.json` and prints to stderr `stripe-mock: run exported to <path>; replay with: ductkit-stripe-mock replay --run <path>`. Tests hold one so that a failure leaves a replayable file behind.
 
 ## 13. Future verifier (out of scope)
 

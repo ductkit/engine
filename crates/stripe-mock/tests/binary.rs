@@ -1,170 +1,18 @@
 //! Spawns the `ductkit-stripe-mock` binary and talks to it over HTTP.
 
-use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant};
+mod common;
+
+use std::io::Read;
+use std::process::Command;
+use std::time::Duration;
+
+use common::{Server, temp_dir, write};
 
 use ductkit_stripe_mock::{Config, MockStripe, NewCustomer, RunExport};
 use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_ductkit-stripe-mock");
 const MINIMAL: &str = "seed = 3\n[history]\nduration = \"1h\"\n";
-
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn temp_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "ductkit-stripe-mock-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn write(dir: &std::path::Path, name: &str, text: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, text).unwrap();
-    path
-}
-
-/// A running binary; killed on drop so a failed test leaves no server behind.
-struct Server {
-    child: Child,
-    api_url: String,
-    control_url: String,
-    seed: u64,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Server {
-    fn start(args: &[&str]) -> Server {
-        let mut child = Command::new(BIN)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("binary spawns");
-        let stdout = child.stdout.take().unwrap();
-        // Drained continuously so the child never blocks on a full pipe.
-        let stderr_text = Arc::new(Mutex::new(String::new()));
-        let mut stderr = child.stderr.take().unwrap();
-        let sink = stderr_text.clone();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            while let Ok(n) = stderr.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                sink.lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buf[..n]));
-            }
-        });
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            let _ = BufReader::new(stdout).read_line(&mut line);
-            let _ = tx.send(line);
-        });
-        // Owned by the guard from here on, so a timeout below still kills it.
-        let mut server = Server {
-            child,
-            api_url: String::new(),
-            control_url: String::new(),
-            seed: 0,
-        };
-        let line = rx.recv_timeout(Duration::from_secs(10));
-        std::thread::sleep(Duration::from_millis(50));
-        let stderr = stderr_text.lock().unwrap().clone();
-        let line =
-            line.unwrap_or_else(|e| panic!("no ready line within 10 s ({e}); stderr: {stderr}"));
-        let ready: Value = serde_json::from_str(&line)
-            .unwrap_or_else(|e| panic!("ready line {line:?} is not JSON ({e}); stderr: {stderr}"));
-        server.api_url = ready["api_url"].as_str().unwrap().to_string();
-        server.control_url = ready["control_url"].as_str().unwrap().to_string();
-        server.seed = ready["seed"].as_u64().unwrap();
-        server
-    }
-
-    fn serve(config: &std::path::Path, extra: &[&str]) -> Server {
-        let mut args = vec![
-            "serve",
-            "--config",
-            config.to_str().unwrap(),
-            "--api-addr",
-            "127.0.0.1:0",
-            "--control-addr",
-            "127.0.0.1:0",
-        ];
-        args.extend_from_slice(extra);
-        Server::start(&args)
-    }
-
-    async fn get(&self, path: &str) -> reqwest::Response {
-        reqwest::get(format!("{}{path}", self.control_url))
-            .await
-            .unwrap()
-    }
-
-    async fn post(&self, path: &str, body: Value) -> reqwest::Response {
-        reqwest::Client::new()
-            .post(format!("{}{path}", self.control_url))
-            .json(&body)
-            .send()
-            .await
-            .unwrap()
-    }
-
-    async fn now_ms(&self) -> i64 {
-        let body: Value = self.get("/control/now").await.json().await.unwrap();
-        chrono::DateTime::parse_from_rfc3339(body["now"].as_str().unwrap())
-            .unwrap()
-            .timestamp_millis()
-    }
-
-    async fn truth_log(&self) -> String {
-        let mut all = Vec::new();
-        let mut after = 0;
-        loop {
-            let page: Value = self
-                .get(&format!("/control/truth_log?after_seq={after}&limit=500"))
-                .await
-                .json()
-                .await
-                .unwrap();
-            let data = page["data"].as_array().unwrap();
-            if let Some(last) = data.last() {
-                after = last["seq"].as_u64().unwrap();
-            }
-            all.extend(data.iter().cloned());
-            if page["has_more"] != true {
-                break;
-            }
-        }
-        serde_json::to_string(&all).unwrap()
-    }
-
-    fn wait_exit(&mut self, within: Duration) -> ExitStatus {
-        let deadline = Instant::now() + within;
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                return status;
-            }
-            assert!(Instant::now() < deadline, "process did not exit in time");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
 
 struct Output {
     code: Option<i32>,

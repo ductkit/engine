@@ -25,6 +25,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
 
+Run the standalone Stripe mock (flags and control API: `docs/stripe-mock-spec.md` sections 3 and 11):
+
+```sh
+cargo run -p ductkit-stripe-mock -- serve --config mock.toml
+cargo run -p ductkit-stripe-mock -- check --config mock.toml   # validate a config only
+```
+
 Run `cargo fmt --all` and `cargo clippy` before committing; keep clippy warning-free.
 
 ## Conventions

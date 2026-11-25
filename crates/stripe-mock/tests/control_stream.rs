@@ -2,8 +2,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
-use common::{ctl_get, mock_with_control};
+use common::{Sse, WAIT, ctl_get, mock_with_control};
 use ductkit_stripe_mock::{AccountApi, Action, MockStripe, NewCustomer};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -21,55 +20,6 @@ const SPEC_KEYS: [&str; 10] = [
     "events",
     "cause",
 ];
-const WAIT: Duration = Duration::from_secs(5);
-
-/// A parsed SSE stream: `next` yields `(event, data)` and skips comments.
-struct Sse {
-    stream: std::pin::Pin<Box<dyn futures_core::Stream<Item = reqwest::Result<Bytes>>>>,
-    buf: String,
-}
-
-impl Sse {
-    async fn open(m: &MockStripe, query: &str) -> Sse {
-        let url = m.control_url().expect("control API is open");
-        let r = reqwest::get(format!("{url}/control/subscribe{query}"))
-            .await
-            .expect("connects");
-        assert_eq!(r.status(), 200);
-        assert_eq!(r.headers()["content-type"], "text/event-stream");
-        Sse {
-            stream: Box::pin(r.bytes_stream()),
-            buf: String::new(),
-        }
-    }
-
-    /// The next frame, or `None` at the end of the stream.
-    async fn next(&mut self) -> Option<(String, Value)> {
-        loop {
-            if let Some(i) = self.buf.find("\n\n") {
-                let block: String = self.buf.drain(..i + 2).collect();
-                let mut event = None;
-                let mut data = String::new();
-                for line in block.lines() {
-                    if let Some(v) = line.strip_prefix("event:") {
-                        event = Some(v.trim().to_string());
-                    } else if let Some(v) = line.strip_prefix("data:") {
-                        data.push_str(v.trim_start());
-                    }
-                }
-                let Some(event) = event else { continue };
-                return Some((event, serde_json::from_str(&data).expect("JSON data")));
-            }
-            match tokio::time::timeout(WAIT, self.stream.next())
-                .await
-                .expect("stream stalled")
-            {
-                Some(chunk) => self.buf.push_str(&String::from_utf8_lossy(&chunk.unwrap())),
-                None => return None,
-            }
-        }
-    }
-}
 
 fn assert_spec_keys(update: &Value) {
     for key in SPEC_KEYS {

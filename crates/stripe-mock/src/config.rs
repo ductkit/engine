@@ -1439,6 +1439,13 @@ platforms = 2",
     }
 
     #[test]
+    fn spec_documents_control_api() {
+        let spec = include_str!("../../../docs/stripe-mock-spec.md");
+        assert!(spec.contains("POST /control/ops"));
+        assert!(spec.contains("ductkit-stripe-mock/run@1"));
+    }
+
+    #[test]
     fn spec_mentions_stripe_context() {
         let spec = include_str!("../../../docs/stripe-mock-spec.md");
         assert!(spec.contains("Stripe-Context"));
