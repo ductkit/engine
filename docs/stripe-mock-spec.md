@@ -122,6 +122,9 @@ one_off_payment = 6.0
 refund = 0.4
 dispute = 0.05
 catalog_change = 0.2                   # products/prices created, archived
+one_off_invoice = 2.0                  # a manual invoice, with a drawn outcome
+step_delay = { distribution = "lognormal", median_ms = 200, p99_ms = 2000 }   # gap between an action's steps
+payment_failure_probability = 0.1      # per invoice payment attempt
 
 # Extra per-type churn on top of actions.
 [churn.customer]
@@ -130,6 +133,13 @@ delete = 0.2
 [churn.product]
 update = 0.5
 archive = 0.1
+[churn.price]
+update = 0.5
+archive = 0.1
+[churn.subscription]
+update = 0.5         # metadata
+[churn.invoice]
+update = 0.5         # metadata
 
 [api]
 keys = ["sk_test_mock"]   # accepted API keys (section 7.1)
@@ -204,6 +214,8 @@ Each type has a state machine that only allows legal transitions, for example:
 - `subscription.status`: `incomplete → active | incomplete_expired`, `active ⇄ past_due`, `active → canceled`, `trialing → active`, `active ⇄ paused`.
 - `invoice.status`: `draft → open → paid | void | uncollectible`, `draft →` deleted.
 
+Phase 3 generates `incomplete → active | incomplete_expired`, `active ⇄ past_due`, `active | past_due → canceled`; `trialing` and `paused` are not generated yet.
+
 ### 5.3 Value realism
 
 - Integer amounts in the smallest currency unit, including zero-decimal currencies (JPY etc.) and very large amounts.
@@ -221,7 +233,7 @@ The mock models connected accounts created through **both** Accounts APIs, in th
 - Both kinds use `acct_` IDs and are addressed with the `Stripe-Account` header. Whether a v2 account is also readable through `/v1/accounts` follows Stripe's documented behaviour for the pinned version (section 18).
 - Accounts can be connected and disconnected during a run (`connect_rate`, `deauthorize_rate`, control API).
 
-**Event coverage is identical for platform and connected accounts.** Every action, entity type, lifecycle and event type the mock generates for a platform account is generated for each connected account too, with the same rates. Connected-account events reach snapshot destinations with `connect = true` (carrying `account`) and thin destinations with `other_accounts` in `events_from` (carrying `context`). All faults apply to them in the same way.
+**Event coverage is identical for platform and connected accounts.** Every action, entity type, lifecycle and event type the mock generates for a platform account is generated for each connected account too, with the same rates. Connected-account events reach snapshot destinations with `connect = true` (carrying `account`) and thin destinations with `@accounts` in `events_from` (carrying `context`). All faults apply to them in the same way.
 
 ## 6. Action generation
 
@@ -234,6 +246,8 @@ In Stripe, one action produces many events across objects. The generator models 
 3. `payment_intent.created` → `payment_intent.succeeded`, `charge.succeeded`
 4. `invoice.paid`, `invoice.payment_succeeded`
 5. `customer.subscription.updated` (status `incomplete → active`)
+
+Until payment objects exist (phase 7), paying an invoice is one mutation announcing `invoice.paid` and `invoice.payment_succeeded`.
 
 Mutations inside one action are spaced over a short, configurable span (often the same second), which produces the cross-object races that matter. Per-type `churn` rates add independent updates and deletes on top.
 
@@ -283,6 +297,7 @@ Before the run starts, `history` generates data over a past period. Data older t
 - Deleted objects are excluded; archived ones are included (with filters such as `active=`).
 - Embedded lists (`subscription.items`, `invoice.lines`) truncated to `nested_list_page_size` with `has_more: true` and a `url` for the sub-list.
 - Expandable fields return IDs unless `expand[]` asks for the object.
+- Sub-lists list in creation order, ascending, so their first page equals the embedded list.
 
 ### 7.4 Consistency faults on the API
 

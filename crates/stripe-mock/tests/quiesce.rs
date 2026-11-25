@@ -129,3 +129,37 @@ async fn quiesce_keeps_the_nominal_retry_window() {
     // As under `step`: the first attempt is at +10m and the retry at +11m is within 10m of it.
     assert_eq!(rx.requests().len(), 2);
 }
+
+#[tokio::test]
+async fn quiesce_pauses_continuations() {
+    use ductkit_stripe_mock::{Action, ObjectType};
+    let m = mock_with("[actions]\nstep_delay = { distribution = \"fixed\", ms = 60000 }").await;
+    m.run_action(Action::StartSubscription {
+        customer: None,
+        prices: None,
+    })
+    .unwrap();
+    m.quiesce().await.unwrap();
+    let log = m.truth_log();
+    let sub = log
+        .iter()
+        .rev()
+        .find(|u| u.object_type == ObjectType::Subscription)
+        .unwrap()
+        .object_id
+        .clone();
+    let status = |m: &ductkit_stripe_mock::MockStripe| {
+        m.get(ObjectType::Subscription, &sub).unwrap().state["status"].clone()
+    };
+    assert_eq!(status(&m), "incomplete");
+    assert!(
+        log.iter()
+            .filter(|u| u.object_type == ObjectType::Invoice)
+            .all(|u| u.state["status"] == "draft")
+    );
+    m.step(Duration::from_secs(3600)).await.unwrap();
+    assert_eq!(m.truth_log().len(), log.len());
+    m.resume_generation();
+    m.step(Duration::from_secs(600)).await.unwrap();
+    assert_eq!(status(&m), "active");
+}

@@ -158,3 +158,32 @@ async fn failed_first_payment_expires_after_23h() {
     assert_eq!(inv.state["status"], "void");
     assert_eq!(s.cause.unwrap(), cause);
 }
+
+#[tokio::test]
+async fn billing_run_is_deterministic() {
+    // Rates are per simulated hour: a tenth of the spec example keeps 40 days fast.
+    let cfg = "seed = 12\n[actions]\nnew_customer = 1.0\nstart_subscription = 0.4\ncancel_subscription = 0.05\ncatalog_change = 0.02\none_off_invoice = 0.2\nstep_delay = { distribution = \"lognormal\", median_ms = 200, p99_ms = 2000 }\npayment_failure_probability = 0.1\n[churn.product]\nupdate = 0.05\narchive = 0.05\n[churn.price]\nupdate = 0.05\narchive = 0.05\n[churn.subscription]\nupdate = 0.05\n[churn.invoice]\nupdate = 0.05\n";
+    let a = mock_with(cfg).await;
+    let b = mock_with(cfg).await;
+    a.step(Duration::from_secs(40 * 86_400)).await.unwrap();
+    b.step(Duration::from_secs(40 * 86_400)).await.unwrap();
+    let log = a.truth_log();
+    assert_eq!(
+        serde_json::to_value(&log).unwrap(),
+        serde_json::to_value(b.truth_log()).unwrap()
+    );
+    for t in [
+        ObjectType::Customer,
+        ObjectType::Product,
+        ObjectType::Price,
+        ObjectType::Subscription,
+        ObjectType::SubscriptionItem,
+        ObjectType::Invoice,
+        ObjectType::InvoiceLineItem,
+    ] {
+        assert!(log.iter().any(|u| u.object_type == t), "{t:?} missing");
+    }
+    for k in [ChangeKind::Archived, ChangeKind::StateChanged] {
+        assert!(log.iter().any(|u| u.kind == k), "{k:?} missing");
+    }
+}

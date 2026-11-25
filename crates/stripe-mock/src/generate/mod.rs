@@ -336,6 +336,12 @@ impl Generator {
             for a in &mut self.actions {
                 a.next_due = a.rng.exp_interval_ms(a.rate).map(|ms| now.plus_ms(ms));
             }
+            // Continuations that fell due while paused run now, in queue order.
+            let later = self.ctx.queue.split_off(&(now, 0));
+            let overdue = std::mem::replace(&mut self.ctx.queue, later);
+            for ((_, seq), entry) in overdue {
+                self.ctx.queue.insert((now, seq), entry);
+            }
         }
         self.enabled = on;
     }
