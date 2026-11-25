@@ -10,6 +10,18 @@ pub enum MockError {
         requested: crate::SimTime,
         now: crate::SimTime,
     },
+    /// No object with this ID exists.
+    #[error("no such {object_type}: {id}")]
+    NoSuchObject {
+        object_type: crate::ObjectType,
+        id: String,
+    },
+    /// The object exists but has been deleted.
+    #[error("{object_type} {id} is deleted")]
+    Deleted {
+        object_type: crate::ObjectType,
+        id: String,
+    },
     /// Reading a config file failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
