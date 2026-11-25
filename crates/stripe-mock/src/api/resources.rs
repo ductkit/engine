@@ -231,9 +231,10 @@ async fn list(
     // A write during pagination runs before the view is taken, so this page sees it.
     if (p.starting_after.is_some() || p.ending_before.is_some()) && sim.api.pagination_write() {
         let Sim {
-            engine, generator, ..
+            engine, generators, ..
         } = &mut *sim;
-        generator.pagination_write(engine, r.t);
+        let scope = engine.scope().clone();
+        generators.pagination_write(&scope, r.t, engine);
     }
     let at = stale_at(&mut sim);
     let view = View {

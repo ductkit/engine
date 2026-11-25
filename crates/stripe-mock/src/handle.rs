@@ -10,10 +10,9 @@ use tokio::task::JoinHandle;
 use crate::delivery::sender::send;
 use crate::delivery::{DeliveryRecord, DestinationInfo, PreparedAttempt};
 use crate::engine::events::EventInfo;
-use crate::engine::{Cause, ChangeKind, Engine, StateUpdate};
+use crate::engine::{Cause, ChangeKind, Engine, Scope, StateUpdate};
 use crate::faults::api::ApiFaults;
-use crate::generate::{self, AccountsGenerator, Generator};
-use crate::generate::{Action, delete_customer_cascade};
+use crate::generate::{Action, Generators, delete_customer_cascade};
 use crate::model::customer::{CustomerUpdate, NewCustomer, apply_update, new_customer_json};
 use crate::rng::{RngStreams, SimRng};
 use crate::stream::{SubscribeFilter, SubscribeOptions, Subscription};
@@ -26,9 +25,8 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct Sim {
     pub engine: Engine,
-    pub generator: Generator,
-    /// Connects, disconnects and updates connected accounts.
-    pub accounts: AccountsGenerator,
+    /// The platform's, the accounts and every connected account's generator.
+    pub generators: Generators,
     pub control_rng: SimRng,
     /// Draws `Request-Id` values.
     pub api_rng: SimRng,
@@ -76,12 +74,9 @@ impl Shared {
         let mut sim = self.lock();
         if target > sim.engine.now() {
             let Sim {
-                engine,
-                generator,
-                accounts,
-                ..
+                engine, generators, ..
             } = &mut *sim;
-            generate::run_until(generator, accounts, engine, target);
+            generators.run_until(engine, target);
         }
         let now = sim.engine.now();
         let mut due = Vec::new();
@@ -188,25 +183,16 @@ impl MockStripe {
         // scaled rates, before any destination exists, so none of it is delivered.
         let history_start = start.plus_ms(-config.history.duration.ms());
         let mut engine = Engine::new(history_start, &config, &streams);
-        let mut generator = Generator::new(&config, &streams, history_start);
-        let mut accounts = AccountsGenerator::new(
-            &config.accounts,
-            &config.churn.account,
-            config.seed,
-            history_start,
-        );
+        let mut generators = Generators::new(&config, &streams, history_start);
         // Initial accounts are connected at history start, so they get history too.
-        accounts.connect_initial(&mut engine, config.accounts.connected_accounts.initial);
-        generator.scale_rates(config.history.scale, history_start);
-        accounts.scale_rates(config.history.scale, history_start);
-        generate::run_until(&mut generator, &mut accounts, &mut engine, start);
-        generator.scale_rates(1.0, start);
-        accounts.scale_rates(1.0, start);
+        generators.connect_initial(&mut engine, config.accounts.connected_accounts.initial);
+        generators.scale_rates(config.history.scale, history_start);
+        generators.run_until(&mut engine, start);
+        generators.scale_rates(1.0, start);
         engine.add_config_destinations(&config);
         let sim = Sim {
             engine,
-            generator,
-            accounts,
+            generators,
             control_rng: streams.stream("control"),
             api_rng: streams.stream("api.request_ids"),
             api: ApiFaults::new(&config.api, &streams),
@@ -325,21 +311,18 @@ impl MockStripe {
             let (due, batch) = {
                 let mut sim = self.shared.lock();
                 let Sim {
-                    engine,
-                    generator,
-                    accounts,
-                    ..
+                    engine, generators, ..
                 } = &mut *sim;
-                let action = generate::next_due(generator, accounts).filter(|g| *g <= t);
+                let action = generators.next_due().filter(|g| *g <= t);
                 let delivery = engine.next_delivery_due().filter(|d| *d <= t);
                 match (action, delivery) {
                     (None, None) => {
-                        generate::run_until(generator, accounts, engine, t);
+                        generators.run_until(engine, t);
                         return Ok(());
                     }
                     // Actions first on ties, so a zero-delay event joins the batch.
                     (Some(g), d) if d.is_none_or(|d| g <= d) => {
-                        generate::run_until(generator, accounts, engine, g);
+                        generators.run_until(engine, g);
                         continue;
                     }
                     (_, Some(d)) => {
@@ -358,46 +341,92 @@ impl MockStripe {
 
     /// Creates a customer now and returns its ID.
     pub fn create_customer(&self, p: NewCustomer) -> Result<String, MockError> {
-        let mut sim = self.shared.lock();
-        let Sim {
-            engine,
-            control_rng,
-            ..
-        } = &mut *sim;
-        let id = control_rng.id(ObjectType::Customer.id_prefix());
-        let prefix = control_rng.alnum_upper(8);
-        let state = new_customer_json(&id, engine.now().unix_seconds(), &prefix, &p);
-        let cause = engine.begin_action("control.create_customer");
-        engine.create(
-            ObjectType::Customer,
-            id.clone(),
-            state,
-            cause,
-            &["customer.created"],
-        );
-        Ok(id)
+        self.create_customer_in(&None, p)
+    }
+
+    fn create_customer_in(&self, scope: &Scope, p: NewCustomer) -> Result<String, MockError> {
+        self.scoped(scope, |engine, control_rng, _| {
+            let id = control_rng.id(ObjectType::Customer.id_prefix());
+            let prefix = control_rng.alnum_upper(8);
+            let state = new_customer_json(&id, engine.now().unix_seconds(), &prefix, &p);
+            let cause = engine.begin_action("control.create_customer");
+            engine.create(
+                ObjectType::Customer,
+                id.clone(),
+                state,
+                cause,
+                &["customer.created"],
+            );
+            Ok(id)
+        })
     }
 
     /// Updates a customer now. Returns the new version, or `None` if nothing changed.
     pub fn update_customer(&self, id: &str, u: CustomerUpdate) -> Result<Option<u64>, MockError> {
-        let mut sim = self.shared.lock();
-        let cause = sim.engine.begin_action("control.update_customer");
-        let update = sim.engine.update(
-            ObjectType::Customer,
-            id,
-            |s| apply_update(s, &u),
-            cause,
-            ChangeKind::Updated,
-            &["customer.updated"],
-        )?;
-        Ok(update.map(|u| u.version))
+        self.update_customer_in(&None, id, u)
+    }
+
+    fn update_customer_in(
+        &self,
+        scope: &Scope,
+        id: &str,
+        u: CustomerUpdate,
+    ) -> Result<Option<u64>, MockError> {
+        self.scoped(scope, |engine, _, _| {
+            let cause = engine.begin_action("control.update_customer");
+            let update = engine.update(
+                ObjectType::Customer,
+                id,
+                |s| apply_update(s, &u),
+                cause,
+                ChangeKind::Updated,
+                &["customer.updated"],
+            )?;
+            Ok(update.map(|u| u.version))
+        })
     }
 
     /// Deletes a customer now.
     pub fn delete_customer(&self, id: &str) -> Result<(), MockError> {
+        self.delete_customer_in(&None, id)
+    }
+
+    fn delete_customer_in(&self, scope: &Scope, id: &str) -> Result<(), MockError> {
+        self.scoped(scope, |engine, _, _| {
+            let cause = engine.begin_action("control.delete_customer");
+            delete_customer_cascade(engine, id, &cause)
+        })
+    }
+
+    /// A control surface scoped to the connected account `id`. Its methods fail with
+    /// `UnknownAccount` while the account is unknown or disconnected.
+    pub fn account(&self, id: &str) -> AccountHandle<'_> {
+        AccountHandle {
+            mock: self,
+            scope: Some(id.to_string()),
+        }
+    }
+
+    /// Runs `f` in `scope`, failing with `UnknownAccount` for an account that is
+    /// unknown or disconnected.
+    fn scoped<R>(
+        &self,
+        scope: &Scope,
+        f: impl FnOnce(&mut Engine, &mut SimRng, &mut Generators) -> Result<R, MockError>,
+    ) -> Result<R, MockError> {
         let mut sim = self.shared.lock();
-        let cause = sim.engine.begin_action("control.delete_customer");
-        delete_customer_cascade(&mut sim.engine, id, &cause)
+        let Sim {
+            engine,
+            control_rng,
+            generators,
+            ..
+        } = &mut *sim;
+        if let Some(id) = scope
+            && !engine.account_meta(id).is_some_and(|m| m.connected)
+        {
+            return Err(MockError::UnknownAccount(id.clone()));
+        }
+        engine.in_scope(scope.clone(), |e| f(e, control_rng, generators))
     }
 
     /// Connects a new account through the given Accounts API now and returns its ID.
@@ -406,16 +435,19 @@ impl MockStripe {
         self.require_connect()?;
         let mut sim = self.shared.lock();
         let Sim {
-            engine, accounts, ..
+            engine, generators, ..
         } = &mut *sim;
-        let (api, kind, configurations, content) = accounts.draw_new_with(Some(api));
-        Ok(engine.connect_account(api, kind, configurations, content))
+        Ok(generators.connect_account(engine, api))
     }
 
     /// Disconnects a connected account now (the platform loses access to it).
     pub fn disconnect_account(&self, id: &str) -> Result<(), MockError> {
         self.require_connect()?;
-        self.shared.lock().engine.disconnect_account(id)
+        let mut sim = self.shared.lock();
+        let Sim {
+            engine, generators, ..
+        } = &mut *sim;
+        generators.disconnect_account(engine, id)
     }
 
     /// Every account ever connected, in connection order.
@@ -446,11 +478,13 @@ impl MockStripe {
     /// Runs a business action now, plus every follow-up step due by now
     /// (spec section 11, "Triggers"). Returns the action's cause.
     pub fn run_action(&self, a: Action) -> Result<Cause, MockError> {
-        let mut sim = self.shared.lock();
-        let Sim {
-            engine, generator, ..
-        } = &mut *sim;
-        generator.run_action(engine, a)
+        self.run_action_in(&None, a)
+    }
+
+    fn run_action_in(&self, scope: &Scope, a: Action) -> Result<Cause, MockError> {
+        self.scoped(scope, |engine, _, generators| {
+            generators.run_action(scope, engine, a)
+        })
     }
 
     /// Subscribes to the latest state of every matching object (spec section 10).
@@ -480,8 +514,7 @@ impl MockStripe {
         {
             let mut sim = self.shared.lock();
             let now = sim.engine.now();
-            sim.generator.set_enabled(false, now);
-            sim.accounts.set_enabled(false, now);
+            sim.generators.set_enabled(false, now);
             sim.engine.begin_quiesce();
         }
         let _quiescing = QuiesceGuard(&self.shared);
@@ -511,13 +544,12 @@ impl MockStripe {
     pub fn resume_generation(&self) {
         let mut sim = self.shared.lock();
         let now = sim.engine.now();
-        sim.generator.set_enabled(true, now);
-        sim.accounts.set_enabled(true, now);
+        sim.generators.set_enabled(true, now);
     }
 
     /// Whether generated traffic is running.
     pub fn generation_enabled(&self) -> bool {
-        self.shared.lock().generator.enabled()
+        self.shared.lock().generators.enabled()
     }
 
     /// Changes webhook settings (validated); affects future scheduling and attempts only.
@@ -556,11 +588,11 @@ impl MockStripe {
         f: impl FnOnce(&mut ActionsConfig),
     ) -> Result<(), MockError> {
         let mut sim = self.shared.lock();
-        let mut cfg = sim.generator.actions_config().clone();
+        let mut cfg = sim.generators.actions_config().clone();
         f(&mut cfg);
         cfg.validate()?;
         let sim = &mut *sim;
-        sim.generator.set_actions_config(cfg, &mut sim.engine);
+        sim.generators.set_actions_config(cfg, &mut sim.engine);
         Ok(())
     }
 
@@ -698,5 +730,43 @@ impl Drop for MockStripe {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
+    }
+}
+
+/// A control surface scoped to one connected account, from [`MockStripe::account`].
+/// Same operations as the platform's, acting on that account's objects only.
+#[derive(Debug, Clone)]
+pub struct AccountHandle<'a> {
+    mock: &'a MockStripe,
+    scope: Scope,
+}
+
+impl AccountHandle<'_> {
+    /// Creates a customer in the account now and returns its ID.
+    pub fn create_customer(&self, p: NewCustomer) -> Result<String, MockError> {
+        self.mock.create_customer_in(&self.scope, p)
+    }
+
+    /// Updates a customer of the account. Returns the new version, or `None` if
+    /// nothing changed.
+    pub fn update_customer(&self, id: &str, u: CustomerUpdate) -> Result<Option<u64>, MockError> {
+        self.mock.update_customer_in(&self.scope, id, u)
+    }
+
+    /// Deletes a customer of the account.
+    pub fn delete_customer(&self, id: &str) -> Result<(), MockError> {
+        self.mock.delete_customer_in(&self.scope, id)
+    }
+
+    /// Runs a business action in the account now, plus every follow-up step due.
+    pub fn run_action(&self, a: Action) -> Result<Cause, MockError> {
+        self.mock.run_action_in(&self.scope, a)
+    }
+
+    /// The latest truth-log entry for an object of the account, deleted or not.
+    pub fn get(&self, t: ObjectType, id: &str) -> Result<Option<StateUpdate>, MockError> {
+        self.mock.scoped(&self.scope, |engine, _, _| {
+            Ok(engine.latest(t, id).cloned())
+        })
     }
 }

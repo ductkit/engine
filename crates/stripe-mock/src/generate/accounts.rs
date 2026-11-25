@@ -14,7 +14,6 @@ use crate::{
 
 /// A change to the set of connected accounts, so per-account generators can follow.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // the per-account generators read these (Task 3)
 pub(crate) enum AccountChange {
     Connected(String),
     Disconnected(String),
@@ -73,6 +72,8 @@ pub(crate) struct AccountsGenerator {
     content: SimRng,
     api_mix: AccountApiMix,
     type_mix: AccountTypeMix,
+    /// Draws for updates triggered by pagination writes.
+    pagination: SimRng,
     enabled: bool,
 }
 
@@ -98,6 +99,7 @@ impl AccountsGenerator {
             content: streams.stream("accounts.content"),
             api_mix: cfg.account_api.clone(),
             type_mix: cfg.account_types.clone(),
+            pagination: streams.stream("api.pagination_writes.accounts"),
             enabled: true,
         }
     }
@@ -166,19 +168,17 @@ impl AccountsGenerator {
                         changes.push(AccountChange::Disconnected(id));
                     }
                 }
-                Kind::Update => {
-                    let connected = engine.connected_ids();
-                    if !connected.is_empty() {
-                        let rng = &mut self.clocks[i].1.rng;
-                        let id = connected[rng.below(connected.len() as u64) as usize].clone();
-                        let content = random_content(rng);
-                        engine
-                            .update_account(&id, content)
-                            .expect("picked from the connected accounts");
-                    }
-                }
+                Kind::Update => update_random(&mut self.clocks[i].1.rng, engine),
             }
             self.clocks[i].1.redraw(due);
+        }
+    }
+
+    /// A write during pagination of the accounts list: one update of a random
+    /// connected account. Does nothing while disabled.
+    pub(crate) fn pagination_update(&mut self, engine: &mut Engine) {
+        if self.enabled {
+            update_random(&mut self.pagination, engine);
         }
     }
 
@@ -242,4 +242,17 @@ impl AccountsGenerator {
         let content = random_content(&mut self.content);
         (api, kind, configurations, content)
     }
+}
+
+/// Updates a random connected account, if there is one.
+fn update_random(rng: &mut SimRng, engine: &mut Engine) {
+    let connected = engine.connected_ids();
+    if connected.is_empty() {
+        return;
+    }
+    let id = connected[rng.below(connected.len() as u64) as usize].clone();
+    let content = random_content(rng);
+    engine
+        .update_account(&id, content)
+        .expect("picked from the connected accounts");
 }

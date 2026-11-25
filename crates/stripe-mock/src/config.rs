@@ -510,6 +510,9 @@ impl Config {
         ] {
             check_rate(name, rate)?;
         }
+        if ch.account.update != 0.0 && !self.accounts.connect {
+            return err("`churn.account.update` needs `accounts.connect = true`".to_string());
+        }
         if !(1..=100).contains(&self.payloads.nested_list_page_size) {
             return err(format!(
                 "payloads.nested_list_page_size must be between 1 and 100, got {}",
@@ -1248,6 +1251,29 @@ connected_accounts = {{ {bad} }}"
                 "{bad}: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn account_churn_needs_connect() {
+        let msg = Config::from_toml_str(
+            "[churn.account]
+update = 0.5",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.contains("churn.account.update") && msg.contains("accounts.connect = true"),
+            "{msg}"
+        );
+        assert!(
+            Config::from_toml_str(
+                "[accounts]
+connect = true
+[churn.account]
+update = 0.5"
+            )
+            .is_ok()
+        );
     }
 
     #[test]

@@ -12,9 +12,11 @@
 mod accounts;
 mod billing;
 mod catalog;
+mod mux;
 mod subscriptions;
 
 pub(crate) use accounts::{AccountChange, AccountsGenerator};
+pub(crate) use mux::Generators;
 
 pub(crate) use subscriptions::delete_customer_cascade;
 
@@ -187,37 +189,6 @@ impl Ctx {
     }
 }
 
-/// The earlier of the platform and the accounts generator next due time.
-pub(crate) fn next_due(platform: &Generator, accounts: &AccountsGenerator) -> Option<SimTime> {
-    platform
-        .next_due()
-        .into_iter()
-        .chain(accounts.next_due())
-        .min()
-}
-
-/// Runs the platform generator and the accounts generator up to `target` in time
-/// order. Ties go to the platform. Sets the time to `target`.
-pub(crate) fn run_until(
-    platform: &mut Generator,
-    accounts: &mut AccountsGenerator,
-    engine: &mut Engine,
-    target: SimTime,
-) -> Vec<AccountChange> {
-    let mut changes = Vec::new();
-    loop {
-        let p = platform.next_due().filter(|t| *t <= target);
-        let a = accounts.next_due().filter(|t| *t <= target);
-        match (p, a) {
-            (Some(p), a) if a.is_none_or(|a| p <= a) => platform.run_until(engine, p),
-            (_, Some(a)) => changes.extend(accounts.run_due(engine, a)),
-            _ => break,
-        }
-    }
-    platform.run_until(engine, target);
-    changes
-}
-
 /// Schedules and performs generated actions and continuations.
 #[derive(Debug)]
 pub(crate) struct Generator {
@@ -234,6 +205,18 @@ pub(crate) struct Generator {
 
 impl Generator {
     pub(crate) fn new(config: &Config, streams: &RngStreams, start: SimTime) -> Generator {
+        Generator::new_with_prefix(config, streams, start, "")
+    }
+
+    /// Like [`new`](Self::new), with every stream name prefixed by `prefix`: a
+    /// connected account's generator uses `account/{acct}/` (spec section 5.4).
+    pub(crate) fn new_with_prefix(
+        config: &Config,
+        streams: &RngStreams,
+        start: SimTime,
+        prefix: &str,
+    ) -> Generator {
+        let stream = |name: &str| streams.stream(&format!("{prefix}{name}"));
         let (a, c) = (&config.actions, &config.churn);
         let specs = [
             (
@@ -304,8 +287,8 @@ impl Generator {
         ];
         let actions = specs
             .into_iter()
-            .map(|(kind, rate, stream)| {
-                let mut rng = streams.stream(stream);
+            .map(|(kind, rate, stream_name)| {
+                let mut rng = stream(stream_name);
                 let next_due = rng.exp_interval_ms(rate).map(|ms| start.plus_ms(ms));
                 Scheduled {
                     kind,
@@ -324,11 +307,11 @@ impl Generator {
                 page_size: config.payloads.nested_list_page_size,
                 queue: BTreeMap::new(),
                 next_seq: 0,
-                lifecycle: streams.stream("generate.lifecycle"),
-                billing: streams.stream("generate.billing"),
+                lifecycle: stream("generate.lifecycle"),
+                billing: stream("generate.billing"),
             },
-            control: streams.stream("control.actions"),
-            pagination_rng: streams.stream("api.pagination_writes.content"),
+            control: stream("control.actions"),
+            pagination_rng: stream("api.pagination_writes.content"),
             enabled: true,
         }
     }

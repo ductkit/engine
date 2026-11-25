@@ -124,13 +124,11 @@ impl Engine {
     }
 
     /// What the mock knows about an account ever connected.
-    #[allow(dead_code)] // used by the account endpoints and generators (Tasks 3-4)
     pub(crate) fn account_meta(&self, id: &str) -> Option<&AccountMeta> {
         self.accounts.iter().find(|a| a.id == id)
     }
 
     /// Every account ever connected, in connection order.
-    #[allow(dead_code)] // used by the account endpoints and generators (Tasks 3-4)
     pub(crate) fn account_metas(&self) -> &[AccountMeta] {
         &self.accounts
     }
@@ -491,7 +489,6 @@ impl Engine {
         self.stores.entry(self.scope.clone()).or_default()
     }
 
-    #[allow(dead_code)] // used by the Connect tasks
     pub(crate) fn scope(&self) -> &Scope {
         &self.scope
     }
