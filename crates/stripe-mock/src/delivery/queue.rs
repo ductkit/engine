@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde::Serialize;
 
-use crate::delivery::Destinations;
+use crate::delivery::{Destinations, retry_delays};
 use crate::engine::events::{EventFormat, EventRecord, EventStore, thin_notification};
 use crate::rng::{RngStreams, SimRng};
 use crate::{SimTime, WebhooksConfig};
@@ -93,8 +93,6 @@ pub enum AbandonReason {
 enum State {
     Queued,
     InFlight,
-    /// The last attempt failed and no retry is queued.
-    Failed,
     Succeeded,
     Abandoned,
 }
@@ -108,13 +106,15 @@ struct Delivery {
     attempts: u32,
     state: State,
     object_version: u64,
+    /// When the queued attempt is due (its queue key).
+    next_at: Option<SimTime>,
+    first_attempt_at: Option<SimTime>,
 }
 
 /// One attempt ready to send, built under the sim lock.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedAttempt {
     pub index: usize,
-    pub delivery_id: String,
     pub event_id: String,
     pub destination_id: String,
     pub url: String,
@@ -125,6 +125,8 @@ pub(crate) struct PreparedAttempt {
     pub scheduled_at: SimTime,
     pub timeout_ms: u64,
     pub object_version: u64,
+    /// The destination is in a simulated outage: record `Outage` without sending.
+    pub outage: bool,
 }
 
 /// Every delivery, its queue and the log.
@@ -193,6 +195,8 @@ impl Deliveries {
             attempts: 0,
             state: State::Queued,
             object_version: ev.object_version,
+            next_at: Some(attempt_at),
+            first_attempt_at: None,
         });
         self.by_event.entry(ev.id.clone()).or_default().push(index);
         self.queue.insert((attempt_at, index));
@@ -228,21 +232,23 @@ impl Deliveries {
                 break;
             }
             self.queue.pop_first();
-            let Some(dest) = dests.get(&self.list[index].destination_id) else {
-                self.list[index].state = State::Abandoned;
-                self.push_log(
-                    due,
-                    index,
-                    DeliveryRecordKind::Abandoned {
-                        reason: AbandonReason::DestinationRemoved,
-                    },
-                );
-                continue;
+            self.list[index].next_at = None;
+            let dest = match dests.get(&self.list[index].destination_id) {
+                None => {
+                    self.abandon(index, AbandonReason::DestinationRemoved, due);
+                    continue;
+                }
+                Some(d) if !d.info.enabled => {
+                    self.abandon(index, AbandonReason::DestinationDisabled, due);
+                    continue;
+                }
+                Some(d) => d,
             };
             let signature = self.draw_fault();
             let d = &mut self.list[index];
             d.attempts += 1;
             d.state = State::InFlight;
+            d.first_attempt_at.get_or_insert(due);
             let d = d.clone();
             let ev = events
                 .get(&d.event_id)
@@ -257,7 +263,6 @@ impl Deliveries {
             };
             batch.push(PreparedAttempt {
                 index,
-                delivery_id: d.id,
                 event_id: d.event_id,
                 destination_id: d.destination_id,
                 url: dest.info.url.clone(),
@@ -268,6 +273,7 @@ impl Deliveries {
                 scheduled_at: due,
                 timeout_ms: self.config.response_timeout.ms().max(0) as u64,
                 object_version: d.object_version,
+                outage: dest.outage_until.is_some_and(|until| until > due),
             });
         }
         Some((due, batch))
@@ -292,7 +298,36 @@ impl Deliveries {
         }
     }
 
-    /// Logs a finished attempt. Returns whether it succeeded.
+    fn abandon(&mut self, index: usize, reason: AbandonReason, now: SimTime) {
+        let d = &mut self.list[index];
+        if let Some(t) = d.next_at.take() {
+            self.queue.remove(&(t, index));
+        }
+        d.state = State::Abandoned;
+        self.push_log(now, index, DeliveryRecordKind::Abandoned { reason });
+    }
+
+    /// Abandons every queued delivery to `destination_id`. In-flight ones are
+    /// abandoned when their result arrives.
+    pub(crate) fn abandon_for_destination(
+        &mut self,
+        destination_id: &str,
+        reason: AbandonReason,
+        now: SimTime,
+    ) {
+        let queued: Vec<usize> = (0..self.list.len())
+            .filter(|i| {
+                let d = &self.list[*i];
+                d.destination_id == destination_id && d.state == State::Queued
+            })
+            .collect();
+        for index in queued {
+            self.abandon(index, reason, now);
+        }
+    }
+
+    /// Logs a finished attempt at `now` and decides what follows: done, a retry,
+    /// abandonment, or disabling the destination.
     pub(crate) fn record_outcome(
         &mut self,
         a: &PreparedAttempt,
@@ -300,13 +335,43 @@ impl Deliveries {
         elapsed_ms: u64,
         now: SimTime,
         latest_version: u64,
-    ) -> bool {
+        dests: &mut Destinations,
+    ) {
         let success = matches!(outcome, AttemptOutcome::Success { .. });
-        self.list[a.index].state = if success {
-            State::Succeeded
-        } else {
-            State::Failed
-        };
+        let mut next_retry_at = None;
+        let mut abandon = None;
+        let mut disable = false;
+        match dests.get_mut(&a.destination_id).ok() {
+            Some(d) if success => {
+                self.list[a.index].state = State::Succeeded;
+                d.first_failure_since_success = None;
+            }
+            _ if success => self.list[a.index].state = State::Succeeded,
+            None => abandon = Some(AbandonReason::DestinationRemoved),
+            Some(d) if !d.info.enabled => abandon = Some(AbandonReason::DestinationDisabled),
+            Some(d) => {
+                let since = *d.first_failure_since_success.get_or_insert(now);
+                if now.0 - since.0 >= self.config.disable_after_failures.ms() {
+                    d.info.enabled = false;
+                    disable = true;
+                } else {
+                    let first = self.list[a.index]
+                        .first_attempt_at
+                        .unwrap_or(a.scheduled_at);
+                    let delay = retry_delays(&self.config.retry_schedule)
+                        .nth(a.attempt.saturating_sub(1) as usize);
+                    match delay {
+                        Some(ms)
+                            if a.scheduled_at.0 + ms - first.0
+                                <= self.config.max_retry_duration.ms() =>
+                        {
+                            next_retry_at = Some(a.scheduled_at.plus_ms(ms));
+                        }
+                        _ => abandon = Some(AbandonReason::RetriesExhausted),
+                    }
+                }
+            }
+        }
         self.push_log(
             now,
             a.index,
@@ -317,10 +382,27 @@ impl Deliveries {
                 object_version: a.object_version,
                 latest_version,
                 signature: a.signature.clone(),
-                next_retry_at: None,
+                next_retry_at,
             },
         );
-        success
+        if let Some(t) = next_retry_at {
+            let d = &mut self.list[a.index];
+            d.state = State::Queued;
+            d.next_at = Some(t);
+            self.queue.insert((t, a.index));
+        }
+        if let Some(reason) = abandon {
+            self.abandon(a.index, reason, now);
+        }
+        if disable {
+            self.push_log(now, a.index, DeliveryRecordKind::DestinationDisabled);
+            self.abandon(a.index, AbandonReason::DestinationDisabled, now);
+            self.abandon_for_destination(
+                &a.destination_id,
+                AbandonReason::DestinationDisabled,
+                now,
+            );
+        }
     }
 
     pub(crate) fn log(&self) -> &[DeliveryRecord] {

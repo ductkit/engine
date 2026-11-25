@@ -18,6 +18,9 @@ fn real_unix_now() -> i64 {
 
 /// POSTs the attempt, signed with real time. Returns the outcome and the real elapsed ms.
 pub(crate) async fn send(client: &reqwest::Client, a: &PreparedAttempt) -> (AttemptOutcome, u64) {
+    if a.outage {
+        return (AttemptOutcome::Outage, 0);
+    }
     let now = real_unix_now();
     let secrets: Vec<&str> = a.secrets.iter().map(String::as_str).collect();
     let signature = match &a.signature {

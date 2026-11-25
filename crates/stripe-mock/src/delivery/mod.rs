@@ -1,8 +1,5 @@
 //! Delivery targets and webhook delivery (spec section 9).
 
-// TEMP: retries and disabling (Task 8) read the remaining fields and methods.
-#![allow(dead_code)]
-
 pub(crate) mod queue;
 pub(crate) mod sender;
 pub(crate) mod signing;
@@ -14,7 +11,7 @@ pub(crate) use queue::{Deliveries, PreparedAttempt};
 
 use crate::engine::events::EventFormat;
 use crate::rng::{RngStreams, SimRng};
-use crate::{DestinationConfig, MockError, PayloadFormat, SimTime};
+use crate::{DestinationConfig, MockError, PayloadFormat, RetrySchedule, SimTime};
 
 /// Public view of a destination, including its current signing secret.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +54,18 @@ impl Destination {
             PayloadFormat::Snapshot => EventFormat::Snapshot,
             PayloadFormat::Thin => EventFormat::Thin,
         }
+    }
+}
+
+/// Delays (ms) after attempts 1, 2, ...; the end of the iterator means no more retries.
+pub(crate) fn retry_delays(schedule: &RetrySchedule) -> Box<dyn Iterator<Item = i64> + '_> {
+    match schedule {
+        RetrySchedule::StripeLike => Box::new(
+            [60_000, 300_000, 1_800_000, 7_200_000, 18_000_000]
+                .into_iter()
+                .chain(std::iter::repeat(36_000_000)),
+        ),
+        RetrySchedule::Explicit(list) => Box::new(list.iter().map(|d| d.ms())),
     }
 }
 
@@ -182,6 +191,19 @@ impl Destinations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_schedules() {
+        let stripe: Vec<i64> = retry_delays(&RetrySchedule::StripeLike).take(7).collect();
+        assert_eq!(
+            stripe,
+            [
+                60_000, 300_000, 1_800_000, 7_200_000, 18_000_000, 36_000_000, 36_000_000
+            ]
+        );
+        let explicit = RetrySchedule::Explicit(vec![crate::DurationStr(5), crate::DurationStr(7)]);
+        assert_eq!(retry_delays(&explicit).collect::<Vec<_>>(), [5, 7]);
+    }
 
     #[test]
     fn patterns() {

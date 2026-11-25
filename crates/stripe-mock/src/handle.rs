@@ -331,15 +331,30 @@ impl MockStripe {
 
     /// Removes a delivery target.
     pub fn remove_destination(&self, id: &str) -> Result<(), MockError> {
-        let mut sim = self.shared.lock();
-        sim.engine.destinations_mut().remove(id)?;
-        Ok(())
+        self.shared.lock().engine.remove_destination(id)
     }
 
     /// Enables or disables a delivery target.
     pub fn set_destination_enabled(&self, id: &str, enabled: bool) -> Result<(), MockError> {
+        self.shared
+            .lock()
+            .engine
+            .set_destination_enabled(id, enabled)
+    }
+
+    /// Starts a simulated outage: attempts to the destination fail with `Outage`,
+    /// without HTTP, until `duration` of simulated time has passed or `end_outage`.
+    pub fn start_outage(&self, id: &str, duration: Duration) -> Result<(), MockError> {
         let mut sim = self.shared.lock();
-        sim.engine.destinations_mut().get_mut(id)?.info.enabled = enabled;
+        let until = sim.engine.now().plus_ms(duration.as_millis() as i64);
+        sim.engine.destinations_mut().get_mut(id)?.outage_until = Some(until);
+        Ok(())
+    }
+
+    /// Ends a simulated outage now.
+    pub fn end_outage(&self, id: &str) -> Result<(), MockError> {
+        let mut sim = self.shared.lock();
+        sim.engine.destinations_mut().get_mut(id)?.outage_until = None;
         Ok(())
     }
 

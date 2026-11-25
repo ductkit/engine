@@ -6,7 +6,9 @@ pub(crate) mod store;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::delivery::{AttemptOutcome, Deliveries, DeliveryRecord, Destinations, PreparedAttempt};
+use crate::delivery::{
+    AbandonReason, AttemptOutcome, Deliveries, DeliveryRecord, Destinations, PreparedAttempt,
+};
 use crate::rng::RngStreams;
 use crate::stream::{self, SubscribeFilter, SubscribeOptions, Subscriber, Subscription};
 use crate::{Config, MockError, ObjectType, SimTime};
@@ -137,12 +139,44 @@ impl Engine {
             .get(&a.event_id)
             .and_then(|ev| self.store.get(ev.object_type, &ev.object_id))
             .map_or(a.object_version, |o| o.latest.version);
-        let success = self
-            .deliveries
-            .record_outcome(a, outcome, elapsed_ms, now, latest_version);
-        if success && let Ok(d) = self.destinations.get_mut(&a.destination_id) {
-            d.first_failure_since_success = None;
+        self.deliveries.record_outcome(
+            a,
+            outcome,
+            elapsed_ms,
+            now,
+            latest_version,
+            &mut self.destinations,
+        );
+    }
+
+    /// Enables or disables a destination; disabling abandons its queued deliveries.
+    pub(crate) fn set_destination_enabled(
+        &mut self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<(), MockError> {
+        let d = self.destinations.get_mut(id)?;
+        if d.info.enabled == enabled {
+            return Ok(());
         }
+        d.info.enabled = enabled;
+        d.first_failure_since_success = None;
+        if !enabled {
+            self.deliveries.abandon_for_destination(
+                id,
+                AbandonReason::DestinationDisabled,
+                self.now,
+            );
+        }
+        Ok(())
+    }
+
+    /// Removes a destination and abandons its queued deliveries.
+    pub(crate) fn remove_destination(&mut self, id: &str) -> Result<(), MockError> {
+        self.destinations.remove(id)?;
+        self.deliveries
+            .abandon_for_destination(id, AbandonReason::DestinationRemoved, self.now);
+        Ok(())
     }
 
     pub(crate) fn delivery_log(&self) -> &[DeliveryRecord] {
