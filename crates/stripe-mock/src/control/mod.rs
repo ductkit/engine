@@ -19,7 +19,7 @@ use crate::generate::Action;
 use crate::model::customer::{CustomerUpdate, NewCustomer};
 use crate::{
     AccountApi, ActionsConfig, ApiConfig, ClockMode, DestinationConfig, DurationStr, EventsConfig,
-    MockError, MockStripe, ObjectType, SimTime, WebhooksConfig,
+    MockError, MockStripe, ObjectType, SimTime, StartOptions, WebhooksConfig,
 };
 
 /// A mutating control call. `account: None` is the platform.
@@ -283,6 +283,15 @@ impl MockStripe {
         export: RunExport,
         options: ReplayOptions,
     ) -> Result<MockStripe, MockError> {
+        MockStripe::replay_with(export, options, StartOptions::default()).await
+    }
+
+    /// [`MockStripe::replay`], serving the replayed mock on the addresses in `start`.
+    pub async fn replay_with(
+        export: RunExport,
+        options: ReplayOptions,
+        start: StartOptions,
+    ) -> Result<MockStripe, MockError> {
         export.check_format()?;
         let mut config = export.config;
         config.seed = export.seed;
@@ -290,7 +299,7 @@ impl MockStripe {
         if options.drop_destinations {
             config.destinations.clear();
         }
-        let m = MockStripe::start(config).await?;
+        let m = MockStripe::start_with(config, start).await?;
         for entry in export.journal {
             if options.drop_destinations && entry.op.is_destination_op() {
                 continue;

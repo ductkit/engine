@@ -25,3 +25,7 @@ toml.workspace = true
 
 [dev-dependencies]
 tokio-tungstenite = { workspace = true, features = ["connect"] }
+
+[[bin]]
+name = "ductkit-stripe-mock"
+path = "src/main.rs"

@@ -3,6 +3,7 @@
 //! See `docs/stripe-mock-spec.md` in the repository.
 
 mod api;
+pub mod cli;
 mod config;
 mod control;
 mod delivery;

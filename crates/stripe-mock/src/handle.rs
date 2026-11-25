@@ -415,6 +415,11 @@ impl MockStripe {
         }
     }
 
+    /// The seed the run started with.
+    pub fn seed(&self) -> u64 {
+        self.shared.config.seed
+    }
+
     /// Current simulated time.
     pub fn now(&self) -> SimTime {
         self.shared.lock().engine.now()
