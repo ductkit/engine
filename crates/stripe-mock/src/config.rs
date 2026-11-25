@@ -21,6 +21,42 @@ const UNIMPLEMENTED_SECTIONS: [&str; 7] = [
     "destinations",
 ];
 
+/// Spec keys inside sections phase 1 does support, but that phase 1 does not implement.
+const UNIMPLEMENTED_KEYS: [(&str, &[&str]); 3] = [
+    ("api", &["latency", "rate_limit", "errors", "stale_read"]),
+    (
+        "actions",
+        &[
+            "start_subscription",
+            "cancel_subscription",
+            "renew_subscription_cycle",
+            "one_off_payment",
+            "refund",
+            "dispute",
+            "catalog_change",
+        ],
+    ),
+    ("churn", &["product", "price", "subscription", "invoice"]),
+];
+
+/// The first spec section or key that phase 1 does not implement, e.g. `[webhooks]` or `api.latency`.
+fn first_unimplemented(table: &toml::Table) -> Option<String> {
+    if let Some(section) = UNIMPLEMENTED_SECTIONS
+        .iter()
+        .find(|s| table.contains_key(**s))
+    {
+        return Some(format!("[{section}]"));
+    }
+    for (section, keys) in UNIMPLEMENTED_KEYS {
+        if let Some(inner) = table.get(section).and_then(|v| v.as_table())
+            && let Some(key) = keys.iter().find(|k| inner.contains_key(**k))
+        {
+            return Some(format!("{section}.{key}"));
+        }
+    }
+    None
+}
+
 /// Full mock configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -122,12 +158,10 @@ impl Config {
     /// Parses and validates a TOML config.
     pub fn from_toml_str(s: &str) -> Result<Config, MockError> {
         let table: toml::Table = s.parse().map_err(|e| MockError::Config(format!("{e}")))?;
-        for section in UNIMPLEMENTED_SECTIONS {
-            if table.contains_key(section) {
-                return Err(MockError::Config(format!(
-                    "`[{section}]` is not implemented yet (phase 1 supports seed, api_version,                      clock, api.keys, actions.new_customer, churn.customer)"
-                )));
-            }
+        if let Some(path) = first_unimplemented(&table) {
+            return Err(MockError::Config(format!(
+                "`{path}` is not implemented yet (phase 1 supports seed, api_version, clock, api.keys, actions.new_customer, churn.customer)"
+            )));
         }
         let config: Config = toml::from_str(s).map_err(|e| MockError::Config(format!("{e}")))?;
         config.validate()?;
@@ -241,6 +275,64 @@ mod tests {
             msg.contains("[accounts]") && msg.contains("not implemented"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn nested_unimplemented_keys_are_named() {
+        for (toml, path) in [
+            (
+                "[api]
+latency = { median_ms = 40 }",
+                "api.latency",
+            ),
+            (
+                "[actions]
+start_subscription = 4.0",
+                "actions.start_subscription",
+            ),
+            (
+                "[churn.product]
+update = 0.5",
+                "churn.product",
+            ),
+        ] {
+            let msg = Config::from_toml_str(toml).unwrap_err().to_string();
+            assert!(
+                msg.contains(path) && msg.contains("not implemented"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_example_without_top_level_sections_fails_clearly() {
+        let spec = include_str!("../../../docs/stripe-mock-spec.md");
+        let toml = spec
+            .split(
+                "```toml
+",
+            )
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap();
+        let mut table: toml::Table = toml.parse().unwrap();
+        for section in UNIMPLEMENTED_SECTIONS {
+            table.remove(section);
+        }
+        let stripped = toml::to_string(&table).unwrap();
+        let msg = Config::from_toml_str(&stripped).unwrap_err().to_string();
+        assert!(
+            msg.contains("`api.latency`") && msg.contains("not implemented"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn not_implemented_message_is_tidy() {
+        let msg = Config::from_toml_str("[webhooks]").unwrap_err().to_string();
+        assert!(!msg.contains("  "), "{msg:?}");
     }
 
     #[test]

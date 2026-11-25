@@ -297,7 +297,7 @@ Customer fields, in this order (`serde_json` with the `preserve_order` feature).
 | `tax_exempt` | `"none"` |
 | `test_clock` | `null` |
 
-Random data. Draw every choice from the given `rng`, in field order.
+Random data. Draw every choice from the given `rng`, in this order: email, name, description, metadata.
 - **Names**: one of `["Test Customer", "Zoë Fischer", "山田 太郎", "O'Brien & Sons", "Ünïcödé Ltd"]`.
 - **Email**: `user{below(1_000_000)}@example.com`.
 - **Description**: `None` half the time.
