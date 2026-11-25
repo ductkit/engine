@@ -5,6 +5,7 @@ pub(crate) mod store;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::stream::{self, SubscribeFilter, SubscribeOptions, Subscriber, Subscription};
 use crate::{MockError, ObjectType, SimTime};
 
 pub(crate) use store::ObjectStore;
@@ -60,6 +61,7 @@ pub(crate) struct Engine {
     next_action: u64,
     log: Vec<StateUpdate>,
     store: ObjectStore,
+    subscribers: Vec<Subscriber>,
 }
 
 impl Engine {
@@ -70,6 +72,7 @@ impl Engine {
             next_action: 1,
             log: Vec::new(),
             store: ObjectStore::default(),
+            subscribers: Vec::new(),
         }
     }
 
@@ -207,8 +210,42 @@ impl Engine {
         update
     }
 
-    /// Fan-out to subscribers (Task 6).
-    fn notify(&mut self, _update: &StateUpdate) {}
+    /// Snapshot plus registration, atomically (the caller holds the sim lock).
+    pub(crate) fn subscribe(
+        &mut self,
+        filter: SubscribeFilter,
+        options: &SubscribeOptions,
+    ) -> Subscription {
+        let mut types: Vec<ObjectType> = self
+            .store
+            .all_types()
+            .into_iter()
+            .filter(|t| filter.matches(*t))
+            .collect();
+        types.sort();
+        let snapshot = types
+            .into_iter()
+            .flat_map(|t| self.store.in_creation_order(t))
+            .map(|o| StateUpdate {
+                kind: if o.deleted {
+                    ChangeKind::Deleted
+                } else {
+                    ChangeKind::Snapshot
+                },
+                events: EventRefs::default(),
+                cause: None,
+                ..o.latest.clone()
+            })
+            .collect();
+        let (subscriber, subscription) = stream::pair(filter, options, snapshot);
+        self.subscribers.push(subscriber);
+        subscription
+    }
+
+    /// Offers the update to every subscriber without waiting; drops lagging or closed ones.
+    fn notify(&mut self, update: &StateUpdate) {
+        self.subscribers.retain(|s| s.offer(update));
+    }
 }
 
 #[cfg(test)]

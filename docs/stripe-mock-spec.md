@@ -357,11 +357,11 @@ Per-object `version` starts at 1 and increases by one per mutation. A sync targe
 }
 ```
 
-Messages in the initial snapshot have `kind: "snapshot"` and no `events` or `cause`.
+Messages in the initial snapshot have `kind: "snapshot"` (`"deleted"` for tombstones), keep the object's latest `seq`, `at` and `version`, and have empty `events` and no `cause`.
 
 ### 10.4 Transport
 
-- In-process: `handle.subscribe(filter) -> impl Stream<Item = StateUpdate>`.
+- In-process: `handle.subscribe(filter) -> impl Stream<Item = SubscriptionItem>`, where `SubscriptionItem` is `Update(StateUpdate) | Synced | Lagged`.
 - Standalone: SSE (`GET /control/subscribe?account=…&types=…`) and WebSocket on the control port.
 
 ### 10.5 Delivery log (debugging)

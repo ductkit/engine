@@ -9,6 +9,7 @@ use crate::model::customer::{
     CustomerUpdate, NewCustomer, apply_update, deleted_stub, new_customer_json,
 };
 use crate::rng::{RngStreams, SimRng};
+use crate::stream::{SubscribeFilter, SubscribeOptions, Subscription};
 use crate::{ClockMode, Config, MockError, ObjectType, SimTime};
 
 /// Everything behind the lock.
@@ -115,6 +116,20 @@ impl MockStripe {
         sim.engine
             .delete(ObjectType::Customer, id, deleted_stub(id), cause)?;
         Ok(())
+    }
+
+    /// Subscribes to the latest state of every matching object (spec section 10).
+    pub fn subscribe(&self, filter: SubscribeFilter) -> Subscription {
+        self.subscribe_with(filter, SubscribeOptions::default())
+    }
+
+    /// Like [`MockStripe::subscribe`], with explicit options.
+    pub fn subscribe_with(
+        &self,
+        filter: SubscribeFilter,
+        options: SubscribeOptions,
+    ) -> Subscription {
+        self.shared.lock().engine.subscribe(filter, &options)
     }
 
     /// The latest truth-log entry for an object, deleted or not.

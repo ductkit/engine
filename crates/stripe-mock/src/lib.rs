@@ -9,6 +9,7 @@ mod generate;
 mod handle;
 mod model;
 mod rng;
+mod stream;
 mod time;
 
 pub use config::{
@@ -20,4 +21,5 @@ pub use error::MockError;
 pub use handle::MockStripe;
 pub use model::ObjectType;
 pub use model::customer::{CustomerUpdate, NewCustomer};
+pub use stream::{SubscribeFilter, SubscribeOptions, Subscription, SubscriptionItem};
 pub use time::SimTime;

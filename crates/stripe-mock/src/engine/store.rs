@@ -65,6 +65,11 @@ impl ObjectStore {
         }
     }
 
+    /// Types that have at least one object.
+    pub(crate) fn all_types(&self) -> Vec<ObjectType> {
+        self.types.keys().copied().collect()
+    }
+
     pub(crate) fn insert(&mut self, update: StateUpdate, created: i64) {
         let ts = self.types.entry(update.object_type).or_default();
         let id = update.object_id.clone();
