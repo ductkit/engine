@@ -192,7 +192,7 @@ events_from = ["@self", "@accounts"]   # @accounts: events from connected accoun
 `[accounts]` defaults and rules:
 
 - `platforms` must be `1`; any other value is rejected as not implemented.
-- `connect` defaults to `false`. With `connect = false` a connected-account count or rate above 0, any `Stripe-Account` or `Stripe-Context` header, and the `connect` / `events_from` destination options are accepted, but there are no connected-account events to route.
+- `connect` defaults to `false`. With `connect = false`, a connected-account count or rate above 0 (including `[churn.account] update`) is a config error, and any `Stripe-Account` or `Stripe-Context` header is rejected (section 7.1). The `connect` / `events_from` destination options are accepted, but there are no connected-account events to route.
 - Defaults: `initial = 0`, `connect_rate = 0`, `deauthorize_rate = 0`, `account_api = { v1 = 0.5, v2 = 0.5 }`, `account_types = { standard = 0.5, express = 0.3, custom = 0.2 }`. Each mix must sum to 1 (±1e-9) with no negative weight.
 - `[churn.account] update` (per hour, default 0) updates a random connected account.
 - Initial accounts are connected at the start of history (`clock.start - history.duration`), so they get history too; their connect events fall inside history and are not delivered.
