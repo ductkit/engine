@@ -326,3 +326,45 @@ async fn start_with_api_addr() {
     .unwrap();
     assert_eq!(m.api_url(), format!("http://{addr}"));
 }
+
+#[tokio::test]
+async fn state_keys_match_subscription_object_types() {
+    use futures_util::StreamExt;
+    let m = mock_with_control(
+        "seed = 5
+[actions]
+new_customer = 4
+start_subscription = 3
+[history]
+duration = \"6h\"
+",
+    )
+    .await;
+    let mut from_stream = std::collections::BTreeSet::new();
+    let mut s = m.subscribe(SubscribeFilter::default());
+    while let Some(item) = s.next().await {
+        match item {
+            ductkit_stripe_mock::SubscriptionItem::Update(u) => {
+                if u.kind != ductkit_stripe_mock::ChangeKind::Deleted {
+                    from_stream.insert(
+                        serde_json::to_value(u.object_type)
+                            .unwrap()
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    );
+                }
+            }
+            _ => break,
+        }
+    }
+    let state: Value = ctl_get(&m, "/control/state").await.json().await.unwrap();
+    let mut from_state = std::collections::BTreeSet::new();
+    for scope in state["scopes"].as_array().unwrap() {
+        for k in scope["objects"].as_object().unwrap().keys() {
+            from_state.insert(k.clone());
+        }
+    }
+    assert!(from_state.contains("invoice_line_item"), "{from_state:?}");
+    assert_eq!(from_stream, from_state);
+}

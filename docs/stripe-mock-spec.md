@@ -450,7 +450,7 @@ Messages in the initial snapshot have `kind: "snapshot"` (`"deleted"` for tombst
 
 **Query parameters** (both transports; either may be absent, which means all):
 
-- `types=customer,subscription_item`: comma-separated object types. The `object_type` names used in updates are accepted, and so are Stripe `object` names (`line_item` for `invoice_line_item`). `GET /control/state` keys its objects by the Stripe `object` name.
+- `types=customer,subscription_item`: comma-separated object types. The `object_type` names used in updates are accepted, and so are Stripe `object` names (`line_item` for `invoice_line_item`). Responses always use the `object_type` name: `GET /control/state` keys its objects by it, and `GET /control/objects/{type}/{id}` accepts either name in `{type}`.
 - `account=platform,acct_…`: comma-separated scopes; `platform` means the platform scope.
 - An unknown type, or an account that is unknown or disconnected, returns 400 (error envelope, section 11) before the stream starts.
 

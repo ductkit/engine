@@ -643,7 +643,7 @@ impl Engine {
                         .map(|o| o.latest.state.clone())
                         .collect();
                     if !live.is_empty() {
-                        objects.insert(t.as_str().to_string(), Value::Array(live));
+                        objects.insert(t.serde_name(), Value::Array(live));
                     }
                 }
                 serde_json::json!({"account": scope, "objects": objects})

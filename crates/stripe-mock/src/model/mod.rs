@@ -51,6 +51,15 @@ impl ObjectType {
         }
     }
 
+    /// The name this type serializes to (`StateUpdate.object_type`, state dump
+    /// keys). It differs from [`as_str`](Self::as_str) for line items.
+    pub fn serde_name(&self) -> String {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::String(s)) => s,
+            _ => self.as_str().to_string(),
+        }
+    }
+
     /// The ID prefix, without the underscore.
     pub fn id_prefix(&self) -> &'static str {
         match self {

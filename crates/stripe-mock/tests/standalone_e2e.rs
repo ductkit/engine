@@ -72,17 +72,11 @@ fn flatten_updates(updates: &[Value]) -> BTreeMap<Key, Value> {
         .collect()
 }
 
-/// The same shape from `GET /control/state`. Its keys are Stripe `object` names, so
-/// `line_item` is renamed to the `object_type` the subscription uses.
+/// The same shape from `GET /control/state`.
 fn flatten_state(state: &Value) -> BTreeMap<Key, Value> {
     let mut out = BTreeMap::new();
     for scope in state["scopes"].as_array().unwrap() {
         for (t, objects) in scope["objects"].as_object().unwrap() {
-            let t = if t == "line_item" {
-                "invoice_line_item"
-            } else {
-                t
-            };
             for o in objects.as_array().unwrap() {
                 out.insert(
                     key(&scope["account"], t, o["id"].as_str().unwrap()),
@@ -113,7 +107,13 @@ async fn drive_subscribe_export_replay() {
     let reader = async {
         let mut updates: Vec<Value> = Vec::new();
         let mut max_seq = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         while max_seq < target.load(ordering) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no update reached the target seq within 60 s: last seq seen {max_seq}, target {}",
+                target.load(ordering)
+            );
             match tokio::time::timeout(Duration::from_millis(200), sse.next()).await {
                 Ok(Some((event, data))) => {
                     assert_ne!(event, "lagged", "subscriber lagged");

@@ -178,7 +178,7 @@ fn page<T: serde::Serialize>(mut items: Vec<T>, limit: usize) -> Reply {
 fn parse_object_type(s: &str) -> Result<ObjectType, ControlError> {
     ObjectType::ALL
         .into_iter()
-        .find(|t| t.as_str() == s || serde_json::to_value(t).is_ok_and(|v| v == s))
+        .find(|t| t.as_str() == s || t.serde_name() == s)
         .ok_or_else(|| ControlError::invalid(format!("unknown object type `{s}`")))
 }
 
