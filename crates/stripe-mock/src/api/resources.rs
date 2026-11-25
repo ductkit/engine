@@ -12,10 +12,10 @@ use serde_json::{Value, json};
 use crate::api::ApiError;
 use crate::api::expand::expand;
 use crate::api::list::{ListParams, array_base, decode, paginate, parse_list_params};
-use crate::engine::Engine;
 use crate::engine::store::StoredObject;
-use crate::handle::Shared;
-use crate::{ChangeKind, ObjectType};
+use crate::engine::{Engine, StateUpdate};
+use crate::handle::{Shared, Sim};
+use crate::{ChangeKind, ObjectType, SimTime};
 
 /// List order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,24 +93,59 @@ fn bool_param(p: &ListParams, name: &str) -> Result<Option<bool>, ApiError> {
     }
 }
 
-/// Whether `o` passes the resource's filters.
+/// What one request sees: the latest state, or (a stale read) every object as
+/// it was at `at` (spec section 7.4).
+#[derive(Clone, Copy)]
+pub(crate) struct View<'a> {
+    pub engine: &'a Engine,
+    pub at: Option<SimTime>,
+}
+
+impl<'a> View<'a> {
+    /// The version this view shows of `o`; `None` if it did not exist yet.
+    pub(crate) fn state(&self, o: &'a StoredObject) -> Option<&'a StateUpdate> {
+        match self.at {
+            None => Some(&o.latest),
+            Some(at) => self
+                .engine
+                .as_of(o.latest.object_type, &o.latest.object_id, at),
+        }
+    }
+
+    /// The version a list shows: existing in this view and not deleted.
+    fn listed(&self, o: &'a StoredObject) -> Option<&'a StateUpdate> {
+        self.state(o).filter(|u| u.kind != ChangeKind::Deleted)
+    }
+
+    /// The state retrieve shows: a deleted customer is its stub, other deleted
+    /// objects (and objects not yet created in this view) are missing.
+    pub(crate) fn visible(&self, t: ObjectType, id: &str) -> Option<Value> {
+        let u = self.state(self.engine.store().get(t, id)?)?;
+        if u.kind == ChangeKind::Deleted && t != ObjectType::Customer {
+            return None;
+        }
+        Some(u.state.clone())
+    }
+}
+
+/// Whether `s` (a state of `o` in `view`) passes the resource's filters.
 fn matches(
-    engine: &Engine,
+    view: &View,
     r: &Resource,
     o: &StoredObject,
+    s: &Value,
     f: &BTreeMap<String, String>,
     active: Option<bool>,
 ) -> bool {
-    let s = &o.latest.state;
     let eq = |field: &str, key: &str| {
         f.get(key)
             .is_none_or(|want| s[field].as_str() == Some(want))
     };
     match r.t {
         ObjectType::Customer => eq("email", "email"),
-        ObjectType::Product => active.is_none_or(|a| s["active"] == json!(a)),
+        ObjectType::Product => active.is_none_or(|a| s["active"].as_bool() == Some(a)),
         ObjectType::Price => {
-            active.is_none_or(|a| s["active"] == json!(a))
+            active.is_none_or(|a| s["active"].as_bool() == Some(a))
                 && eq("product", "product")
                 && eq("currency", "currency")
                 && eq("type", "type")
@@ -127,15 +162,16 @@ fn matches(
             status_ok
                 && eq("customer", "customer")
                 && f.get("price").is_none_or(|want| {
-                    engine
+                    view.engine
                         .store()
                         .children(
                             ObjectType::SubscriptionItem,
                             "subscription",
                             &o.latest.object_id,
                         )
-                        .iter()
-                        .any(|i| !i.deleted && i.latest.state["price"]["id"].as_str() == Some(want))
+                        .into_iter()
+                        .filter_map(|i| view.listed(i))
+                        .any(|i| i.state["price"]["id"].as_str() == Some(want))
                 })
         }
         ObjectType::SubscriptionItem => eq("subscription", "subscription"),
@@ -191,12 +227,21 @@ async fn list(
     } else {
         None
     };
-    let sim = shared.lock();
-    let engine = &sim.engine;
-    let all = ordered(engine, r);
+    let mut sim = shared.lock();
+    let at = stale_at(&mut sim);
+    let view = View {
+        engine: &sim.engine,
+        at,
+    };
+    let all = ordered(view.engine, r);
     let (page, has_more) = paginate(
         &all,
-        |o| !o.deleted && p.created.matches(o.created) && matches(engine, r, o, &p.extra, active),
+        |o| {
+            p.created.matches(o.created)
+                && view
+                    .listed(o)
+                    .is_some_and(|u| matches(&view, r, o, &u.state, &p.extra, active))
+        },
         &p,
     )?;
     let url = match r.required {
@@ -207,10 +252,24 @@ async fn list(
         "object": "list",
         "url": url,
         "has_more": has_more,
-        "data": page.iter().map(|o| o.latest.state.clone()).collect::<Vec<_>>(),
+        "data": states(&view, &page),
     });
-    expand(engine, r.t, &mut out, expand_paths(&p))?;
+    expand(&view, r.t, &mut out, expand_paths(&p))?;
     Ok(Json(out))
+}
+
+/// Draws whether this object read is stale, and if so the time it shows.
+fn stale_at(sim: &mut Sim) -> Option<SimTime> {
+    let lag = sim.api.stale_lag()?;
+    Some(sim.engine.now().plus_ms(-lag))
+}
+
+/// The states `view` shows for a page (every page entry is listed in `view`).
+fn states(view: &View, page: &[&StoredObject]) -> Vec<Value> {
+    page.iter()
+        .filter_map(|o| view.listed(o))
+        .map(|u| u.state.clone())
+        .collect()
 }
 
 fn expand_paths(p: &ListParams) -> &[String] {
@@ -223,16 +282,6 @@ fn no_such(t: ObjectType, id: &str) -> ApiError {
         code: Some("resource_missing"),
         ..ApiError::not_found(format!("No such {}: '{id}'", t.as_str()))
     }
-}
-
-/// The latest state as retrieve shows it: deleted customers are a stub, other
-/// deleted objects are missing.
-pub(crate) fn visible(engine: &Engine, t: ObjectType, id: &str) -> Option<Value> {
-    let u = engine.latest(t, id)?;
-    if u.kind == ChangeKind::Deleted && t != ObjectType::Customer {
-        return None;
-    }
-    Some(u.state.clone())
 }
 
 /// `GET {path}/{id}`.
@@ -253,9 +302,14 @@ async fn retrieve(
         }
         paths.push(value);
     }
-    let sim = shared.lock();
-    let mut obj = visible(&sim.engine, r.t, &id).ok_or_else(|| no_such(r.t, &id))?;
-    expand(&sim.engine, r.t, &mut obj, &paths)?;
+    let mut sim = shared.lock();
+    let at = stale_at(&mut sim);
+    let view = View {
+        engine: &sim.engine,
+        at,
+    };
+    let mut obj = view.visible(r.t, &id).ok_or_else(|| no_such(r.t, &id))?;
+    expand(&view, r.t, &mut obj, &paths)?;
     Ok(Json(obj))
 }
 
@@ -266,23 +320,28 @@ pub(crate) async fn invoice_lines(
     RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let p = parse_list_params(decode(query), &[], &["expand"])?;
-    let sim = shared.lock();
-    let engine = &sim.engine;
-    if visible(engine, ObjectType::Invoice, &id).is_none() {
+    let mut sim = shared.lock();
+    let at = stale_at(&mut sim);
+    let view = View {
+        engine: &sim.engine,
+        at,
+    };
+    if view.visible(ObjectType::Invoice, &id).is_none() {
         return Err(no_such(ObjectType::Invoice, &id));
     }
-    let lines = engine
+    let lines = view
+        .engine
         .store()
         .children(ObjectType::InvoiceLineItem, "invoice", &id);
-    let (page, has_more) = paginate(&lines, |o| !o.deleted, &p)?;
+    let (page, has_more) = paginate(&lines, |o| view.listed(o).is_some(), &p)?;
     let mut out = json!({
         "object": "list",
         "url": format!("/v1/invoices/{id}/lines"),
         "has_more": has_more,
-        "data": page.iter().map(|o| o.latest.state.clone()).collect::<Vec<_>>(),
+        "data": states(&view, &page),
     });
     expand(
-        engine,
+        &view,
         ObjectType::InvoiceLineItem,
         &mut out,
         expand_paths(&p),

@@ -15,14 +15,11 @@ const UNIMPLEMENTED_SECTIONS: [&str; 1] = ["accounts"];
 
 /// Spec keys inside supported sections that are not implemented yet, with an
 /// optional reason appended to the error.
-const UNIMPLEMENTED_KEYS: [(&str, &[&str], &str); 2] = [
-    ("api", &["stale_read"], ""),
-    (
-        "actions",
-        &["one_off_payment", "refund", "dispute"],
-        " (needs payment objects, phase 7)",
-    ),
-];
+const UNIMPLEMENTED_KEYS: [(&str, &[&str], &str); 1] = [(
+    "actions",
+    &["one_off_payment", "refund", "dispute"],
+    " (needs payment objects, phase 7)",
+)];
 
 /// The first spec section or key that is not implemented, e.g. `[history]` or
 /// `api.latency`, with its reason.
@@ -116,6 +113,27 @@ pub struct ApiConfig {
     pub rate_limit: Option<RateLimit>,
     /// Probabilities of injected failures per request.
     pub errors: ApiErrors,
+    /// Retrieve and list may show objects as they were up to `max_lag` ago.
+    pub stale_read: StaleRead,
+}
+
+/// Stale reads on object retrieve and list (spec section 7.4).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StaleRead {
+    /// Per request.
+    pub probability: f64,
+    /// A stale read lags by a uniform draw in `1ms..=max_lag`.
+    pub max_lag: DurationStr,
+}
+
+impl Default for StaleRead {
+    fn default() -> Self {
+        StaleRead {
+            probability: 0.0,
+            max_lag: DurationStr(2_000),
+        }
+    }
 }
 
 /// A token bucket: `burst` requests at once, refilled at `requests_per_second`.
@@ -164,6 +182,10 @@ impl ApiConfig {
             ("api.errors.reset", e.reset),
         ] {
             check_probability(name, p)?;
+        }
+        check_probability("api.stale_read.probability", self.stale_read.probability)?;
+        if self.stale_read.max_lag.ms() < 1 {
+            return config_err("api.stale_read.max_lag must be at least 1ms");
         }
         let sum = e.e500 + e.e503 + e.timeout + e.reset;
         if sum > 1.0 {
@@ -307,6 +329,7 @@ impl Default for ApiConfig {
             latency: Distribution::default(),
             rate_limit: None,
             errors: ApiErrors::default(),
+            stale_read: StaleRead::default(),
         }
     }
 }
@@ -810,24 +833,13 @@ mod tests {
 
     #[test]
     fn nested_unimplemented_keys_are_named() {
-        for (toml, path) in [
-            (
-                "[api]
-stale_read = { probability = 0.0 }",
-                "api.stale_read",
-            ),
-            (
-                "[actions]
-dispute = 0.05",
-                "actions.dispute",
-            ),
-        ] {
-            let msg = Config::from_toml_str(toml).unwrap_err().to_string();
-            assert!(
-                msg.contains(path) && msg.contains("not implemented"),
-                "{msg}"
-            );
-        }
+        let msg = Config::from_toml_str("[actions]\ndispute = 0.05")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("actions.dispute") && msg.contains("not implemented"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -850,7 +862,7 @@ dispute = 0.05",
         let stripped = toml::to_string(&table).unwrap();
         let msg = Config::from_toml_str(&stripped).unwrap_err().to_string();
         assert!(
-            msg.contains("`api.stale_read`") && msg.contains("not implemented"),
+            msg.contains("`actions.one_off_payment`") && msg.contains("not implemented"),
             "{msg}"
         );
     }

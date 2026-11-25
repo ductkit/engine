@@ -62,6 +62,7 @@ pub(crate) struct ApiFaults {
     storm_until: Option<Instant>,
     errors: SimRng,
     latency: SimRng,
+    stale: SimRng,
 }
 
 impl ApiFaults {
@@ -72,6 +73,7 @@ impl ApiFaults {
             storm_until: None,
             errors: streams.stream("api.errors"),
             latency: streams.stream("api.latency"),
+            stale: streams.stream("api.stale_reads"),
         };
         f.set_config(config.clone(), Instant::now());
         f
@@ -93,6 +95,14 @@ impl ApiFaults {
     /// Every request is rate limited until `until`.
     pub(crate) fn storm(&mut self, until: Instant) {
         self.storm_until = Some(until);
+    }
+
+    /// For one object retrieve or list: the stale lag in ms, if this read is stale.
+    pub(crate) fn stale_lag(&mut self) -> Option<i64> {
+        let s = &self.config.stale_read;
+        self.stale
+            .chance(s.probability)
+            .then(|| self.stale.uniform_ms(1, s.max_lag.ms()))
     }
 
     /// The fault for one request that passed the gate (if any) and its latency in ms.

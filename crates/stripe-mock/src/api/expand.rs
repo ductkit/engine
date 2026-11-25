@@ -3,7 +3,7 @@
 use serde_json::Value;
 
 use crate::api::ApiError;
-use crate::engine::Engine;
+use crate::api::resources::View;
 use crate::{ChangeKind, ObjectType};
 
 /// Deepest expansion, counting the segments other than `data`.
@@ -48,19 +48,19 @@ fn validate(t: ObjectType, paths: &[String], list: bool) -> Result<(), ApiError>
 
 /// The object an ID names, as expansion shows it: a deleted customer is its
 /// stub, other deleted objects are `null`, unknown IDs stay strings.
-fn lookup(engine: &Engine, id: &str) -> Option<Value> {
+fn lookup(view: &View, id: &str) -> Option<Value> {
     let prefix = id.split_once('_')?.0;
     let t = ObjectType::ALL
         .into_iter()
         .find(|t| t.id_prefix() == prefix)?;
-    let u = engine.latest(t, id)?;
+    let u = view.state(view.engine.store().get(t, id)?)?;
     if u.kind == ChangeKind::Deleted && t != ObjectType::Customer {
         return Some(Value::Null);
     }
     Some(u.state.clone())
 }
 
-fn apply(engine: &Engine, v: &mut Value, segs: &[&str]) {
+fn apply(view: &View, v: &mut Value, segs: &[&str]) {
     let Some((first, rest)) = segs.split_first() else {
         return;
     };
@@ -68,7 +68,7 @@ fn apply(engine: &Engine, v: &mut Value, segs: &[&str]) {
         && let Some(items) = v.get_mut("data").and_then(Value::as_array_mut)
     {
         for item in items {
-            apply(engine, item, rest);
+            apply(view, item, rest);
         }
         return;
     }
@@ -76,16 +76,16 @@ fn apply(engine: &Engine, v: &mut Value, segs: &[&str]) {
         return;
     };
     if let Some(id) = child.as_str()
-        && let Some(found) = lookup(engine, id)
+        && let Some(found) = lookup(view, id)
     {
         *child = found;
     }
-    apply(engine, child, rest);
+    apply(view, child, rest);
 }
 
 /// Expands `paths` in `obj`, an object of type `t` or a list of them.
 pub(crate) fn expand(
-    engine: &Engine,
+    view: &View,
     t: ObjectType,
     obj: &mut Value,
     paths: &[String],
@@ -93,7 +93,7 @@ pub(crate) fn expand(
     validate(t, paths, obj["object"] == "list")?;
     for path in paths {
         let segs: Vec<&str> = path.split('.').collect();
-        apply(engine, obj, &segs);
+        apply(view, obj, &segs);
     }
     Ok(())
 }

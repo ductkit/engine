@@ -12,6 +12,8 @@ pub(crate) struct StoredObject {
     /// `created` in Unix seconds, as shown in the API.
     pub created: i64,
     pub deleted: bool,
+    /// Truth-log positions of every version, oldest first.
+    pub versions: Vec<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -99,7 +101,8 @@ impl ObjectStore {
         self.types.keys().copied().collect()
     }
 
-    pub(crate) fn insert(&mut self, update: StateUpdate, created: i64) {
+    /// Adds a new object; `log_pos` is its truth-log position.
+    pub(crate) fn insert(&mut self, update: StateUpdate, created: i64, log_pos: usize) {
         let ts = self.types.entry(update.object_type).or_default();
         let id = update.object_id.clone();
         debug_assert!(!ts.objects.contains_key(&id), "duplicate id {id}");
@@ -125,11 +128,13 @@ impl ObjectStore {
                 latest: update,
                 created,
                 deleted: false,
+                versions: vec![log_pos],
             },
         );
     }
 
-    pub(crate) fn replace(&mut self, update: StateUpdate) {
+    /// Records a new version; `log_pos` is its truth-log position.
+    pub(crate) fn replace(&mut self, update: StateUpdate, log_pos: usize) {
         let ts = self
             .types
             .get_mut(&update.object_type)
@@ -146,6 +151,7 @@ impl ObjectStore {
             ts.live.remove(i);
         }
         obj.deleted = deleted;
+        obj.versions.push(log_pos);
         obj.latest = update;
     }
 }
@@ -180,17 +186,20 @@ mod tests {
     }
 
     fn add(s: &mut ObjectStore, t: ObjectType, id: &str, created: i64, state: Value) {
-        s.insert(update(t, id, 1, ChangeKind::Created, state), created);
+        s.insert(update(t, id, 1, ChangeKind::Created, state), created, 0);
     }
 
     fn del(s: &mut ObjectStore, t: ObjectType, id: &str) {
-        s.replace(update(
-            t,
-            id,
-            2,
-            ChangeKind::Deleted,
-            json!({"id": id, "deleted": true}),
-        ));
+        s.replace(
+            update(
+                t,
+                id,
+                2,
+                ChangeKind::Deleted,
+                json!({"id": id, "deleted": true}),
+            ),
+            0,
+        );
     }
 
     fn ids<'a>(objs: impl IntoIterator<Item = &'a StoredObject>) -> Vec<String> {

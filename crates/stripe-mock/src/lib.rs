@@ -19,7 +19,7 @@ pub use config::{
     ActionsConfig, ApiConfig, ApiErrors, CatalogChurn, ChurnConfig, ClockConfig, ClockMode,
     ClockSkew, Config, CustomerChurn, DestinationConfig, DisableAfter, Distribution, DurationStr,
     EventRetentionConfig, EventsConfig, HistoryConfig, LateTail, PINNED_API_VERSION, PayloadFormat,
-    PayloadsConfig, RateLimit, RenewMode, RetrySchedule, UpdateChurn, WebhooksConfig,
+    PayloadsConfig, RateLimit, RenewMode, RetrySchedule, StaleRead, UpdateChurn, WebhooksConfig,
 };
 pub use delivery::signing::verify_signature;
 pub use delivery::{

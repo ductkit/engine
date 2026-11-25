@@ -254,7 +254,8 @@ impl Engine {
     ) -> StateUpdate {
         let created = state["created"].as_i64().unwrap_or(self.now.unix_seconds());
         let update = self.record(t, id, 1, ChangeKind::Created, state, cause, None, events);
-        self.store.insert(update.clone(), created);
+        self.store
+            .insert(update.clone(), created, self.log.len() - 1);
         self.notify(&update);
         update
     }
@@ -293,7 +294,7 @@ impl Engine {
             Some(previous),
             events,
         );
-        self.store.replace(update.clone());
+        self.store.replace(update.clone(), self.log.len() - 1);
         self.notify(&update);
         Ok(Some(update))
     }
@@ -319,9 +320,20 @@ impl Engine {
             Some(previous),
             events,
         );
-        self.store.replace(update.clone());
+        self.store.replace(update.clone(), self.log.len() - 1);
         self.notify(&update);
         Ok(update)
+    }
+
+    /// The object's latest version with `at <= at`; `None` if it did not exist yet.
+    pub(crate) fn as_of(&self, t: ObjectType, id: &str, at: SimTime) -> Option<&StateUpdate> {
+        self.store
+            .get(t, id)?
+            .versions
+            .iter()
+            .rev()
+            .map(|&pos| &self.log[pos])
+            .find(|u| u.at <= at)
     }
 
     pub(crate) fn latest(&self, t: ObjectType, id: &str) -> Option<&StateUpdate> {
@@ -443,6 +455,45 @@ mod tests {
 
     fn cust(id: &str, created: i64) -> Value {
         json!({"id": id, "object": "customer", "created": created, "email": null})
+    }
+
+    #[test]
+    fn as_of_picks_version_at_time() {
+        let mut e = test_engine();
+        let c = e.begin_action("t");
+        e.set_now(SimTime(1_000));
+        e.create(
+            ObjectType::Customer,
+            "cus_a".into(),
+            cust("cus_a", 1),
+            c.clone(),
+            &[],
+        );
+        for (t, name) in [(11_000, "two"), (21_000, "three")] {
+            e.set_now(SimTime(t));
+            e.update(
+                ObjectType::Customer,
+                "cus_a",
+                |v| v["name"] = json!(name),
+                c.clone(),
+                ChangeKind::Updated,
+                &[],
+            )
+            .unwrap();
+        }
+        let version = |at: i64| {
+            e.as_of(ObjectType::Customer, "cus_a", SimTime(at))
+                .map(|u| u.version)
+        };
+        assert_eq!(version(6_000), Some(1));
+        assert_eq!(version(11_000), Some(2));
+        assert_eq!(version(26_000), Some(3));
+        assert_eq!(version(500), None);
+        assert_eq!(
+            e.as_of(ObjectType::Customer, "cus_zz", SimTime(26_000))
+                .map(|u| u.version),
+            None
+        );
     }
 
     #[test]
