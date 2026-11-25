@@ -6,6 +6,7 @@ pub(crate) mod store;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::delivery::Destinations;
 use crate::rng::RngStreams;
 use crate::stream::{self, SubscribeFilter, SubscribeOptions, Subscriber, Subscription};
 use crate::{Config, MockError, ObjectType, SimTime};
@@ -68,6 +69,7 @@ pub(crate) struct Engine {
     subscribers: Vec<Subscriber>,
     projector: Projector,
     events: EventStore,
+    destinations: Destinations,
 }
 
 impl Engine {
@@ -81,7 +83,23 @@ impl Engine {
             subscribers: Vec::new(),
             projector: Projector::new(config, streams),
             events: EventStore::default(),
+            destinations: {
+                let mut d = Destinations::new(streams);
+                for c in &config.destinations {
+                    d.add(c.clone(), start)
+                        .expect("config destinations are validated");
+                }
+                d
+            },
         }
+    }
+
+    pub(crate) fn destinations(&self) -> &Destinations {
+        &self.destinations
+    }
+
+    pub(crate) fn destinations_mut(&mut self) -> &mut Destinations {
+        &mut self.destinations
     }
 
     pub(crate) fn events(&self) -> &EventStore {

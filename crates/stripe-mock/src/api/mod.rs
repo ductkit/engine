@@ -1,6 +1,7 @@
 //! Read-only Stripe-compatible HTTP API (spec section 7).
 
 mod customers;
+mod destinations;
 mod events_v1;
 mod events_v2;
 mod list;
@@ -91,6 +92,8 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/customers/{id}", get(customers::retrieve))
         .route("/v1/events", get(events_v1::list))
         .route("/v1/events/{id}", get(events_v1::retrieve))
+        .route("/v1/webhook_endpoints", get(destinations::list_v1))
+        .route("/v2/core/event_destinations", get(destinations::list_v2))
         .route("/v2/core/events", get(events_v2::list))
         .route("/v2/core/events/{id}", get(events_v2::retrieve))
         .fallback(fallback)

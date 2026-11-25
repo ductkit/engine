@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::delivery::DestinationInfo;
 use crate::engine::events::EventInfo;
 use crate::engine::{Engine, StateUpdate};
 use crate::generate::Generator;
@@ -15,7 +16,7 @@ use crate::model::customer::{
 };
 use crate::rng::{RngStreams, SimRng};
 use crate::stream::{SubscribeFilter, SubscribeOptions, Subscription};
-use crate::{ClockMode, Config, EventsConfig, MockError, ObjectType, SimTime};
+use crate::{ClockMode, Config, DestinationConfig, EventsConfig, MockError, ObjectType, SimTime};
 
 /// Everything behind the lock.
 #[derive(Debug)]
@@ -264,6 +265,45 @@ impl MockStripe {
         cfg.validate()?;
         sim.engine.projector_mut().config = cfg;
         Ok(())
+    }
+
+    /// Adds a delivery target (validated like config destinations).
+    pub fn add_destination(&self, d: DestinationConfig) -> Result<DestinationInfo, MockError> {
+        let mut sim = self.shared.lock();
+        let now = sim.engine.now();
+        sim.engine.destinations_mut().add(d, now)
+    }
+
+    /// Removes a delivery target.
+    pub fn remove_destination(&self, id: &str) -> Result<(), MockError> {
+        let mut sim = self.shared.lock();
+        sim.engine.destinations_mut().remove(id)?;
+        Ok(())
+    }
+
+    /// Enables or disables a delivery target.
+    pub fn set_destination_enabled(&self, id: &str, enabled: bool) -> Result<(), MockError> {
+        let mut sim = self.shared.lock();
+        sim.engine.destinations_mut().get_mut(id)?.info.enabled = enabled;
+        Ok(())
+    }
+
+    /// Replaces a destination's secret; the old one keeps signing for `overlap`.
+    pub fn rotate_secret(&self, id: &str, overlap: Duration) -> Result<String, MockError> {
+        let mut sim = self.shared.lock();
+        let until = sim.engine.now().plus_ms(overlap.as_millis() as i64);
+        sim.engine.destinations_mut().rotate_secret(id, until)
+    }
+
+    /// All delivery targets, in creation order.
+    pub fn destinations(&self) -> Vec<DestinationInfo> {
+        self.shared
+            .lock()
+            .engine
+            .destinations()
+            .iter()
+            .map(|d| d.info.clone())
+            .collect()
     }
 
     /// Every event in creation order, with its hidden visibility time.

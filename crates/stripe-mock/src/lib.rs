@@ -4,6 +4,7 @@
 
 mod api;
 mod config;
+mod delivery;
 mod engine;
 mod error;
 mod generate;
@@ -19,6 +20,8 @@ pub use config::{
     EventRetentionConfig, EventsConfig, LateTail, PINNED_API_VERSION, PayloadFormat, RetrySchedule,
     WebhooksConfig,
 };
+pub use delivery::DestinationInfo;
+pub use delivery::signing::verify_signature;
 pub use engine::events::{EventFormat, EventInfo};
 pub use engine::{Cause, ChangeKind, EventRefs, StateUpdate};
 pub use error::MockError;

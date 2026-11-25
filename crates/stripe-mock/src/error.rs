@@ -25,6 +25,9 @@ pub enum MockError {
         object_type: crate::ObjectType,
         id: String,
     },
+    /// No destination with this ID exists.
+    #[error("no such destination: {0}")]
+    NoSuchDestination(String),
     /// Reading a config file failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
