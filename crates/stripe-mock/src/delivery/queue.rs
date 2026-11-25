@@ -180,7 +180,7 @@ impl Deliveries {
 
     /// Queues a delivery of `ev` to every matching enabled destination, plus random duplicates.
     pub(crate) fn schedule_for_event(&mut self, ev: &EventRecord, dests: &Destinations) {
-        for destination_id in dests.matching(ev.format, &ev.event_type) {
+        for destination_id in dests.matching(ev.format, &ev.event_type, ev.account.as_deref()) {
             self.schedule_one(ev, &destination_id, false);
             if self.duplicate.chance(self.config.duplicate_probability) {
                 self.schedule_one(ev, &destination_id, true);

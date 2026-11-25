@@ -355,9 +355,8 @@ async fn control_connect_and_disconnect_manage_generators() {
 #[tokio::test]
 async fn quiesce_covers_accounts() {
     let rx = Receiver::start(|_| (200, Duration::ZERO));
-    // A `connect = false` destination still receives every event until Task 5.
     let m = mock_with(&format!(
-        "{}[actions]\nnew_customer = 20\n[accounts]\nconnect = true\nconnected_accounts = {{ initial = 2 }}\n",
+        "{}connect = true\n[actions]\nnew_customer = 20\n[accounts]\nconnect = true\nconnected_accounts = {{ initial = 2 }}\n",
         dest(&rx.url("/h"), "snapshot", "*")
     ))
     .await;
@@ -365,9 +364,8 @@ async fn quiesce_covers_accounts() {
     m.step(Duration::from_secs(3600)).await.unwrap();
     m.quiesce().await.unwrap();
     let log = m.delivery_log();
-    let scheduled = |id: &str| {
-        log.iter()
-            .any(|r| r.event_id == id && matches!(r.kind, DeliveryRecordKind::Scheduled { .. }))
+    let has = |id: &str, f: fn(&DeliveryRecordKind) -> bool| {
+        log.iter().any(|r| r.event_id == id && f(&r.kind))
     };
     let events: Vec<_> = m
         .event_timeline()
@@ -376,7 +374,14 @@ async fn quiesce_covers_accounts() {
         .collect();
     assert!(events.len() > 20, "{}", events.len());
     for e in &events {
-        assert!(scheduled(&e.id), "{e:?}");
+        assert!(
+            has(&e.id, |k| matches!(k, DeliveryRecordKind::Scheduled { .. })),
+            "{e:?}"
+        );
+        assert!(
+            has(&e.id, |k| matches!(k, DeliveryRecordKind::Attempt { .. })),
+            "never attempted: {e:?}"
+        );
     }
     let n = m.truth_log().len();
     m.step(Duration::from_secs(3600)).await.unwrap();

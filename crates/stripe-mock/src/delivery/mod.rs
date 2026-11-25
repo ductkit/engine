@@ -21,6 +21,10 @@ pub struct DestinationInfo {
     pub url: String,
     pub payload: PayloadFormat,
     pub enabled_events: Vec<String>,
+    /// Snapshot destinations: also receive connected accounts' events.
+    pub connect: bool,
+    /// Thin destinations: `"@self"` and/or `"@accounts"`; empty for snapshot destinations.
+    pub events_from: Vec<String>,
     pub enabled: bool,
     pub secret: String,
     pub created: SimTime,
@@ -47,6 +51,18 @@ impl Destination {
                 .map(|(s, _)| s.clone()),
         );
         v
+    }
+
+    /// Whether the destination takes events of the platform (`false`) or of a connected
+    /// account (`true`).
+    fn covers_scope(&self, connected: bool) -> bool {
+        match self.info.payload {
+            PayloadFormat::Snapshot => !connected || self.info.connect,
+            PayloadFormat::Thin => {
+                let want = if connected { "@accounts" } else { "@self" };
+                self.info.events_from.iter().any(|v| v == want)
+            }
+        }
     }
 
     pub(crate) fn format(&self) -> EventFormat {
@@ -119,12 +135,18 @@ impl Destinations {
             Some(s) => s,
             None => self.new_secret(),
         };
+        let events_from = match d.payload {
+            PayloadFormat::Snapshot => Vec::new(),
+            PayloadFormat::Thin => d.events_from.unwrap_or_else(|| vec!["@self".to_string()]),
+        };
         let info = DestinationInfo {
             id,
             name: d.name,
             url: d.url,
             payload: d.payload,
             enabled_events: d.enabled_events,
+            connect: d.connect,
+            events_from,
             enabled: true,
             secret,
             created: now,
@@ -171,13 +193,20 @@ impl Destinations {
         self.list.iter()
     }
 
-    /// IDs of enabled destinations of `format` subscribed to `event_type`.
-    pub(crate) fn matching(&self, format: EventFormat, event_type: &str) -> Vec<String> {
+    /// IDs of enabled destinations of `format` subscribed to `event_type` from `account`
+    /// (`None` is the platform itself).
+    pub(crate) fn matching(
+        &self,
+        format: EventFormat,
+        event_type: &str,
+        account: Option<&str>,
+    ) -> Vec<String> {
         self.list
             .iter()
             .filter(|d| {
                 d.info.enabled
                     && d.format() == format
+                    && d.covers_scope(account.is_some())
                     && d.info
                         .enabled_events
                         .iter()

@@ -864,8 +864,10 @@ impl DestinationConfig {
                 _ => {}
             }
         }
-        if self.connect {
-            return config_err("`destinations.connect` is not implemented yet (phase 5: Connect)");
+        if self.connect && self.payload == PayloadFormat::Thin {
+            return config_err(format!(
+                "destination `{n}`: connect only applies to snapshot destinations (use events_from)"
+            ));
         }
         if let Some(from) = &self.events_from {
             if self.payload == PayloadFormat::Snapshot {
@@ -873,10 +875,23 @@ impl DestinationConfig {
                     "destination `{n}`: events_from only applies to thin destinations"
                 ));
             }
-            if from.as_slice() != ["@self"] {
-                return config_err(
-                    "`destinations.events_from` other than [\"@self\"] is not implemented yet (phase 5: Connect)",
-                );
+            if from.is_empty() {
+                return config_err(format!("destination `{n}`: events_from must not be empty"));
+            }
+            for (i, v) in from.iter().enumerate() {
+                if v.starts_with("@organization_members") {
+                    return config_err(format!(
+                        "`destinations.events_from` value `{v}` is not implemented yet (organizations)"
+                    ));
+                }
+                if v != "@self" && v != "@accounts" {
+                    return config_err(format!(
+                        "destination `{n}`: events_from value `{v}` must be \"@self\" or \"@accounts\""
+                    ));
+                }
+                if from[..i].contains(v) {
+                    return config_err(format!("destination `{n}`: events_from lists `{v}` twice"));
+                }
             }
         }
         if let Some(secret) = &self.secret
@@ -1095,7 +1110,6 @@ one_off_payment = 1",
         };
         for (toml, needle) in [
             (d("https://x", "*", ""), "http://"),
-            (d("http://x", "*", "connect = true"), "phase 5"),
             (d("http://x", "v1.customer.created", ""), "v1."),
             (d("http://x", "*", "secret = \"nope\""), "whsec_"),
             (
@@ -1106,6 +1120,89 @@ one_off_payment = 1",
             let msg = Config::from_toml_str(&toml).unwrap_err().to_string();
             assert!(msg.contains(needle), "{toml}: {msg}");
         }
+    }
+
+    fn dest_toml(payload: &str, events: &str, extra: &str) -> String {
+        format!(
+            "[[destinations]]
+name = \"d\"
+url = \"http://x\"
+payload = \"{payload}\"
+enabled_events = [\"{events}\"]
+{extra}"
+        )
+    }
+
+    #[test]
+    fn connect_destination_validates() {
+        let c = Config::from_toml_str(&dest_toml("snapshot", "*", "connect = true")).unwrap();
+        assert!(c.destinations[0].connect);
+        let msg = Config::from_toml_str(&dest_toml("thin", "*", "connect = true"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("connect"), "{msg}");
+    }
+
+    #[test]
+    fn events_from_rules() {
+        for ok in [
+            "[\"@self\"]",
+            "[\"@accounts\"]",
+            "[\"@self\", \"@accounts\"]",
+            "[\"@accounts\", \"@self\"]",
+        ] {
+            let t = dest_toml("thin", "*", &format!("events_from = {ok}"));
+            Config::from_toml_str(&t).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for (bad, needle) in [
+            ("[]", "events_from"),
+            ("[\"@self\", \"@self\"]", "events_from"),
+            ("[\"@accounts\", \"@accounts\"]", "events_from"),
+            ("[\"@nope\"]", "events_from"),
+            (
+                "[\"@organization_members\"]",
+                "not implemented yet (organizations)",
+            ),
+            (
+                "[\"@self\", \"@organization_members/@accounts\"]",
+                "not implemented yet (organizations)",
+            ),
+        ] {
+            let t = dest_toml("thin", "*", &format!("events_from = {bad}"));
+            let msg = Config::from_toml_str(&t).unwrap_err().to_string();
+            assert!(msg.contains(needle), "{bad}: {msg}");
+        }
+        let msg = Config::from_toml_str(&dest_toml("snapshot", "*", "events_from = [\"@self\"]"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("events_from"), "{msg}");
+    }
+
+    #[test]
+    fn spec_example_destinations_parse() {
+        let c = Config::from_toml_str(
+            r#"
+            [[destinations]]
+            name = "snapshot"
+            url = "http://localhost:4000/webhooks/stripe"
+            payload = "snapshot"
+            enabled_events = ["*"]
+            connect = true
+
+            [[destinations]]
+            name = "thin"
+            url = "http://localhost:4000/webhooks/stripe-thin"
+            payload = "thin"
+            enabled_events = ["v1.customer.*", "v1.invoice.*"]
+            events_from = ["@self", "@accounts"]
+        "#,
+        )
+        .unwrap();
+        assert!(c.destinations[0].connect);
+        assert_eq!(
+            c.destinations[1].events_from,
+            Some(vec!["@self".to_string(), "@accounts".to_string()])
+        );
     }
 
     #[test]

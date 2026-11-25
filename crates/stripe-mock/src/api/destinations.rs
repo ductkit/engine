@@ -52,7 +52,7 @@ fn v2_object(d: &Destination) -> Value {
         "type": "webhook_endpoint",
         "event_payload": "thin",
         "enabled_events": d.info.enabled_events,
-        "events_from": ["@self"],
+        "events_from": d.info.events_from,
         "snapshot_api_version": null,
         "status": status(d),
         "status_details": null,
