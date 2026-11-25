@@ -13,15 +13,15 @@ mod billing;
 mod catalog;
 mod subscriptions;
 
+pub(crate) use subscriptions::delete_customer_cascade;
+
 pub use billing::InvoiceOutcome;
 
 use std::collections::BTreeMap;
 
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::model::catalog::PriceSpec;
-use crate::model::customer::{
-    apply_update, deleted_stub, new_customer_json, random_new_customer, random_update,
-};
+use crate::model::customer::{apply_update, new_customer_json, random_new_customer, random_update};
 use crate::rng::{RngStreams, SimRng};
 use crate::{ActionsConfig, Config, MockError, ObjectType, SimTime};
 
@@ -47,6 +47,12 @@ pub enum Action {
         customer: Option<String>,
         prices: Option<Vec<String>>,
     },
+    /// Cancel the named or a random `active`/`past_due` subscription, now or at
+    /// period end (drawn when `None`).
+    CancelSubscription {
+        id: Option<String>,
+        at_period_end: Option<bool>,
+    },
 }
 
 /// Generated actions, in tie-break order. New kinds are appended, so existing
@@ -64,6 +70,8 @@ enum ActionKind {
     OneOffInvoice,
     InvoiceUpdate,
     StartSubscription,
+    CancelSubscription,
+    SubscriptionUpdate,
 }
 
 /// A follow-up step of an action.
@@ -106,6 +114,23 @@ pub(crate) enum Continuation {
         invoice: String,
     },
     ExpireIncomplete {
+        sub: String,
+        invoice: String,
+    },
+    /// Renew at the end of the current period.
+    Renew {
+        sub: String,
+    },
+    FinalizeRenewal {
+        sub: String,
+        invoice: String,
+    },
+    PayRenewal {
+        sub: String,
+        invoice: String,
+    },
+    /// The one retry of a failed renewal payment.
+    DunningRetry {
         sub: String,
         invoice: String,
     },
@@ -225,6 +250,16 @@ impl Generator {
                 a.start_subscription,
                 "generate.subscription.start",
             ),
+            (
+                ActionKind::CancelSubscription,
+                a.cancel_subscription,
+                "generate.subscription.cancel",
+            ),
+            (
+                ActionKind::SubscriptionUpdate,
+                c.subscription.update,
+                "generate.subscription.update",
+            ),
         ];
         let actions = specs
             .into_iter()
@@ -268,6 +303,30 @@ impl Generator {
 
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub(crate) fn actions_config(&self) -> &ActionsConfig {
+        &self.ctx.config
+    }
+
+    /// Replaces `[actions]`. Poisson actions whose rate changed redraw their next
+    /// due time from `now`; everything else applies to later draws.
+    pub(crate) fn set_actions_config(&mut self, config: ActionsConfig, now: SimTime) {
+        for a in &mut self.actions {
+            let rate = match a.kind {
+                ActionKind::NewCustomer => config.new_customer,
+                ActionKind::CatalogChange => config.catalog_change,
+                ActionKind::OneOffInvoice => config.one_off_invoice,
+                ActionKind::StartSubscription => config.start_subscription,
+                ActionKind::CancelSubscription => config.cancel_subscription,
+                _ => continue,
+            };
+            if rate != a.rate {
+                a.rate = rate;
+                a.next_due = a.rng.exp_interval_ms(rate).map(|ms| now.plus_ms(ms));
+            }
+        }
+        self.ctx.config = config;
     }
 
     /// Turns generation off or on. Re-enabling redraws each Poisson action's next due
@@ -348,6 +407,14 @@ impl Generator {
                 customer,
                 prices,
             )?,
+            Action::CancelSubscription { id, at_period_end } => {
+                subscriptions::cancel_subscription(&mut self.control, engine, id, at_period_end)?
+                    .ok_or_else(|| {
+                        MockError::InvalidAction(
+                            "no active or past_due subscription to cancel".to_string(),
+                        )
+                    })?
+            }
         };
         if self.enabled {
             let now = engine.now();
@@ -384,7 +451,11 @@ fn run_continuation(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mu
         c @ (Continuation::SubscriptionInvoice { .. }
         | Continuation::FinalizeFirstInvoice { .. }
         | Continuation::PayFirstInvoice { .. }
-        | Continuation::ExpireIncomplete { .. }) => subscriptions::run(c, cause, engine, ctx),
+        | Continuation::ExpireIncomplete { .. }
+        | Continuation::Renew { .. }
+        | Continuation::FinalizeRenewal { .. }
+        | Continuation::PayRenewal { .. }
+        | Continuation::DunningRetry { .. }) => subscriptions::run(c, cause, engine, ctx),
         c => billing::run(c, cause, engine, ctx),
     }
 }
@@ -445,9 +516,7 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
                 return;
             };
             let cause = engine.begin_action("customer_delete");
-            engine
-                .delete(t, &id, deleted_stub(&id), cause, &["customer.deleted"])
-                .expect("live customer");
+            subscriptions::delete_customer_cascade(engine, &id, &cause).expect("live customer");
         }
         ActionKind::CatalogChange => {
             catalog::change(rng, engine, ctx);
@@ -465,6 +534,11 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
             subscriptions::start_subscription(rng, engine, ctx, None, None)
                 .expect("random targets are valid");
         }
+        ActionKind::CancelSubscription => {
+            subscriptions::cancel_subscription(rng, engine, None, None)
+                .expect("random targets are valid");
+        }
+        ActionKind::SubscriptionUpdate => subscriptions::churn_update(rng, engine),
     }
 }
 

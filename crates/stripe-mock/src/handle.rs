@@ -11,16 +11,14 @@ use crate::delivery::sender::send;
 use crate::delivery::{DeliveryRecord, DestinationInfo, PreparedAttempt};
 use crate::engine::events::EventInfo;
 use crate::engine::{Cause, ChangeKind, Engine, StateUpdate};
-use crate::generate::Action;
 use crate::generate::Generator;
-use crate::model::customer::{
-    CustomerUpdate, NewCustomer, apply_update, deleted_stub, new_customer_json,
-};
+use crate::generate::{Action, delete_customer_cascade};
+use crate::model::customer::{CustomerUpdate, NewCustomer, apply_update, new_customer_json};
 use crate::rng::{RngStreams, SimRng};
 use crate::stream::{SubscribeFilter, SubscribeOptions, Subscription};
 use crate::{
-    ClockMode, Config, DestinationConfig, EventsConfig, MockError, ObjectType, SimTime,
-    WebhooksConfig,
+    ActionsConfig, ClockMode, Config, DestinationConfig, EventsConfig, MockError, ObjectType,
+    SimTime, WebhooksConfig,
 };
 
 /// Everything behind the lock.
@@ -352,14 +350,7 @@ impl MockStripe {
     pub fn delete_customer(&self, id: &str) -> Result<(), MockError> {
         let mut sim = self.shared.lock();
         let cause = sim.engine.begin_action("control.delete_customer");
-        sim.engine.delete(
-            ObjectType::Customer,
-            id,
-            deleted_stub(id),
-            cause,
-            &["customer.deleted"],
-        )?;
-        Ok(())
+        delete_customer_cascade(&mut sim.engine, id, &cause)
     }
 
     /// Runs a business action now, plus every follow-up step due by now
@@ -447,6 +438,21 @@ impl MockStripe {
         f(&mut cfg);
         cfg.validate()?;
         sim.engine.set_webhooks_config(cfg);
+        Ok(())
+    }
+
+    /// Changes `[actions]` settings (validated). Changed rates redraw their next
+    /// due time from now; other settings apply to later draws.
+    pub fn update_actions_config(
+        &self,
+        f: impl FnOnce(&mut ActionsConfig),
+    ) -> Result<(), MockError> {
+        let mut sim = self.shared.lock();
+        let mut cfg = sim.generator.actions_config().clone();
+        f(&mut cfg);
+        cfg.validate()?;
+        let now = sim.engine.now();
+        sim.generator.set_actions_config(cfg, now);
         Ok(())
     }
 

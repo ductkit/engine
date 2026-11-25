@@ -9,7 +9,6 @@ use crate::model::embedded::embedded_list;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BillingReason {
     SubscriptionCreate,
-    #[allow(dead_code)] // TEMP: used from Task 6
     SubscriptionCycle,
     Manual,
 }
