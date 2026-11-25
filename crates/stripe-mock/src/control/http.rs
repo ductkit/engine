@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use super::{ControlOp, duration};
+use super::{ControlOp, duration, sse};
 use crate::engine::Scope;
 use crate::handle::Shared;
 use crate::{DurationStr, MockError, MockStripe, ObjectType, SubscribeFilter};
@@ -47,6 +47,8 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         .route("/control/events", get(events))
         .route("/control/deliveries", get(deliveries))
         .route("/control/export", get(export))
+        .route("/control/subscribe", get(sse::subscribe))
+        .route("/control/subscribe/ws", get(sse::subscribe_ws))
         .route("/control/shutdown", post(shutdown))
         .fallback(|| async {
             ControlError::new(StatusCode::NOT_FOUND, "not_found", "no such route")
@@ -131,7 +133,7 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Json<T> {
 }
 
 /// `axum::extract::Query` whose rejections are control errors.
-struct Query<T>(T);
+pub(super) struct Query<T>(pub(super) T);
 
 impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for Query<T> {
     type Rejection = ControlError;
@@ -148,7 +150,7 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for Query<T> {
 
 type Mock = State<Arc<Shared>>;
 
-fn mock(shared: Arc<Shared>) -> MockStripe {
+pub(super) fn mock(shared: Arc<Shared>) -> MockStripe {
     MockStripe::view(shared)
 }
 
@@ -182,18 +184,37 @@ fn parse_object_type(s: &str) -> Result<ObjectType, ControlError> {
 
 /// `types=a,b` and `account=platform,acct_…` into a filter; either may be absent.
 pub(crate) fn parse_filter(
+    m: &MockStripe,
     types: Option<&str>,
     account: Option<&str>,
 ) -> Result<SubscribeFilter, ControlError> {
     let object_types = types
         .map(|t| t.split(',').map(|s| parse_object_type(s.trim())).collect())
         .transpose()?;
-    let accounts = account.map(|a| {
-        a.split(',')
-            .map(|s| s.trim())
-            .map(|s| (s != "platform").then(|| s.to_string()))
-            .collect::<Vec<Scope>>()
-    });
+    let accounts = account
+        .map(|a| {
+            let connected: Vec<String> = m
+                .accounts()
+                .into_iter()
+                .filter(|a| a.connected)
+                .map(|a| a.id)
+                .collect();
+            a.split(',')
+                .map(|s| s.trim())
+                .map(|s| {
+                    if s == "platform" {
+                        Ok(None)
+                    } else if connected.iter().any(|c| c == s) {
+                        Ok(Some(s.to_string()))
+                    } else {
+                        Err(ControlError::invalid(format!(
+                            "unknown or disconnected account `{s}`"
+                        )))
+                    }
+                })
+                .collect::<Result<Vec<Scope>, _>>()
+        })
+        .transpose()?;
     Ok(SubscribeFilter {
         object_types,
         accounts,
@@ -344,8 +365,9 @@ struct StateQuery {
 }
 
 async fn state(State(s): Mock, Query(q): Query<StateQuery>) -> Reply {
-    let filter = parse_filter(q.types.as_deref(), q.account.as_deref())?;
-    Ok(axum::Json(mock(s).dump_state(&filter)))
+    let m = mock(s);
+    let filter = parse_filter(&m, q.types.as_deref(), q.account.as_deref())?;
+    Ok(axum::Json(m.dump_state(&filter)))
 }
 
 #[derive(Deserialize)]

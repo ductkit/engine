@@ -3,6 +3,7 @@
 
 pub(crate) mod http;
 pub(crate) mod journal;
+pub(crate) mod sse;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
