@@ -19,6 +19,22 @@ fn paid_one_off() -> Action {
     }
 }
 
+/// Runs `run` until its invoice has a non-zero total (a zero-amount invoice is paid
+/// without payment objects); returns that run's cause. `run(true)` is a retry: it first
+/// changes the catalog so other prices get billed.
+fn charged(m: &MockStripe, run: impl Fn(bool) -> Cause) -> Cause {
+    for i in 0..50 {
+        let cause = run(i > 0);
+        let nonzero = caused(m, &cause)
+            .iter()
+            .any(|u| u.object_type == ObjectType::Invoice && u.state["total"].as_i64() > Some(0));
+        if nonzero {
+            return cause;
+        }
+    }
+    panic!("only zero-amount invoices");
+}
+
 fn caused(m: &MockStripe, cause: &Cause) -> Vec<StateUpdate> {
     m.truth_log()
         .into_iter()
@@ -80,7 +96,12 @@ fn fee(amount: i64) -> i64 {
 #[tokio::test]
 async fn paid_invoice_creates_payment_objects() {
     let m = mock_with("").await;
-    let cause = m.run_action(paid_one_off()).unwrap();
+    let cause = charged(&m, |retry| {
+        if retry {
+            m.run_action(Action::CatalogChange).unwrap();
+        }
+        m.run_action(paid_one_off()).unwrap()
+    });
     let mine = caused(&m, &cause);
     assert_eq!(
         after_finalize(&event_types(&m, &mine)),
@@ -154,12 +175,16 @@ async fn paid_invoice_creates_payment_objects() {
 
     // A second paid invoice for the same customer reuses the card.
     let cust = inv["customer"].as_str().unwrap().to_string();
-    let cause = m
-        .run_action(Action::OneOffInvoice {
-            customer: Some(cust),
+    let cause = charged(&m, |retry| {
+        if retry {
+            m.run_action(Action::CatalogChange).unwrap();
+        }
+        m.run_action(Action::OneOffInvoice {
+            customer: Some(cust.clone()),
             outcome: Some(InvoiceOutcome::Paid),
         })
-        .unwrap();
+        .unwrap()
+    });
     let again = caused(&m, &cause);
     assert!(
         !again
@@ -176,7 +201,12 @@ async fn paid_invoice_creates_payment_objects() {
 #[tokio::test]
 async fn failed_payment_creates_failed_charge() {
     let m = mock_with("[actions]\npayment_failure_probability = 1.0").await;
-    let cause = m.run_action(paid_one_off()).unwrap();
+    let cause = charged(&m, |retry| {
+        if retry {
+            m.run_action(Action::CatalogChange).unwrap();
+        }
+        m.run_action(paid_one_off()).unwrap()
+    });
     let mine = caused(&m, &cause);
     let types = after_finalize(&event_types(&m, &mine));
     assert_eq!(
@@ -194,14 +224,25 @@ async fn failed_payment_creates_failed_charge() {
             .iter()
             .any(|u| u.object_type == ObjectType::BalanceTransaction)
     );
-    assert!(
-        !mine
-            .iter()
-            .any(|u| u.object_type == ObjectType::InvoicePayment)
-    );
+    // The failed attempt leaves one open invoice payment, announced by no event, carried by
+    // the `invoice.payment_failed` mutation.
+    let ip_id = only_id(&mine, ObjectType::InvoicePayment);
+    let ip_created = mine
+        .iter()
+        .find(|u| u.object_id == ip_id && u.kind == ChangeKind::Created)
+        .unwrap();
+    assert_eq!(ip_created.state["status"], "open");
+    assert!(ip_created.events.snapshot.is_empty());
     let inv_id = only_id(&mine, ObjectType::Invoice);
-    let inv = json(&m, &format!("/v1/invoices/{inv_id}")).await;
-    assert_eq!(inv["payments"]["data"], serde_json::json!([]));
+    let failed_inv = mine
+        .iter()
+        .find(|u| u.object_id == inv_id && u.state["attempt_count"] == 1)
+        .unwrap();
+    let payments = &failed_inv.state["payments"];
+    assert_eq!(payments["total_count"], 1);
+    assert_eq!(payments["data"][0]["id"], ip_id.as_str());
+    assert_eq!(payments["data"][0]["status"], "open");
+    assert_eq!(payments["data"][0]["amount_paid"], Value::Null);
     let ch_id = only_id(&mine, ObjectType::Charge);
     let ch = json(&m, &format!("/v1/charges/{ch_id}")).await;
     assert_eq!(ch["status"], "failed");
@@ -218,6 +259,16 @@ async fn failed_payment_creates_failed_charge() {
     assert_eq!(failed.state["last_payment_error"]["charge"], ch_id.as_str());
     assert_eq!(failed.state["latest_charge"], ch_id.as_str());
     assert_eq!(failed.state["amount_received"], 0);
+    // As in Stripe, the declined card is only named in the error.
+    assert_eq!(failed.state["payment_method"], Value::Null);
+    assert_eq!(
+        failed.state["last_payment_error"]["payment_method"]["id"],
+        ch["payment_method"]
+    );
+    assert_eq!(
+        ip_created.state["payment"]["payment_intent"],
+        pi_id.as_str()
+    );
 }
 
 #[tokio::test]
@@ -263,6 +314,12 @@ async fn retry_reuses_payment_intent() {
     // Newest first.
     assert_eq!(statuses, ["succeeded", "failed"]);
     assert_eq!(pi["latest_charge"], charges["data"][0]["id"]);
+    assert_eq!(pi["payment_method"], charges["data"][0]["payment_method"]);
+    let ips = json(&m, &format!("/v1/invoice_payments?invoice={renewal}")).await;
+    assert_eq!(ips["data"].as_array().unwrap().len(), 1, "{ips}");
+    assert_eq!(ips["data"][0]["status"], "paid");
+    assert_eq!(inv["payments"]["total_count"], 1);
+    assert_eq!(inv["payments"]["data"][0]["status"], "paid");
     // Every payment intent of the renewal's customer: one for the first invoice, one
     // for the renewal (reused by the retry).
     let cust = inv["customer"].as_str().unwrap();
@@ -273,7 +330,12 @@ async fn retry_reuses_payment_intent() {
 #[tokio::test]
 async fn voided_after_failure_cancels_payment_intent() {
     let m = mock_with("[actions]\npayment_failure_probability = 1.0").await;
-    let cause = m.run_action(paid_one_off()).unwrap();
+    let cause = charged(&m, |retry| {
+        if retry {
+            m.run_action(Action::CatalogChange).unwrap();
+        }
+        m.run_action(paid_one_off()).unwrap()
+    });
     let mine = caused(&m, &cause);
     let types = after_finalize(&event_types(&m, &mine));
     assert_eq!(
@@ -289,6 +351,15 @@ async fn voided_after_failure_cancels_payment_intent() {
     assert_eq!(pi["status"], "canceled");
     assert_eq!(pi["cancellation_reason"], "void_invoice");
     assert!(pi["canceled_at"].is_i64());
+    let ip_id = only_id(&mine, ObjectType::InvoicePayment);
+    let ip = json(&m, &format!("/v1/invoice_payments/{ip_id}")).await;
+    assert_eq!(ip["status"], "canceled");
+    assert_eq!(ip["status_transitions"]["canceled_at"], pi["canceled_at"]);
+    assert_eq!(ip["status_transitions"]["paid_at"], Value::Null);
+    let inv_id = only_id(&mine, ObjectType::Invoice);
+    let inv = json(&m, &format!("/v1/invoices/{inv_id}")).await;
+    assert_eq!(inv["status"], "void");
+    assert_eq!(inv["payments"]["data"][0]["status"], "canceled");
 }
 
 #[tokio::test]
@@ -326,7 +397,12 @@ async fn uncollectible_after_failure_cancels_payment_intent() {
 #[tokio::test]
 async fn balance_transaction_becomes_available_silently() {
     let m = mock_with("").await;
-    let cause = m.run_action(paid_one_off()).unwrap();
+    let cause = charged(&m, |retry| {
+        if retry {
+            m.run_action(Action::CatalogChange).unwrap();
+        }
+        m.run_action(paid_one_off()).unwrap()
+    });
     let mine = caused(&m, &cause);
     let txn = only_id(&mine, ObjectType::BalanceTransaction);
     let created = m.get(ObjectType::BalanceTransaction, &txn).unwrap();
@@ -351,7 +427,13 @@ async fn balance_transaction_becomes_available_silently() {
 async fn connected_payments_stay_in_scope() {
     let m = mock_with("[accounts]\nconnect = true\n").await;
     let acct = m.connect_account(AccountApi::V1).unwrap();
-    let cause = m.account(&acct).run_action(paid_one_off()).unwrap();
+    let cause = charged(&m, |retry| {
+        let a = m.account(&acct);
+        if retry {
+            a.run_action(Action::CatalogChange).unwrap();
+        }
+        a.run_action(paid_one_off()).unwrap()
+    });
     let mine: Vec<StateUpdate> = caused(&m, &cause)
         .into_iter()
         .filter(|u| u.account.as_deref() == Some(&*acct))
@@ -379,4 +461,96 @@ async fn connected_payments_stay_in_scope() {
         .collect();
     assert!(events.iter().any(|e| e.event_type == "charge.succeeded"));
     assert!(events.iter().all(|e| e.account.as_deref() == Some(&*acct)));
+    let txn = only_id(&mine, ObjectType::BalanceTransaction);
+    m.step(Duration::from_secs(2 * DAY + 2)).await.unwrap();
+    let settled = m
+        .account(&acct)
+        .get(ObjectType::BalanceTransaction, &txn)
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.state["status"], "available");
+    assert_eq!(settled.account.as_deref(), Some(&*acct));
+    assert_eq!(
+        settled.at.to_datetime().timestamp(),
+        settled.state["available_on"].as_i64().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn balance_becomes_available_while_generation_is_off() {
+    let m = mock_with("").await;
+    let cause = charged(&m, |retry| {
+        if retry {
+            m.run_action(Action::CatalogChange).unwrap();
+        }
+        m.run_action(paid_one_off()).unwrap()
+    });
+    let txn = only_id(&caused(&m, &cause), ObjectType::BalanceTransaction);
+    m.quiesce().await.unwrap();
+    assert!(!m.generation_enabled());
+    m.step(Duration::from_secs(3 * DAY)).await.unwrap();
+    let u = m.get(ObjectType::BalanceTransaction, &txn).unwrap();
+    assert_eq!(u.state["status"], "available");
+    assert_eq!(
+        u.at.to_datetime().timestamp_millis(),
+        u.state["available_on"].as_i64().unwrap() * 1000
+    );
+}
+
+/// An active recurring price with a zero unit amount.
+fn zero_price(m: &MockStripe) -> String {
+    for _ in 0..500 {
+        let found = m
+            .truth_log()
+            .into_iter()
+            .filter(|u| u.object_type == ObjectType::Price)
+            .map(|u| u.object_id)
+            .find(|id| {
+                let p = m.get(ObjectType::Price, id).unwrap().state;
+                p["active"] == true && p["unit_amount"] == 0 && p["recurring"].is_object()
+            });
+        if let Some(id) = found {
+            return id;
+        }
+        m.run_action(Action::CatalogChange).unwrap();
+    }
+    panic!("no zero-amount recurring price");
+}
+
+#[tokio::test]
+async fn zero_amount_invoice_is_paid_without_payment_objects() {
+    let m = mock_with("").await;
+    let price = zero_price(&m);
+    let cause = m
+        .run_action(Action::StartSubscription {
+            customer: None,
+            prices: Some(vec![price]),
+        })
+        .unwrap();
+    let mine = caused(&m, &cause);
+    for t in [
+        ObjectType::PaymentMethod,
+        ObjectType::PaymentIntent,
+        ObjectType::Charge,
+        ObjectType::BalanceTransaction,
+        ObjectType::InvoicePayment,
+    ] {
+        assert!(!mine.iter().any(|u| u.object_type == t), "{t:?}");
+    }
+    assert_eq!(
+        after_finalize(&event_types(&m, &mine)),
+        [
+            "invoice.paid",
+            "invoice.payment_succeeded",
+            "customer.subscription.updated"
+        ]
+    );
+    let inv_id = only_id(&mine, ObjectType::Invoice);
+    let inv = json(&m, &format!("/v1/invoices/{inv_id}")).await;
+    assert_eq!(
+        (inv["status"].clone(), inv["total"].clone()),
+        ("paid".into(), 0.into())
+    );
+    assert_eq!(inv["payments"]["data"], serde_json::json!([]));
+    assert_eq!(inv["payments"]["total_count"], 0);
 }

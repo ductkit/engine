@@ -4,16 +4,15 @@
 //! (stream `"generate.payments"`); whether a payment succeeds is decided by the caller.
 
 use crate::engine::{Cause, ChangeKind, Engine};
-use crate::generate::{Continuation, Ctx};
+use crate::generate::{Ctx, billing};
 use crate::model::payments::{
-    AVAILABLE_AFTER_SECS, CardDraw, NewCharge, NewPaymentIntent, decline_error,
-    new_card_payment_method, new_charge, new_charge_balance_transaction, new_invoice_payment,
-    new_payment_intent,
+    CardDraw, NewCharge, NewPaymentIntent, decline_error, new_card_payment_method, new_charge,
+    new_charge_balance_transaction, new_invoice_payment, new_payment_intent,
 };
 use crate::rng::SimRng;
 use crate::stripe::{
-    BalanceTransaction, Expandable, Invoice, PaymentIntent, PaymentIntentCancellationReason,
-    PaymentIntentStatus, PaymentMethod,
+    BalanceTransaction, Expandable, Invoice, InvoicePayment, PaymentIntent,
+    PaymentIntentCancellationReason, PaymentIntentStatus, PaymentMethod,
 };
 use crate::{ObjectType, SimTime};
 
@@ -24,7 +23,7 @@ pub(crate) struct PaymentOutcome {
     pub charge: String,
     /// The charge's balance transaction, for a succeeded charge.
     pub balance_transaction: Option<String>,
-    /// The invoice payment, for a paid invoice.
+    /// The invoice payment, for an invoice's payment.
     pub invoice_payment: Option<String>,
 }
 
@@ -88,7 +87,6 @@ pub(crate) fn ensure_payment_method(
 }
 
 /// Creates a payment intent (`payment_intent.created`), `requires_confirmation`.
-#[allow(clippy::too_many_arguments)] // each argument is part of the intent
 fn create_payment_intent(
     engine: &mut Engine,
     ctx: &mut Ctx,
@@ -96,7 +94,6 @@ fn create_payment_intent(
     payment_method: &str,
     amount: i64,
     currency: &str,
-    invoice: Option<&str>,
     cause: &Cause,
 ) -> String {
     let id = ctx.payments.id(ObjectType::PaymentIntent.id_prefix());
@@ -109,7 +106,6 @@ fn create_payment_intent(
         customer,
         payment_method,
         client_secret: &secret,
-        invoice,
     });
     engine.create_obj(
         ObjectType::PaymentIntent,
@@ -121,17 +117,19 @@ fn create_payment_intent(
     id
 }
 
-/// One confirmation of the payment intent `pi`: a new charge, then the intent's new status.
+/// One confirmation of the payment intent `pi` with the payment method `pm_id`: a new
+/// charge, then the intent's new status.
 ///
 /// Success: the `pending` balance transaction (no event, available after two days), the
 /// `succeeded` charge (`charge.succeeded`), and the intent `succeeded`
 /// (`payment_intent.succeeded`). Failure: a `failed` charge (`charge.failed`) and the
-/// intent back to `requires_payment_method` with `last_payment_error`
-/// (`payment_intent.payment_failed`).
+/// intent back to `requires_payment_method`, its `payment_method` cleared and the card
+/// named in `last_payment_error` (`payment_intent.payment_failed`).
 fn confirm(
     engine: &mut Engine,
     ctx: &mut Ctx,
     pi: &str,
+    pm_id: &str,
     succeed: bool,
     cause: &Cause,
 ) -> PaymentOutcome {
@@ -145,14 +143,8 @@ fn confirm(
         .clone()
         .flatten()
         .map(|c| c.id().to_string());
-    let pm_id = intent
-        .payment_method
-        .clone()
-        .flatten()
-        .map(|p| p.id().to_string())
-        .expect("the intent has a payment method");
     let pm: PaymentMethod = engine
-        .latest_obj(ObjectType::PaymentMethod, &pm_id)
+        .latest_obj(ObjectType::PaymentMethod, pm_id)
         .expect("payment method exists");
     let now = engine.now();
     let created = now.unix_seconds();
@@ -169,11 +161,7 @@ fn confirm(
             cause.clone(),
             &[],
         );
-        ctx.schedule(
-            now.plus_ms(AVAILABLE_AFTER_SECS * 1000),
-            Continuation::BalanceAvailable { id: id.clone() },
-            cause.clone(),
-        );
+        ctx.schedule_settlement(SimTime(txn.available_on * 1000), id.clone(), cause.clone());
         id
     });
     let ch = new_charge(&NewCharge {
@@ -217,8 +205,12 @@ fn confirm(
                 if succeed {
                     p.status = PaymentIntentStatus::Succeeded;
                     p.amount_received = Some(amount);
+                    p.payment_method = Some(Some(Expandable::Id(pm_id.to_string())));
                 } else {
+                    // As in Stripe: a declined card leaves the intent without a payment
+                    // method; the card is named in `last_payment_error`.
                     p.status = PaymentIntentStatus::RequiresPaymentMethod;
+                    p.payment_method = Some(None);
                 }
                 // A success clears the error of an earlier failed attempt.
                 p.last_payment_error = Some(error);
@@ -253,91 +245,150 @@ pub(crate) fn charge_once(
         Some(c) => ensure_payment_method(engine, ctx, c, cause),
         None => create_payment_method(engine, ctx, None, cause),
     };
-    let pi = create_payment_intent(engine, ctx, customer, &pm, amount, currency, None, cause);
-    confirm(engine, ctx, &pi, succeed, cause)
+    let pi = create_payment_intent(engine, ctx, customer, &pm, amount, currency, cause);
+    confirm(engine, ctx, &pi, &pm, succeed, cause)
 }
 
-/// The payment intent of an invoice: the newest of its customer's intents whose
-/// `payment_details.order_reference` is the invoice.
-pub(crate) fn invoice_intent(engine: &Engine, invoice: &str) -> Option<String> {
-    let customer = engine.latest(ObjectType::Invoice, invoice)?.state["customer"]
-        .as_str()?
-        .to_string();
-    engine
+/// The invoice's `open` invoice payment (left by a failed attempt), if any.
+pub(crate) fn open_invoice_payment(engine: &Engine, invoice: &str) -> Option<InvoicePayment> {
+    let id = engine
         .store()
-        .children(ObjectType::PaymentIntent, "customer", &customer)
+        .children(ObjectType::InvoicePayment, "invoice", invoice)
         .into_iter()
         .rev()
-        .find(|o| o.latest.state["payment_details"]["order_reference"] == invoice)
-        .map(|o| o.latest.object_id.clone())
+        .find(|o| o.latest.state["status"] == "open")
+        .map(|o| o.latest.object_id.clone())?;
+    engine.latest_obj(ObjectType::InvoicePayment, &id)
 }
 
-/// One payment attempt on the open invoice `invoice`. The first attempt creates the
-/// payment intent (after the customer's payment method); a retry reuses it. On success,
-/// the invoice payment (`invoice_payment.paid`) and the paid invoice (`invoice.paid`,
-/// `invoice.payment_succeeded`, with the payment appended to `invoice.payments`); on
-/// failure, `invoice.payment_failed`.
+fn intent_of(ip: &InvoicePayment) -> String {
+    ip.payment
+        .payment_intent
+        .as_ref()
+        .map(|p| p.id().to_string())
+        .expect("invoice payments pay through a payment intent")
+}
+
+/// One payment attempt on the open invoice `invoice`; `None` for a zero-amount invoice,
+/// which is paid directly with no payment objects.
+///
+/// The first attempt creates the payment intent (after the customer's payment method)
+/// and the `open` invoice payment linked to it (no event). A retry finds the intent
+/// through that open invoice payment and pays with the customer's card again. On
+/// success, the invoice payment becomes `paid` (`invoice_payment.paid`), then the paid
+/// invoice (`invoice.paid`, `invoice.payment_succeeded`); on failure,
+/// `invoice.payment_failed`. Either invoice mutation carries the invoice payment in
+/// `invoice.payments`.
 pub(crate) fn pay_invoice(
     engine: &mut Engine,
     ctx: &mut Ctx,
     invoice: &str,
     succeed: bool,
     cause: &Cause,
-) -> PaymentOutcome {
+) -> Option<PaymentOutcome> {
     let inv: Invoice = engine
         .latest_obj(ObjectType::Invoice, invoice)
         .expect("open invoice exists");
-    let customer = inv.customer.id().to_string();
     let amount = inv.amount_remaining;
-    let pi = match invoice_intent(engine, invoice) {
-        Some(pi) => pi,
+    if amount == 0 {
+        billing::pay(engine, invoice, None, ctx.page_size, cause);
+        return None;
+    }
+    let customer = inv.customer.id().to_string();
+    let pm = ensure_payment_method(engine, ctx, &customer, cause);
+    let (pi, ip_id) = match open_invoice_payment(engine, invoice) {
+        Some(ip) => (intent_of(&ip), ip.id),
         None => {
-            let pm = ensure_payment_method(engine, ctx, &customer, cause);
-            create_payment_intent(
+            let pi = create_payment_intent(
                 engine,
                 ctx,
                 Some(&customer),
                 &pm,
                 amount,
                 &inv.currency,
-                Some(invoice),
                 cause,
-            )
+            );
+            let id = ctx.payments.id(ObjectType::InvoicePayment.id_prefix());
+            let ip = new_invoice_payment(
+                &id,
+                engine.now().unix_seconds(),
+                invoice,
+                amount,
+                &inv.currency,
+                &pi,
+            );
+            engine.create_obj(
+                ObjectType::InvoicePayment,
+                id.clone(),
+                &ip,
+                cause.clone(),
+                &[],
+            );
+            (pi, id)
         }
     };
-    let mut outcome = confirm(engine, ctx, &pi, succeed, cause);
+    let mut outcome = confirm(engine, ctx, &pi, &pm, succeed, cause);
     if succeed {
-        let id = ctx.payments.id(ObjectType::InvoicePayment.id_prefix());
-        let ip = new_invoice_payment(
-            &id,
-            engine.now().unix_seconds(),
-            invoice,
-            amount,
-            &inv.currency,
-            &pi,
-        );
-        engine.create_obj(
-            ObjectType::InvoicePayment,
-            id.clone(),
-            &ip,
-            cause.clone(),
-            &["invoice_payment.paid"],
-        );
-        crate::generate::billing::pay(engine, invoice, &ip, ctx.page_size, cause);
-        outcome.invoice_payment = Some(id);
+        let now = engine.now().unix_seconds();
+        engine
+            .update_obj::<InvoicePayment>(
+                ObjectType::InvoicePayment,
+                &ip_id,
+                |p| {
+                    p.status = "paid".to_string();
+                    p.amount_paid = Some(Some(amount));
+                    p.status_transitions.paid_at = Some(Some(now));
+                },
+                cause.clone(),
+                ChangeKind::StateChanged,
+                &["invoice_payment.paid"],
+            )
+            .expect("live invoice payment");
+        let ip: InvoicePayment = engine
+            .latest_obj(ObjectType::InvoicePayment, &ip_id)
+            .expect("invoice payment");
+        billing::pay(engine, invoice, Some(&ip), ctx.page_size, cause);
     } else {
-        crate::generate::billing::fail_payment(engine, invoice, cause);
+        let ip: InvoicePayment = engine
+            .latest_obj(ObjectType::InvoicePayment, &ip_id)
+            .expect("invoice payment");
+        billing::fail_payment(engine, invoice, &ip, ctx.page_size, cause);
     }
-    outcome
+    outcome.invoice_payment = Some(ip_id);
+    Some(outcome)
 }
 
-/// Cancels the invoice's payment intent after the invoice was voided or marked
-/// uncollectible (`payment_intent.canceled`, `cancellation_reason: void_invoice`). Does
-/// nothing unless the intent is waiting for a payment method (after a failed attempt).
-pub(crate) fn cancel_invoice_intent(engine: &mut Engine, invoice: &str, cause: &Cause) {
-    let Some(pi) = invoice_intent(engine, invoice) else {
-        return;
-    };
+/// Before an open invoice is voided or marked uncollectible: its open invoice payment
+/// becomes `canceled` (no event; the pinned API has no `invoice_payment.canceled`).
+/// Returns the canceled payment, for the invoice mutation to carry.
+pub(crate) fn cancel_invoice_payment(
+    engine: &mut Engine,
+    invoice: &str,
+    cause: &Cause,
+) -> Option<InvoicePayment> {
+    let ip = open_invoice_payment(engine, invoice)?;
+    let now = engine.now().unix_seconds();
+    engine
+        .update_obj::<InvoicePayment>(
+            ObjectType::InvoicePayment,
+            &ip.id,
+            |p| {
+                p.status = "canceled".to_string();
+                p.status_transitions.canceled_at = Some(Some(now));
+            },
+            cause.clone(),
+            ChangeKind::StateChanged,
+            &[],
+        )
+        .expect("live invoice payment");
+    engine.latest_obj(ObjectType::InvoicePayment, &ip.id)
+}
+
+/// After the invoice was voided or marked uncollectible: cancels the payment intent of
+/// its canceled invoice payment (`payment_intent.canceled`, `cancellation_reason:
+/// void_invoice`) when it waits for a payment method (after a failed attempt).
+pub(crate) fn cancel_intent(engine: &mut Engine, ip: &InvoicePayment, cause: &Cause) {
+    let pi = intent_of(ip);
     let waiting = engine
         .latest(ObjectType::PaymentIntent, &pi)
         .is_some_and(|u| u.state["status"] == "requires_payment_method");

@@ -142,10 +142,6 @@ pub(crate) enum Continuation {
         sub: String,
         invoice: String,
     },
-    /// A charge's balance transaction becomes `available` (silently) at `available_on`.
-    BalanceAvailable {
-        id: String,
-    },
 }
 
 #[derive(Debug)]
@@ -166,6 +162,9 @@ pub(crate) struct Ctx {
     /// `payloads.nested_list_page_size`.
     pub page_size: usize,
     queue: BTreeMap<(SimTime, u64), (Continuation, Cause)>,
+    /// Balance transactions to make available, at their `available_on`. Stripe's
+    /// settlement clock, not a business action: it runs while generation is off too.
+    settlements: BTreeMap<(SimTime, u64), (String, Cause)>,
     next_seq: u64,
     lifecycle: SimRng,
     /// Draws made inside billing flows and continuations: invoice and line IDs,
@@ -181,6 +180,16 @@ impl Ctx {
     pub(crate) fn schedule(&mut self, at: SimTime, c: Continuation, cause: Cause) {
         self.queue.insert((at, self.next_seq), (c, cause));
         self.next_seq += 1;
+    }
+
+    /// Queues the balance transaction `id` to become available at `at`.
+    pub(crate) fn schedule_settlement(&mut self, at: SimTime, id: String, cause: Cause) {
+        self.settlements.insert((at, self.next_seq), (id, cause));
+        self.next_seq += 1;
+    }
+
+    fn next_settlement(&self) -> Option<SimTime> {
+        self.settlements.keys().next().map(|(t, _)| *t)
     }
 
     /// One `actions.step_delay` draw from stream `"generate.lifecycle"`.
@@ -316,6 +325,7 @@ impl Generator {
                 config: config.actions.clone(),
                 page_size: config.payloads.nested_list_page_size,
                 queue: BTreeMap::new(),
+                settlements: BTreeMap::new(),
                 next_seq: 0,
                 lifecycle: stream("generate.lifecycle"),
                 billing: stream("generate.billing"),
@@ -327,15 +337,17 @@ impl Generator {
         }
     }
 
-    /// The earliest due action or continuation (`None` while disabled).
+    /// The earliest due action, continuation or settlement (only settlements while
+    /// disabled).
     pub(crate) fn next_due(&self) -> Option<SimTime> {
         if !self.enabled {
-            return None;
+            return self.ctx.next_settlement();
         }
         self.actions
             .iter()
             .filter_map(|a| a.next_due)
             .chain(self.ctx.next_due())
+            .chain(self.ctx.next_settlement())
             .min()
     }
 
@@ -430,12 +442,29 @@ impl Generator {
 
     /// Performs every action and continuation due at or before `target`, in time
     /// order (continuations first on ties), then sets the time to `target`.
+    /// Settlements run even while generation is off, and go first on ties.
     pub(crate) fn run_until(&mut self, engine: &mut Engine, target: SimTime) {
-        if !self.enabled {
-            engine.set_now(target);
-            return;
-        }
         loop {
+            if let Some(at) = self.ctx.next_settlement().filter(|t| *t <= target) {
+                let before_others = !self.enabled
+                    || self
+                        .actions
+                        .iter()
+                        .filter_map(|a| a.next_due)
+                        .all(|d| at <= d)
+                        && self.ctx.next_due().is_none_or(|c| at <= c);
+                if before_others {
+                    let Some(((at, _), (id, cause))) = self.ctx.settlements.pop_first() else {
+                        unreachable!("a settlement is due");
+                    };
+                    engine.set_now(at);
+                    payments::make_available(engine, &id, &cause);
+                    continue;
+                }
+            }
+            if !self.enabled {
+                break;
+            }
             let cont = self.ctx.next_due().filter(|t| *t <= target);
             // `min_by_key` keeps the first on ties, which is the fixed order.
             let action = self
@@ -590,7 +619,6 @@ fn run_continuation(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mu
         Continuation::SetDefaultPrice { product, price } => {
             catalog::set_default_price(engine, &product, &price, &cause);
         }
-        Continuation::BalanceAvailable { id } => payments::make_available(engine, &id, &cause),
         c @ (Continuation::SubscriptionInvoice { .. }
         | Continuation::FinalizeFirstInvoice { .. }
         | Continuation::PayFirstInvoice { .. }

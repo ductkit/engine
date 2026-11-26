@@ -10,11 +10,35 @@ fn start(customer: Option<String>, prices: Option<Vec<String>>) -> Action {
     Action::StartSubscription { customer, prices }
 }
 
+/// An active recurring price with a non-zero amount (a zero-amount invoice is paid
+/// without payment objects).
+fn charged_price(m: &ductkit_stripe_mock::MockStripe) -> String {
+    for _ in 0..200 {
+        let found = m
+            .truth_log()
+            .into_iter()
+            .filter(|u| u.object_type == ObjectType::Price)
+            .map(|u| u.object_id)
+            .find(|id| {
+                let p = m.get(ObjectType::Price, id).unwrap().state;
+                p["active"] == true
+                    && p["recurring"].is_object()
+                    && p["unit_amount"].as_i64() > Some(0)
+            });
+        if let Some(id) = found {
+            return id;
+        }
+        m.run_action(Action::CatalogChange).unwrap();
+    }
+    panic!("no charged recurring price");
+}
+
 #[tokio::test]
 async fn start_subscription_fans_out_in_order() {
     let rx = Receiver::start(|_| (200, Duration::ZERO));
     let m = mock_with(&dest(&rx.url("/h"), "snapshot", "*")).await;
-    let cause = m.run_action(start(None, None)).unwrap();
+    let price = charged_price(&m);
+    let cause = m.run_action(start(None, Some(vec![price]))).unwrap();
     let mine: Vec<_> = m
         .truth_log()
         .into_iter()
@@ -66,9 +90,13 @@ async fn start_subscription_fans_out_in_order() {
         "{types:?}"
     );
     m.step(Duration::from_millis(1)).await.unwrap();
-    let got: Vec<String> = rx
-        .wait_for(types.len(), Duration::from_secs(5))
-        .await
+    // The catalog set up before the action is delivered first; the fan-out is the tail.
+    let total = timeline
+        .iter()
+        .filter(|e| e.format == ductkit_stripe_mock::EventFormat::Snapshot)
+        .count();
+    let received = rx.wait_for(total, Duration::from_secs(5)).await;
+    let got: Vec<String> = received[received.len() - types.len()..]
         .iter()
         .map(|r| {
             serde_json::from_slice::<Value>(&r.body).unwrap()["type"]
@@ -137,7 +165,8 @@ async fn many_items_are_truncated() {
 #[tokio::test]
 async fn failed_first_payment_expires_after_23h() {
     let m = mock_with("[actions]\npayment_failure_probability = 1.0").await;
-    let cause = m.run_action(start(None, None)).unwrap();
+    let price = charged_price(&m);
+    let cause = m.run_action(start(None, Some(vec![price]))).unwrap();
     let sub_id = m
         .truth_log()
         .into_iter()

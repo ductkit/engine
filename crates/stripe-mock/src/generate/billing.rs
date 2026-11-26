@@ -171,12 +171,31 @@ pub(crate) fn finalize(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     done
 }
 
-/// `open → paid`, with `payment` appended to `invoice.payments` (the embedded list keeps
-/// its first `page_size` entries).
+/// Puts the latest state of `payment` into the embedded `invoice.payments`: replaces its
+/// entry, or, for a payment not yet listed and when `page_size` is given, counts it and
+/// appends it while the page has room.
+fn sync_payment(i: &mut Invoice, payment: &InvoicePayment, page_size: Option<usize>) {
+    let Some(list) = i.payments.as_mut() else {
+        return;
+    };
+    if let Some(entry) = list.data.iter_mut().find(|p| p.id == payment.id) {
+        *entry = payment.clone();
+    } else if let Some(page_size) = page_size {
+        let count = list.total_count.unwrap_or(list.data.len() as i64) + 1;
+        if list.data.len() < page_size {
+            list.data.push(payment.clone());
+        } else {
+            list.has_more = true;
+        }
+        list.total_count = Some(count);
+    }
+}
+
+/// `open → paid`, with `payment` (none for a zero-amount invoice) in `invoice.payments`.
 pub(crate) fn pay(
     engine: &mut Engine,
     id: &str,
-    payment: &InvoicePayment,
+    payment: Option<&InvoicePayment>,
     page_size: usize,
     cause: &Cause,
 ) -> bool {
@@ -192,14 +211,8 @@ pub(crate) fn pay(
             i.attempted = true;
             i.attempt_count += 1;
             i.status_transitions.paid_at = Some(Some(now));
-            if let Some(list) = i.payments.as_mut() {
-                let count = list.total_count.unwrap_or(list.data.len() as i64) + 1;
-                if list.data.len() < page_size {
-                    list.data.push(payment.clone());
-                } else {
-                    list.has_more = true;
-                }
-                list.total_count = Some(count);
+            if let Some(p) = payment {
+                sync_payment(i, p, Some(page_size));
             }
         },
         ChangeKind::StateChanged,
@@ -208,8 +221,15 @@ pub(crate) fn pay(
     )
 }
 
-/// A failed payment attempt on an open invoice.
-pub(crate) fn fail_payment(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
+/// A failed payment attempt on an open invoice, with its open `payment` in
+/// `invoice.payments`.
+pub(crate) fn fail_payment(
+    engine: &mut Engine,
+    id: &str,
+    payment: &InvoicePayment,
+    page_size: usize,
+    cause: &Cause,
+) -> bool {
     transition(
         engine,
         id,
@@ -217,6 +237,7 @@ pub(crate) fn fail_payment(engine: &mut Engine, id: &str, cause: &Cause) -> bool
         |i| {
             i.attempted = true;
             i.attempt_count += 1;
+            sync_payment(i, payment, Some(page_size));
         },
         ChangeKind::Updated,
         &["invoice.payment_failed"],
@@ -224,9 +245,14 @@ pub(crate) fn fail_payment(engine: &mut Engine, id: &str, cause: &Cause) -> bool
     )
 }
 
-/// `open → void`, then the cancel of a payment intent left by a failed attempt.
+/// `open → void`. An open invoice payment (left by a failed attempt) is canceled first,
+/// and its payment intent after.
 pub(crate) fn void(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
+    if status(engine, id).as_deref() != Some("open") {
+        return false;
+    }
     let now = engine.now().unix_seconds();
+    let payment = payments::cancel_invoice_payment(engine, id, cause);
     let done = transition(
         engine,
         id,
@@ -234,20 +260,28 @@ pub(crate) fn void(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
         |i| {
             i.status = Some(Some(InvoiceStatus::Void));
             i.status_transitions.voided_at = Some(Some(now));
+            if let Some(p) = &payment {
+                sync_payment(i, p, None);
+            }
         },
         ChangeKind::StateChanged,
         &["invoice.voided"],
         cause,
     );
-    if done {
-        payments::cancel_invoice_intent(engine, id, cause);
+    if let Some(p) = &payment {
+        payments::cancel_intent(engine, p, cause);
     }
     done
 }
 
-/// `open → uncollectible`, then the cancel of a payment intent left by a failed attempt.
+/// `open → uncollectible`, canceling an open invoice payment and its intent like
+/// [`void`].
 pub(crate) fn mark_uncollectible(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
+    if status(engine, id).as_deref() != Some("open") {
+        return false;
+    }
     let now = engine.now().unix_seconds();
+    let payment = payments::cancel_invoice_payment(engine, id, cause);
     let done = transition(
         engine,
         id,
@@ -255,13 +289,16 @@ pub(crate) fn mark_uncollectible(engine: &mut Engine, id: &str, cause: &Cause) -
         |i| {
             i.status = Some(Some(InvoiceStatus::Uncollectible));
             i.status_transitions.marked_uncollectible_at = Some(Some(now));
+            if let Some(p) = &payment {
+                sync_payment(i, p, None);
+            }
         },
         ChangeKind::StateChanged,
         &["invoice.marked_uncollectible"],
         cause,
     );
-    if done {
-        payments::cancel_invoice_intent(engine, id, cause);
+    if let Some(p) = &payment {
+        payments::cancel_intent(engine, p, cause);
     }
     done
 }
@@ -304,15 +341,18 @@ pub(crate) fn delete_draft(engine: &mut Engine, id: &str, cause: &Cause) -> bool
 /// One payment attempt on an open invoice: fails with
 /// `actions.payment_failure_probability` (drawn from `"generate.billing"`, as before
 /// payment objects existed), and creates its payment objects (see
-/// [`payments::pay_invoice`]). Returns whether it was paid; an invoice that is no longer
-/// open is left alone.
+/// [`payments::pay_invoice`]). A zero-amount invoice charges nothing, so it is paid
+/// whatever the draw. Returns whether it was paid; an invoice that is no longer open is
+/// left alone.
 pub(crate) fn attempt_payment(engine: &mut Engine, ctx: &mut Ctx, id: &str, cause: &Cause) -> bool {
     let succeed = !ctx.billing.chance(ctx.config.payment_failure_probability);
     if status(engine, id).as_deref() != Some("open") {
         return false;
     }
-    payments::pay_invoice(engine, ctx, id, succeed, cause);
-    succeed
+    match payments::pay_invoice(engine, ctx, id, succeed, cause) {
+        Some(_) => succeed,
+        None => true,
+    }
 }
 
 /// A live customer: the named one, or a random one, or a new one.

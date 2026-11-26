@@ -171,10 +171,6 @@ pub(crate) struct NewPaymentIntent<'a> {
     pub customer: Option<&'a str>,
     pub payment_method: &'a str,
     pub client_secret: &'a str,
-    /// The invoice paid, for an invoice's payment intent. Stored as
-    /// `payment_details.order_reference`, which is how the mock finds the invoice's intent
-    /// again for a retry or a cancel.
-    pub invoice: Option<&'a str>,
 }
 
 fn card_options() -> stripe::PaymentIntentPaymentMethodOptions {
@@ -305,12 +301,7 @@ pub(crate) fn new_payment_intent(p: &NewPaymentIntent) -> stripe::PaymentIntent 
         next_action: Some(None),
         object: stripe::PaymentIntentObject::PaymentIntent,
         on_behalf_of: Some(None),
-        payment_details: p.invoice.map(|invoice| stripe::PaymentFlowsPaymentDetails {
-            car_rental_data: None,
-            customer_reference: Some(None),
-            lodging_data: None,
-            order_reference: Some(Some(invoice.to_string())),
-        }),
+        payment_details: None,
         payment_method: Some(Some(Expandable::Id(p.payment_method.to_string()))),
         payment_method_configuration_details: Some(None),
         payment_method_options: Some(Some(card_options())),
@@ -622,7 +613,8 @@ pub(crate) fn new_charge_balance_transaction(
     }
 }
 
-/// A `paid` invoice payment through a payment intent.
+/// An `open` invoice payment through a payment intent, created at the invoice's first
+/// payment attempt; `amount_paid` is null until it is paid.
 pub(crate) fn new_invoice_payment(
     id: &str,
     created: i64,
@@ -632,7 +624,7 @@ pub(crate) fn new_invoice_payment(
     payment_intent: &str,
 ) -> stripe::InvoicePayment {
     stripe::InvoicePayment {
-        amount_paid: Some(Some(amount)),
+        amount_paid: Some(None),
         amount_requested: amount,
         created,
         currency: currency.to_string(),
@@ -647,10 +639,10 @@ pub(crate) fn new_invoice_payment(
             payment_record: None,
             type_: stripe::InvoicesPaymentsInvoicePaymentAssociatedPaymentType::PaymentIntent,
         },
-        status: "paid".to_string(),
+        status: "open".to_string(),
         status_transitions: stripe::InvoicesPaymentsInvoicePaymentStatusTransitions {
             canceled_at: Some(None),
-            paid_at: Some(Some(created)),
+            paid_at: Some(None),
         },
     }
 }
@@ -699,11 +691,10 @@ mod tests {
             customer: Some("cus_1"),
             payment_method: "pm_1",
             client_secret: "pi_1_secret_x",
-            invoice: Some("in_1"),
         });
         let v = conforms(&pi);
         assert_eq!(v["status"], "requires_confirmation");
-        assert_eq!(v["payment_details"]["order_reference"], "in_1");
+        assert!(v.get("payment_details").is_none());
         assert_eq!(v["latest_charge"], Value::Null);
 
         for succeeded in [true, false] {
@@ -744,6 +735,8 @@ mod tests {
             "inpay_1", 1, "in_1", 1000, "usd", "pi_1",
         ));
         assert_eq!(ip["payment"]["payment_intent"], "pi_1");
+        assert_eq!(ip["status"], "open");
+        assert_eq!(ip["amount_paid"], Value::Null);
         assert!(ip["payment"].get("charge").is_none());
     }
 }
