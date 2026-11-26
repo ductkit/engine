@@ -1,5 +1,6 @@
 //! Payments (spec sections 5.5 and 6.1): the objects an invoice payment creates, and the
-//! `one_off_payment`, `refund` and `dispute` actions.
+//! `one_off_payment`, `refund`, `dispute`, `save_payment_method` and payment method detach
+//! actions.
 //!
 //! Every object draw here (IDs, card details, risk scores) comes from `ctx.payments`
 //! (stream `"generate.payments"`); whether a payment succeeds, and an action's targets and
@@ -10,15 +11,17 @@ use crate::generate::catalog::active_ids;
 use crate::generate::{Continuation, Ctx, billing, pick};
 use crate::model::catalog::{random_currency, random_nonzero_amount};
 use crate::model::payments::{
-    CardDraw, NewCharge, NewDispute, NewPaymentIntent, NewRefund, decline_error,
+    BRAND, CardDraw, LAST4, NewCharge, NewDispute, NewPaymentIntent, NewRefund, decline_error,
     new_card_payment_method, new_charge, new_charge_balance_transaction, new_dispute,
     new_dispute_balance_transaction, new_invoice_payment, new_payment_intent, new_refund,
-    new_refund_balance_transaction, push_refund, submit_evidence,
+    new_refund_balance_transaction, new_setup_intent, push_refund, setup_decline_error,
+    submit_evidence,
 };
 use crate::rng::SimRng;
 use crate::stripe::{
     BalanceTransaction, Charge, Dispute, DisputeStatus, Expandable, Invoice, InvoicePayment,
     PaymentIntent, PaymentIntentCancellationReason, PaymentIntentStatus, PaymentMethod,
+    SetupIntent, SetupIntentStatus,
 };
 use crate::{MockError, ObjectType, SimTime};
 
@@ -38,14 +41,36 @@ pub(crate) struct PaymentOutcome {
     pub invoice_payment: Option<String>,
 }
 
+/// The card a payment uses when its customer has none saved: the Visa test card `4242`,
+/// with a drawn expiry and fingerprint.
 fn draw_card(rng: &mut SimRng, now: SimTime) -> CardDraw {
     use chrono::Datelike;
     let year = i64::from(now.to_datetime().year());
     CardDraw {
+        brand: BRAND.to_string(),
+        last4: LAST4.to_string(),
         exp_month: 1 + rng.below(12) as i64,
         exp_year: year + 1 + rng.below(5) as i64,
         // `id_len` with an empty prefix yields `_` plus the characters.
         fingerprint: rng.id_len("", 16)[1..].to_string(),
+    }
+}
+
+/// Brands a saved card is drawn from.
+const SAVED_BRANDS: [&str; 3] = ["visa", "mastercard", "amex"];
+
+/// A card saved through a setup intent: a drawn brand (visa, mastercard or amex), four
+/// random digits, an expiry 1-5 years ahead and a fingerprint.
+fn draw_saved_card(rng: &mut SimRng, now: SimTime) -> CardDraw {
+    let brand = pick(rng, &SAVED_BRANDS).to_string();
+    let last4 = format!("{:04}", rng.below(10_000));
+    let rest = draw_card(rng, now);
+    CardDraw {
+        brand,
+        last4,
+        exp_month: rest.exp_month,
+        exp_year: rest.exp_year,
+        fingerprint: rest.fingerprint,
     }
 }
 
@@ -526,7 +551,7 @@ pub(crate) fn refund(
 /// The amount and currency of a one-off payment, drawn like a one-off invoice line: an
 /// active price with a non-zero amount (one-time prices first) times a quantity of 1–5.
 /// With no such price, a non-zero catalog amount in a random currency.
-fn draw_amount(rng: &mut SimRng, engine: &Engine) -> (i64, String) {
+pub(super) fn draw_amount(rng: &mut SimRng, engine: &Engine) -> (i64, String) {
     let priced: Vec<(String, i64, bool)> = active_ids(engine, ObjectType::Price)
         .into_iter()
         .filter_map(|id| {
@@ -551,7 +576,7 @@ fn draw_amount(rng: &mut SimRng, engine: &Engine) -> (i64, String) {
     (unit * quantity, currency.clone())
 }
 
-fn live_customer(engine: &Engine, id: String) -> Result<String, MockError> {
+pub(super) fn live_customer(engine: &Engine, id: String) -> Result<String, MockError> {
     match engine.latest(ObjectType::Customer, &id) {
         None => Err(MockError::NoSuchObject {
             object_type: ObjectType::Customer,
@@ -907,5 +932,149 @@ pub(crate) fn dispute_action(
         Continuation::DisputeClose { id, outcome },
         cause.clone(),
     );
+    Ok(Some(cause))
+}
+
+/// The named live customer, or a random live one; `None` when none was named and none is
+/// live.
+pub(super) fn named_or_random_customer(
+    rng: &mut SimRng,
+    engine: &Engine,
+    named: Option<String>,
+) -> Result<Option<String>, MockError> {
+    match named {
+        Some(id) => live_customer(engine, id).map(Some),
+        None => {
+            let live = engine.store().live_ids(ObjectType::Customer);
+            Ok((!live.is_empty()).then(|| pick(rng, live).clone()))
+        }
+    }
+}
+
+/// `save_payment_method`: saves a card for the named or a random live customer through a
+/// setup intent. The setup intent is created `requires_payment_method`
+/// (`setup_intent.created`); then the card is created and attached
+/// (`payment_method.attached`) and the setup intent `succeeded` with it
+/// (`setup_intent.succeeded`). With `actions.payment_failure_probability` the card is
+/// declined instead: no payment method, and the setup intent stays
+/// `requires_payment_method` with `last_setup_error` (`setup_intent.setup_failed`). The
+/// target and the outcome come from `rng`, the objects' draws from `ctx.payments`. Returns
+/// `None` when no customer was named and none is live.
+pub(crate) fn save_payment_method(
+    rng: &mut SimRng,
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    customer: Option<String>,
+) -> Result<Option<Cause>, MockError> {
+    let Some(customer) = named_or_random_customer(rng, engine, customer)? else {
+        return Ok(None);
+    };
+    let succeed = !rng.chance(ctx.config.payment_failure_probability);
+    let cause = engine.begin_action("save_payment_method");
+    let now = engine.now();
+    let id = ctx.payments.id(ObjectType::SetupIntent.id_prefix());
+    let secret = format!("{id}_{}", ctx.payments.id_len("secret", 25));
+    let si = new_setup_intent(&id, now.unix_seconds(), &customer, &secret);
+    engine.create_obj(
+        ObjectType::SetupIntent,
+        id.clone(),
+        &si,
+        cause.clone(),
+        &["setup_intent.created"],
+    );
+    if succeed {
+        let pm = ctx.payments.id(ObjectType::PaymentMethod.id_prefix());
+        let card = draw_saved_card(&mut ctx.payments, now);
+        let obj = new_card_payment_method(&pm, now.unix_seconds(), Some(&customer), &card);
+        engine.create_obj(
+            ObjectType::PaymentMethod,
+            pm.clone(),
+            &obj,
+            cause.clone(),
+            &["payment_method.attached"],
+        );
+        engine
+            .update_obj::<SetupIntent>(
+                ObjectType::SetupIntent,
+                &id,
+                |s| {
+                    s.status = SetupIntentStatus::Succeeded;
+                    s.payment_method = Some(Some(Expandable::Id(pm)));
+                },
+                cause.clone(),
+                ChangeKind::StateChanged,
+                &["setup_intent.succeeded"],
+            )
+            .expect("live setup intent");
+    } else {
+        engine
+            .update_obj::<SetupIntent>(
+                ObjectType::SetupIntent,
+                &id,
+                |s| s.last_setup_error = Some(Some(Box::new(setup_decline_error()))),
+                cause.clone(),
+                ChangeKind::Updated,
+                &["setup_intent.setup_failed"],
+            )
+            .expect("live setup intent");
+    }
+    Ok(Some(cause))
+}
+
+/// Whether the payment method `id` is attached to a customer.
+fn attached(engine: &Engine, id: &str) -> bool {
+    engine
+        .latest(ObjectType::PaymentMethod, id)
+        .is_some_and(|u| u.state["customer"].is_string())
+}
+
+/// `churn.payment_method.detach`: detaches the named or a random attached payment method:
+/// `customer: null` (`payment_method.detached`). It stays retrievable and leaves its
+/// customer's lists, and no payment uses it again. Returns `None` when none was named and
+/// none is attached; a named one that is unknown or already detached is an error.
+pub(crate) fn detach_action(
+    rng: &mut SimRng,
+    engine: &mut Engine,
+    id: Option<String>,
+) -> Result<Option<Cause>, MockError> {
+    let id = match id {
+        Some(id) => {
+            if engine.latest(ObjectType::PaymentMethod, &id).is_none() {
+                return Err(MockError::NoSuchObject {
+                    object_type: ObjectType::PaymentMethod,
+                    id,
+                });
+            }
+            if !attached(engine, &id) {
+                return Err(MockError::InvalidAction(format!(
+                    "payment method {id} is not attached to a customer"
+                )));
+            }
+            id
+        }
+        None => {
+            let candidates: Vec<&String> = engine
+                .store()
+                .live_ids(ObjectType::PaymentMethod)
+                .iter()
+                .filter(|id| attached(engine, id))
+                .collect();
+            if candidates.is_empty() {
+                return Ok(None);
+            }
+            (*pick(rng, &candidates)).clone()
+        }
+    };
+    let cause = engine.begin_action("payment_method_detach");
+    engine
+        .update_obj::<PaymentMethod>(
+            ObjectType::PaymentMethod,
+            &id,
+            |p| p.customer = Some(None),
+            cause.clone(),
+            ChangeKind::Updated,
+            &["payment_method.detached"],
+        )
+        .expect("live payment method");
     Ok(Some(cause))
 }

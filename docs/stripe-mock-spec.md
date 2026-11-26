@@ -138,6 +138,8 @@ renew_subscription_cycle = "natural"   # driven by billing periods
 one_off_payment = 6.0                  # a payment with no invoice
 refund = 0.4                           # a full or partial refund of a random succeeded charge
 dispute = 0.05                         # a dispute on a random succeeded, unrefunded charge
+save_payment_method = 1.0              # a setup intent that saves a new card for a random customer
+checkout = 2.0                         # a Checkout session, completed or left to expire
 catalog_change = 0.2                   # products/prices created, archived
 one_off_invoice = 2.0                  # a manual invoice, with a drawn outcome
 step_delay = { distribution = "lognormal", median_ms = 200, p99_ms = 2000 }   # gap between an action's steps
@@ -159,6 +161,8 @@ update = 0.5         # metadata
 update = 0.5         # metadata
 [churn.account]
 update = 0.2         # business profile, email and metadata of a random connected account
+[churn.payment_method]
+detach = 0.1         # a random attached payment method is detached
 
 [api]
 keys = ["sk_test_mock"]   # accepted API keys (section 7.1)
@@ -232,6 +236,13 @@ Limits (config files and the runtime `set_*_config` ops alike; a violation is a 
   3. Close: `won` adds the reinstating balance transaction (`reporting_category: dispute_reversal`, `+amount`, fee -1500, available at once) and announces `charge.dispute.closed`, `charge.dispute.funds_reinstated`; `lost` (funds stay withdrawn) and `warning_closed` announce `charge.dispute.closed`.
 
   Draws come from the stream `generate.dispute`, the IDs from `generate.payments` (the reinstatement's ID when the dispute closes).
+- `save_payment_method` saves a card for a random live customer (none: nothing happens) through a setup intent, in one instant: the setup intent (`requires_payment_method`, `usage: off_session`; `setup_intent.created`), the card payment method attached to the customer (`payment_method.attached`; brand drawn from `visa`, `mastercard` and `amex`, `last4` four random digits, expiry 1–5 years ahead of the clock), and the setup intent `succeeded` with `payment_method` set (`setup_intent.succeeded`). With `payment_failure_probability` the card is declined instead: no payment method is created, and the setup intent stays `requires_payment_method` with `last_setup_error` (`card_declined`; `setup_intent.setup_failed`). A later payment of that customer uses its newest attached card. Draws come from the stream `generate.save_payment_method`, the objects' from `generate.payments`.
+- `[churn.payment_method] detach` (per hour, default 0) detaches a random attached payment method (none: nothing happens): `customer` becomes `null` (`payment_method.detached`). It stays retrievable, leaves `GET /v1/payment_methods?customer=…` and `GET /v1/customers/{id}/payment_methods`, and no later payment uses it (a customer left with no card gets a new one at its next payment). Draws come from the stream `generate.payment_method.detach`.
+- `checkout` opens a hosted card Checkout session for a random live customer (none: nothing happens): `status: open`, `payment_status: unpaid`, `expires_at` = `created` + 24 h, no event. Everything is drawn when it opens: whether it completes (probability 0.7), the mode (`subscription` with probability 0.3, else `payment`; `subscription` needs an active recurring price and otherwise falls back to `payment`), the amount (payment mode, drawn like a one-off payment's) or the subscription's prices and quantities (as `start_subscription` draws them; `amount_total` is their first invoice's total), and the time to completion (uniform 1–30 minutes). Under the opening action's cause, either:
+  1. Completion. Payment mode runs a succeeding payment for `amount_total` (the payment sequence of `one_off_payment`, from `payment_intent.created` to `payment_intent.succeeded`) and links `payment_intent`. Subscription mode starts the subscription in the same instant (`customer.subscription.created`, the first invoice created, finalized and paid with its payment objects, the subscription `active`, its renewal queued) and links `subscription` and `invoice`. Then the session is `complete`, `payment_status: paid` (`no_payment_required` for a zero total), with `customer_details` from the customer and `url: null` (`checkout.session.completed`). If the customer was deleted meanwhile, nothing is bought and the session waits to expire.
+  2. Expiry, at `expires_at`: `status: expired`, `url: null` (`checkout.session.expired`).
+
+  `GET /v1/checkout/sessions` filters by `customer`, `payment_intent`, `subscription` and `status`. Draws come from the stream `generate.checkout`, the session's ID from `generate.payments`.
 
 Configuration can be changed at runtime through the control API (section 11). Changes are recorded in the truth log, so replays reproduce them.
 
@@ -569,7 +580,7 @@ All routes are under `/control` on the control port. Bodies are JSON. `{d}` is a
 
 Mutating calls other than `step`, `advance_to`, `quiesce`, pause, resume and speed go through `POST /control/ops`. That gives one route, one schema and the same shape as scripts and the journal. `ControlOp` covers customer create, update and delete (with an optional `account`), `run_action`, connect and disconnect account, config updates (`set_api_config`, `set_events_config`, `set_webhooks_config`, `set_actions_config`), and destination add, remove, enable, outage start and end, and secret rotation.
 
-`run_action` takes an `Action`, tagged by `type` in snake case: `new_customer`, `catalog_change`, `archive {id}`, `one_off_invoice {customer, outcome}`, `start_subscription {customer, prices}`, `cancel_subscription {id, at_period_end}`, `one_off_payment {customer, amount, succeed}`, `refund {charge, amount}` and `dispute {charge, outcome}` (`outcome`: `won`, `lost` or `warning_closed`). Fields left out or `null` are drawn as the generated action draws them, for example `{"op": "run_action", "action": {"type": "refund", "charge": "ch_…", "amount": 500}}`. `refund` with a named charge that has not succeeded or has less than `amount` (or nothing) left to refund is a 409 `invalid_action` naming the charge, and so is a `refund` with no charge when no charge is refundable; a `one_off_payment` `amount` below 1 is a 409 `invalid_action` too. So is a `dispute` on a named charge that cannot be disputed (not succeeded, refunded or already disputed; the message names it), or with no charge when none is disputable.
+`run_action` takes an `Action`, tagged by `type` in snake case: `new_customer`, `catalog_change`, `archive {id}`, `one_off_invoice {customer, outcome}`, `start_subscription {customer, prices}`, `cancel_subscription {id, at_period_end}`, `one_off_payment {customer, amount, succeed}`, `refund {charge, amount}`, `dispute {charge, outcome}` (`outcome`: `won`, `lost` or `warning_closed`), `save_payment_method {customer}`, `checkout {customer, mode, complete}` (`mode`: `payment` or `subscription`) and `detach_payment_method {id}`. Fields left out or `null` are drawn as the generated action draws them, for example `{"op": "run_action", "action": {"type": "refund", "charge": "ch_…", "amount": 500}}`. `refund` with a named charge that has not succeeded or has less than `amount` (or nothing) left to refund is a 409 `invalid_action` naming the charge, and so is a `refund` with no charge when no charge is refundable; a `one_off_payment` `amount` below 1 is a 409 `invalid_action` too. So is a `dispute` on a named charge that cannot be disputed (not succeeded, refunded or already disputed; the message names it), or with no charge when none is disputable. `save_payment_method` and `checkout` with no customer when no customer is live are 409 `invalid_action`, and a named customer that does not exist is a 404. `detach_payment_method` on a named payment method that is not attached is a 409 `invalid_action` naming it (an unknown one is a 404), and so is one with no ID when none is attached.
 
 **Errors** use one JSON envelope: `{"error": {"code": "<snake_case error name>", "message": "<text>"}}`. Status by error:
 

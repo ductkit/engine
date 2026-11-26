@@ -275,7 +275,9 @@ fn matches(
         ObjectType::BalanceTransaction => {
             eq("type", "type") && eq("source", "source") && !f.contains_key("payout")
         }
-        ObjectType::PaymentMethod => eq("type", "type"),
+        // The children index keeps a detached payment method under the customer it was
+        // created for, so the state shown must still name that customer.
+        ObjectType::PaymentMethod => eq("customer", "customer") && eq("type", "type"),
         ObjectType::CheckoutSession => {
             eq("customer", "customer")
                 && eq("payment_intent", "payment_intent")
@@ -514,13 +516,15 @@ pub(crate) async fn customer_payment_methods(
     }
     let mut all = view.store().children(r.t, "customer", &id);
     all.reverse();
+    let mut filters = p.extra.clone();
+    filters.insert("customer".to_string(), id.clone());
     let (page, has_more) = paginate(
         &all,
         |o| {
             p.created.matches(o.created)
                 && view
                     .listed(o)
-                    .is_some_and(|u| matches(&view, r, o, &u.state, &p.extra, None))
+                    .is_some_and(|u| matches(&view, r, o, &u.state, &filters, None))
         },
         &p,
     )?;

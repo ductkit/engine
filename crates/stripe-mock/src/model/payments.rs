@@ -15,9 +15,9 @@ use crate::stripe::{self, Expandable, List, ListObject};
 /// Seconds from a charge to its balance becoming available.
 pub(crate) const AVAILABLE_AFTER_SECS: i64 = 2 * 86_400;
 
-/// The test card the mock pays with: Visa, `4242`.
-const BRAND: &str = "visa";
-const LAST4: &str = "4242";
+/// The test card the mock pays with when a customer has no saved card: Visa, `4242`.
+pub(crate) const BRAND: &str = "visa";
+pub(crate) const LAST4: &str = "4242";
 const CARD_COUNTRY: &str = "US";
 const FUNDING: &str = "credit";
 
@@ -37,6 +37,9 @@ pub(crate) fn card_fee(amount: i64) -> i64 {
 /// The drawn parts of a card.
 #[derive(Debug, Clone)]
 pub(crate) struct CardDraw {
+    /// `visa`, `mastercard` or `amex`.
+    pub brand: String,
+    pub last4: String,
     pub exp_month: i64,
     pub exp_year: i64,
     pub fingerprint: String,
@@ -56,6 +59,14 @@ fn empty_billing_details() -> stripe::BillingDetails {
         name: Some(None),
         phone: Some(None),
         tax_id: Some(None),
+    }
+}
+
+/// The `display_brand` Stripe shows for a card brand.
+fn display_brand(brand: &str) -> &str {
+    match brand {
+        "amex" => "american_express",
+        other => other,
     }
 }
 
@@ -83,22 +94,22 @@ pub(crate) fn new_card_payment_method(
         blik: None,
         boleto: None,
         card: Some(stripe::PaymentMethodCard {
-            brand: BRAND.to_string(),
+            brand: card.brand.clone(),
             checks: Some(Some(stripe::PaymentMethodCardChecks {
                 address_line1_check: Some(None),
                 address_postal_code_check: Some(None),
                 cvc_check: Some(None),
             })),
             country: Some(Some(CARD_COUNTRY.to_string())),
-            display_brand: Some(Some(BRAND.to_string())),
+            display_brand: Some(Some(display_brand(&card.brand).to_string())),
             exp_month: card.exp_month,
             exp_year: card.exp_year,
             fingerprint: Some(Some(card.fingerprint.clone())),
             funding: FUNDING.to_string(),
             generated_from: Some(None),
-            last4: LAST4.to_string(),
+            last4: card.last4.clone(),
             networks: Some(Some(stripe::Networks {
-                available: vec![BRAND.to_string()],
+                available: vec![card.brand.clone()],
                 preferred: Some(None),
             })),
             regulated_status: Some(Some(stripe::PaymentMethodCardRegulatedStatus::Unregulated)),
@@ -893,6 +904,13 @@ fn empty_evidence() -> stripe::DisputeEvidence {
 /// `warning_needs_response` (an inquiry), no evidence, due [`EVIDENCE_DUE_SECS`] later.
 pub(crate) fn new_dispute(d: &NewDispute) -> stripe::Dispute {
     let c = d.charge;
+    let brand = c
+        .payment_method_details
+        .clone()
+        .flatten()
+        .and_then(|p| p.card)
+        .and_then(|card| card.brand.flatten())
+        .unwrap_or_else(|| BRAND.to_string());
     let (status, case_type) = if d.inquiry {
         (
             stripe::DisputeStatus::WarningNeedsResponse,
@@ -940,9 +958,9 @@ pub(crate) fn new_dispute(d: &NewDispute) -> stripe::Dispute {
         payment_method_details: Some(stripe::DisputePaymentMethodDetails {
             amazon_pay: None,
             card: Some(stripe::DisputePaymentMethodDetailsCard {
-                brand: BRAND.to_string(),
+                brand: brand.clone(),
                 case_type,
-                network: BRAND.to_string(),
+                network: brand,
                 network_reason_code: Some(network_reason_code(d.reason)),
             }),
             klarna: None,
@@ -967,6 +985,100 @@ pub(crate) fn submit_evidence(d: &mut stripe::Dispute) {
     e.has_evidence = true;
     e.submission_count += 1;
     e.submission_method = stripe::DisputeEvidenceDetailsSubmissionMethod::Manual;
+}
+
+/// A new off-session card setup intent for `customer`, `requires_payment_method`.
+pub(crate) fn new_setup_intent(
+    id: &str,
+    created: i64,
+    customer: &str,
+    client_secret: &str,
+) -> stripe::SetupIntent {
+    stripe::SetupIntent {
+        allowed_payment_method_types: Some(None),
+        application: Some(None),
+        attach_to_self: None,
+        automatic_payment_methods: Some(None),
+        cancellation_reason: Some(None),
+        client_secret: Some(Some(client_secret.to_string())),
+        created,
+        customer: Some(Some(Expandable::Id(customer.to_string()))),
+        customer_account: Some(None),
+        description: Some(None),
+        excluded_payment_method_types: Some(None),
+        flow_directions: Some(None),
+        id: id.to_string(),
+        last_setup_error: Some(None),
+        latest_attempt: Some(None),
+        livemode: false,
+        managed_payments: Some(None),
+        mandate: Some(None),
+        metadata: Some(Some(BTreeMap::new())),
+        next_action: Some(None),
+        object: stripe::SetupIntentObject::SetupIntent,
+        on_behalf_of: Some(None),
+        payment_method: Some(None),
+        payment_method_configuration_details: Some(None),
+        payment_method_options: Some(Some(setup_card_options())),
+        payment_method_types: vec!["card".to_string()],
+        single_use_mandate: Some(None),
+        status: stripe::SetupIntentStatus::RequiresPaymentMethod,
+        usage: "off_session".to_string(),
+    }
+}
+
+fn setup_card_options() -> stripe::SetupIntentPaymentMethodOptions {
+    stripe::SetupIntentPaymentMethodOptions {
+        acss_debit: None,
+        amazon_pay: None,
+        bacs_debit: None,
+        bizum: None,
+        blik: None,
+        card: Some(
+            stripe::SetupIntentPaymentMethodOptionsCardUnion::SetupIntentPaymentMethodOptionsCard(
+                stripe::SetupIntentPaymentMethodOptionsCard {
+                    mandate_options: Some(None),
+                    network: Some(None),
+                    request_three_d_secure: Some(Some(
+                        stripe::SetupIntentPaymentMethodOptionsCardRequestThreeDSecure::Automatic,
+                    )),
+                    setup_credential_usage: None,
+                },
+            ),
+        ),
+        card_present: None,
+        klarna: None,
+        link: None,
+        paypal: None,
+        payto: None,
+        pix: None,
+        sepa_debit: None,
+        upi: None,
+        us_bank_account: None,
+    }
+}
+
+/// The `last_setup_error` of a declined card. No payment method was saved, so none is
+/// named.
+pub(crate) fn setup_decline_error() -> stripe::ApiErrors {
+    stripe::ApiErrors {
+        advice_code: None,
+        charge: None,
+        code: Some(DECLINE_CODE.to_string()),
+        decline_code: Some("generic_decline".to_string()),
+        doc_url: Some("https://docs.stripe.com/error-codes/card-declined".to_string()),
+        message: Some(DECLINE_MESSAGE.to_string()),
+        network_advice_code: None,
+        network_decline_code: None,
+        param: None,
+        payment_intent: None,
+        payment_method: None,
+        payment_method_type: None,
+        request_log_url: None,
+        setup_intent: None,
+        source: None,
+        type_: stripe::ApiErrorsType::CardError,
+    }
 }
 
 /// An `open` invoice payment through a payment intent, created at the invoice's first
@@ -1016,6 +1128,8 @@ mod tests {
 
     fn card() -> CardDraw {
         CardDraw {
+            brand: BRAND.to_string(),
+            last4: LAST4.to_string(),
             exp_month: 4,
             exp_year: 2030,
             fingerprint: "Fp0123456789abcd".into(),
@@ -1171,6 +1285,31 @@ mod tests {
             assert_eq!(v["status"], want);
             assert_eq!(v["evidence_details"]["submission_count"], 1);
         }
+
+        let amex = CardDraw {
+            brand: "amex".into(),
+            last4: "0005".into(),
+            ..card()
+        };
+        let v = conforms(&new_card_payment_method("pm_2", 1, Some("cus_1"), &amex));
+        assert_eq!(v["card"]["display_brand"], "american_express");
+        assert_eq!(v["card"]["networks"]["available"][0], "amex");
+
+        let mut si = new_setup_intent("seti_1", 1, "cus_1", "seti_1_secret_x");
+        let v = conforms(&si);
+        assert_eq!(v["status"], "requires_payment_method");
+        assert_eq!(v["payment_method"], Value::Null);
+        assert_eq!(
+            v["payment_method_options"]["card"]["request_three_d_secure"],
+            "automatic"
+        );
+        si.last_setup_error = Some(Some(Box::new(setup_decline_error())));
+        let v = conforms(&si);
+        assert_eq!(v["last_setup_error"]["code"], "card_declined");
+        si.last_setup_error = Some(None);
+        si.status = stripe::SetupIntentStatus::Succeeded;
+        si.payment_method = Some(Some(Expandable::Id("pm_2".into())));
+        conforms(&si);
 
         let ip = conforms(&new_invoice_payment(
             "inpay_1", 1, "in_1", 1000, "usd", "pi_1",

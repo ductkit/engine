@@ -12,6 +12,7 @@
 mod accounts;
 mod billing;
 mod catalog;
+mod checkout;
 mod mux;
 mod payments;
 mod subscriptions;
@@ -22,6 +23,7 @@ pub(crate) use mux::Generators;
 pub(crate) use subscriptions::delete_customer_cascade;
 
 pub use billing::InvoiceOutcome;
+pub use checkout::CheckoutMode;
 pub use payments::DisputeOutcome;
 
 use std::collections::BTreeMap;
@@ -82,6 +84,18 @@ pub enum Action {
         charge: Option<String>,
         outcome: Option<DisputeOutcome>,
     },
+    /// Save a card for the named or a random customer through a setup intent.
+    SavePaymentMethod { customer: Option<String> },
+    /// A Checkout session for the named or a random customer, in `mode` (drawn when
+    /// `None`), completed or left to expire (`complete`, drawn when `None`).
+    Checkout {
+        customer: Option<String>,
+        mode: Option<CheckoutMode>,
+        complete: Option<bool>,
+    },
+    /// Detach the named or a random attached payment method. A named one that is not
+    /// attached is an error naming it.
+    DetachPaymentMethod { id: Option<String> },
 }
 
 /// Generated actions, in tie-break order. New kinds are appended, so existing
@@ -104,6 +118,9 @@ enum ActionKind {
     OneOffPayment,
     Refund,
     Dispute,
+    SavePaymentMethod,
+    Checkout,
+    PaymentMethodDetach,
 }
 
 /// A follow-up step of an action.
@@ -174,6 +191,15 @@ pub(crate) enum Continuation {
     DisputeClose {
         id: String,
         outcome: DisputeOutcome,
+    },
+    /// The Checkout session completes: a payment, or the drawn subscription (`plan`).
+    CheckoutComplete {
+        id: String,
+        plan: Option<subscriptions::SubscriptionDraw>,
+    },
+    /// The Checkout session expires, unless it completed.
+    CheckoutExpire {
+        id: String,
     },
 }
 
@@ -343,6 +369,17 @@ impl Generator {
             ),
             (ActionKind::Refund, a.refund, "generate.refund"),
             (ActionKind::Dispute, a.dispute, "generate.dispute"),
+            (
+                ActionKind::SavePaymentMethod,
+                a.save_payment_method,
+                "generate.save_payment_method",
+            ),
+            (ActionKind::Checkout, a.checkout, "generate.checkout"),
+            (
+                ActionKind::PaymentMethodDetach,
+                c.payment_method.detach,
+                "generate.payment_method.detach",
+            ),
         ];
         let actions = specs
             .into_iter()
@@ -430,6 +467,8 @@ impl Generator {
                 ActionKind::OneOffPayment => config.one_off_payment,
                 ActionKind::Refund => config.refund,
                 ActionKind::Dispute => config.dispute,
+                ActionKind::SavePaymentMethod => config.save_payment_method,
+                ActionKind::Checkout => config.checkout,
                 _ => continue,
             };
             a.base_rate = rate;
@@ -601,6 +640,32 @@ impl Generator {
                         )
                     })?
             }
+            Action::SavePaymentMethod { customer } => {
+                payments::save_payment_method(&mut self.control, engine, &mut self.ctx, customer)?
+                    .ok_or_else(|| {
+                    MockError::InvalidAction(
+                        "no live customer to save a payment method for".to_string(),
+                    )
+                })?
+            }
+            Action::Checkout {
+                customer,
+                mode,
+                complete,
+            } => checkout::checkout_action(
+                &mut self.control,
+                engine,
+                &mut self.ctx,
+                customer,
+                mode,
+                complete,
+            )?
+            .ok_or_else(|| MockError::InvalidAction("no live customer to check out".to_string()))?,
+            Action::DetachPaymentMethod { id } => {
+                payments::detach_action(&mut self.control, engine, id)?.ok_or_else(|| {
+                    MockError::InvalidAction("no attached payment method to detach".to_string())
+                })?
+            }
         };
         self.run_due_now(engine);
         Ok(cause)
@@ -651,11 +716,13 @@ impl Generator {
             ObjectType::Refund => &[ActionKind::Refund],
             ObjectType::InvoicePayment => &[ActionKind::OneOffInvoice],
             ObjectType::Dispute => &[ActionKind::Dispute],
+            ObjectType::PaymentMethod => &[
+                ActionKind::SavePaymentMethod,
+                ActionKind::PaymentMethodDetach,
+            ],
+            ObjectType::SetupIntent => &[ActionKind::SavePaymentMethod],
+            ObjectType::CheckoutSession => &[ActionKind::Checkout],
             ObjectType::SubscriptionItem | ObjectType::InvoiceLineItem | ObjectType::Account => {
-                return;
-            }
-            // No action creates these yet; task 12 adds theirs.
-            ObjectType::PaymentMethod | ObjectType::SetupIntent | ObjectType::CheckoutSession => {
                 return;
             }
         };
@@ -699,6 +766,10 @@ fn run_continuation(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mu
         Continuation::DisputeClose { id, outcome } => {
             payments::dispute_close(engine, ctx, &id, outcome, &cause);
         }
+        Continuation::CheckoutComplete { id, plan } => {
+            checkout::run_complete(engine, ctx, &id, plan, &cause);
+        }
+        Continuation::CheckoutExpire { id } => checkout::run_expire(engine, &id, &cause),
         c => billing::run(c, cause, engine, ctx),
     }
 }
@@ -799,6 +870,17 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
         ActionKind::Dispute => {
             payments::dispute_action(rng, engine, ctx, None, None)
                 .expect("random targets are valid");
+        }
+        ActionKind::SavePaymentMethod => {
+            payments::save_payment_method(rng, engine, ctx, None)
+                .expect("random targets are valid");
+        }
+        ActionKind::Checkout => {
+            checkout::checkout_action(rng, engine, ctx, None, None, None)
+                .expect("random targets are valid");
+        }
+        ActionKind::PaymentMethodDetach => {
+            payments::detach_action(rng, engine, None).expect("random targets are valid");
         }
     }
 }

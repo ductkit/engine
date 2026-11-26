@@ -23,8 +23,8 @@ pub use config::{
     CatalogChurn, ChurnConfig, ClockConfig, ClockMode, ClockSkew, Config, ConnectedAccounts,
     CustomerChurn, DestinationConfig, DisableAfter, Distribution, DurationStr,
     EventRetentionConfig, EventsConfig, HistoryConfig, LateTail, MAX_DURATION_MS, MAX_SPEED,
-    PINNED_API_VERSION, PaginationWrites, PayloadFormat, PayloadsConfig, RateLimit, RenewMode,
-    RetrySchedule, StaleRead, UpdateChurn, WebhooksConfig,
+    PINNED_API_VERSION, PaginationWrites, PayloadFormat, PayloadsConfig, PaymentMethodChurn,
+    RateLimit, RenewMode, RetrySchedule, StaleRead, UpdateChurn, WebhooksConfig,
 };
 pub use control::{
     ControlOp, JournalEntry, OpResult, RUN_FORMAT, ReplayGuard, ReplayOptions, RunExport,
@@ -38,7 +38,7 @@ pub use delivery::{
 pub use engine::events::{EventFormat, EventInfo};
 pub use engine::{Cause, ChangeKind, EventRefs, Scope, StateUpdate};
 pub use error::MockError;
-pub use generate::{Action, DisputeOutcome, InvoiceOutcome};
+pub use generate::{Action, CheckoutMode, DisputeOutcome, InvoiceOutcome};
 pub use handle::{AccountHandle, AccountInfo, MockStripe, StartOptions};
 pub use model::ObjectType;
 pub use model::account::{AccountApi, AccountKind, Configuration};

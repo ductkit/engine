@@ -29,7 +29,9 @@ struct TypeStore {
     parents: HashMap<(&'static str, String), Vec<usize>>,
 }
 
-/// The parent fields indexed for each type. Parent fields never change.
+/// The parent fields indexed for each type, as they were at creation. Parent fields never
+/// change, except a payment method's `customer`, which detaching sets to `null`: readers of
+/// that index check the current state.
 fn parent_fields(t: ObjectType) -> &'static [&'static str] {
     match t {
         ObjectType::SubscriptionItem => &["subscription"],

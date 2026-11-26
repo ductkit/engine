@@ -8,7 +8,7 @@ use crate::generate::billing::{
     resolve_customer, void,
 };
 use crate::generate::catalog::{active_ids, create_product_now, draw_new_product};
-use crate::generate::{Continuation, Ctx, pick};
+use crate::generate::{Continuation, Ctx, payments, pick};
 use crate::model::customer::{deleted_stub, random_metadata_value};
 use crate::model::embedded::embedded_list;
 use crate::model::invoice::{BillingReason, LineSpec};
@@ -112,13 +112,18 @@ fn check_prices(engine: &Engine, ids: &[String]) -> Result<(), MockError> {
     Ok(())
 }
 
+/// Active recurring prices, in creation order.
+pub(crate) fn active_recurring_prices(engine: &Engine) -> Vec<String> {
+    active_ids(engine, ObjectType::Price)
+        .into_iter()
+        .filter(|id| price_state(engine, id).is_some_and(|p| interval(&p).is_some()))
+        .collect()
+}
+
 /// 1-3 prices (or 11-15 with probability 0.05) sharing one currency and interval,
 /// distinct while the pool lasts.
 fn choose_prices(rng: &mut SimRng, engine: &mut Engine, cause: &Cause) -> Vec<String> {
-    let recurring: Vec<String> = active_ids(engine, ObjectType::Price)
-        .into_iter()
-        .filter(|id| price_state(engine, id).is_some_and(|p| interval(&p).is_some()))
-        .collect();
+    let recurring = active_recurring_prices(engine);
     let recurring = if recurring.is_empty() {
         let np = draw_new_product(rng);
         create_product_now(engine, &np, cause)
@@ -128,6 +133,16 @@ fn choose_prices(rng: &mut SimRng, engine: &mut Engine, cause: &Cause) -> Vec<St
     } else {
         recurring
     };
+    pick_prices(rng, engine, recurring)
+}
+
+/// Draws the prices of a subscription from `recurring` (active recurring prices, not
+/// empty), as [`choose_prices`] describes.
+pub(crate) fn pick_prices(
+    rng: &mut SimRng,
+    engine: &Engine,
+    recurring: Vec<String>,
+) -> Vec<String> {
     let first = price_state(engine, pick(rng, &recurring)).expect("price");
     let mut pool: Vec<String> = recurring
         .into_iter()
@@ -154,6 +169,98 @@ fn choose_prices(rng: &mut SimRng, engine: &mut Engine, cause: &Cause) -> Vec<St
     chosen
 }
 
+/// The drawn parts of a new subscription: its ID, and each item's price, ID and quantity.
+#[derive(Debug, Clone)]
+pub(crate) struct SubscriptionDraw {
+    pub id: String,
+    pub items: Vec<(String, String, u64)>,
+}
+
+/// Draws the subscription and item IDs and the item quantities (1-5) for `prices`.
+pub(crate) fn draw_subscription(rng: &mut SimRng, prices: Vec<String>) -> SubscriptionDraw {
+    let id = rng.id(ObjectType::Subscription.id_prefix());
+    let items = prices
+        .into_iter()
+        .map(|price| {
+            let item = rng.id(ObjectType::SubscriptionItem.id_prefix());
+            let quantity = 1 + rng.below(5);
+            (price, item, quantity)
+        })
+        .collect();
+    SubscriptionDraw { id, items }
+}
+
+/// Creates the items (unannounced) and the `incomplete` subscription
+/// (`customer.subscription.created`) of `draw` for `customer`, starting now.
+pub(crate) fn create_subscription(
+    engine: &mut Engine,
+    ctx: &Ctx,
+    customer: &str,
+    draw: &SubscriptionDraw,
+    cause: &Cause,
+) {
+    let sub_id = &draw.id;
+    let now = engine.now().unix_seconds();
+    let mut item_states = Vec::new();
+    let mut currency = String::new();
+    for (price_id, id, quantity) in &draw.items {
+        let price = price_state(engine, price_id).expect("checked price");
+        currency = price.currency.clone();
+        let end = period_end(now, interval(&price).expect("recurring"));
+        let item = new_item(&NewItem {
+            id,
+            subscription: sub_id,
+            price: &price,
+            quantity: *quantity,
+            created: now,
+            period: (now, end),
+        });
+        engine.create_obj(
+            ObjectType::SubscriptionItem,
+            id.clone(),
+            &item,
+            cause.clone(),
+            &[],
+        );
+        item_states.push(item);
+    }
+    let sub = new_subscription(&NewSubscription {
+        id: sub_id,
+        customer,
+        currency: &currency,
+        items: &item_states,
+        created: now,
+        page_size: ctx.page_size,
+    });
+    engine.create_obj(
+        ObjectType::Subscription,
+        sub_id.clone(),
+        &sub,
+        cause.clone(),
+        &["customer.subscription.created"],
+    );
+}
+
+/// Starts a subscription for `customer` in one instant, as Checkout does: the subscription
+/// of `draw`, its first invoice, finalized and paid (the payment succeeds), and the
+/// subscription `active` with its renewal queued. Returns the first invoice.
+pub(crate) fn start_paid_now(
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    customer: &str,
+    draw: &SubscriptionDraw,
+    cause: &Cause,
+) -> String {
+    create_subscription(engine, ctx, customer, draw, cause);
+    let sub = &draw.id;
+    let invoice = invoice_subscription(engine, ctx, sub, BillingReason::SubscriptionCreate, cause);
+    finalize(engine, &invoice, cause);
+    payments::pay_invoice(engine, ctx, &invoice, true, cause);
+    set_status(engine, sub, Status::Active, cause);
+    schedule_renewal(engine, ctx, sub, cause);
+    invoice
+}
+
 /// `start_subscription`: items and an `incomplete` subscription now, then the first
 /// invoice, its finalization and the payment attempt, `step_delay` apart.
 pub(crate) fn start_subscription(
@@ -172,45 +279,11 @@ pub(crate) fn start_subscription(
         Some(p) => p,
         None => choose_prices(rng, engine, &cause),
     };
-    let sub_id = rng.id(ObjectType::Subscription.id_prefix());
-    let now = engine.now().unix_seconds();
-    let mut item_states = Vec::new();
-    let mut currency = String::new();
-    for price_id in &prices {
-        let price = price_state(engine, price_id).expect("checked price");
-        currency = price.currency.clone();
-        let id = rng.id(ObjectType::SubscriptionItem.id_prefix());
-        let quantity = 1 + rng.below(5);
-        let end = period_end(now, interval(&price).expect("recurring"));
-        let item = new_item(&NewItem {
-            id: &id,
-            subscription: &sub_id,
-            price: &price,
-            quantity,
-            created: now,
-            period: (now, end),
-        });
-        engine.create_obj(ObjectType::SubscriptionItem, id, &item, cause.clone(), &[]);
-        item_states.push(item);
-    }
-    let sub = new_subscription(&NewSubscription {
-        id: &sub_id,
-        customer: &customer,
-        currency: &currency,
-        items: &item_states,
-        created: now,
-        page_size: ctx.page_size,
-    });
-    engine.create_obj(
-        ObjectType::Subscription,
-        sub_id.clone(),
-        &sub,
-        cause.clone(),
-        &["customer.subscription.created"],
-    );
+    let draw = draw_subscription(rng, prices);
+    create_subscription(engine, ctx, &customer, &draw, &cause);
     ctx.then(
         engine,
-        Continuation::SubscriptionInvoice { sub: sub_id },
+        Continuation::SubscriptionInvoice { sub: draw.id },
         cause.clone(),
     );
     Ok(cause)

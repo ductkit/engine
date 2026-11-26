@@ -323,6 +323,10 @@ pub struct ActionsConfig {
     pub refund: f64,
     /// A dispute on a random succeeded, unrefunded, undisputed charge.
     pub dispute: f64,
+    /// A setup intent that saves a new card for a random customer.
+    pub save_payment_method: f64,
+    /// A Checkout session for a random customer, in payment or subscription mode.
+    pub checkout: f64,
     pub renew_subscription_cycle: RenewMode,
     /// Gap between consecutive steps of one action.
     pub step_delay: Distribution,
@@ -341,6 +345,8 @@ impl ActionsConfig {
             ("actions.one_off_payment", self.one_off_payment),
             ("actions.refund", self.refund),
             ("actions.dispute", self.dispute),
+            ("actions.save_payment_method", self.save_payment_method),
+            ("actions.checkout", self.checkout),
         ] {
             check_rate(name, rate)?;
         }
@@ -373,6 +379,14 @@ pub struct ChurnConfig {
     pub subscription: UpdateChurn,
     pub invoice: UpdateChurn,
     pub account: UpdateChurn,
+    pub payment_method: PaymentMethodChurn,
+}
+
+/// Payment method churn: detaching a random attached payment method.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PaymentMethodChurn {
+    pub detach: f64,
 }
 
 /// Churn for catalog objects, which archive instead of deleting.
@@ -503,6 +517,7 @@ impl Config {
             ("churn.subscription.update", ch.subscription.update),
             ("churn.invoice.update", ch.invoice.update),
             ("churn.account.update", ch.account.update),
+            ("churn.payment_method.detach", ch.payment_method.detach),
         ] {
             check_rate(name, rate)?;
         }
@@ -1054,7 +1069,8 @@ mod tests {
         }
     }
 
-    /// The spec's example config uses every action key, `dispute` included, and parses.
+    /// The spec's example config uses every action key, `dispute` and `checkout` included, and
+    /// parses.
     #[test]
     fn spec_example_config_parses() {
         let spec = include_str!("../../../docs/stripe-mock-spec.md");
@@ -1073,6 +1089,14 @@ mod tests {
                 c.actions.dispute
             ),
             (6.0, 0.4, 0.05)
+        );
+        assert_eq!(
+            (
+                c.actions.save_payment_method,
+                c.actions.checkout,
+                c.churn.payment_method.detach
+            ),
+            (1.0, 2.0, 0.1)
         );
     }
 
@@ -1326,6 +1350,55 @@ enabled_events = [\"{events}\"]
         assert_eq!(d.actions.renew_subscription_cycle, RenewMode::Natural);
         let off = Config::from_toml_str("[actions]\nrenew_subscription_cycle = \"off\"").unwrap();
         assert_eq!(off.actions.renew_subscription_cycle, RenewMode::Off);
+    }
+
+    #[test]
+    fn config_accepts_payment_method_and_checkout_rates() {
+        let c = Config::from_toml_str(
+            "[actions]
+save_payment_method = 1.5
+checkout = 2.0
+[churn.payment_method]
+detach = 0.3",
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                c.actions.save_payment_method,
+                c.actions.checkout,
+                c.churn.payment_method.detach
+            ),
+            (1.5, 2.0, 0.3)
+        );
+        let d = Config::default();
+        assert_eq!(
+            (
+                d.actions.save_payment_method,
+                d.actions.checkout,
+                d.churn.payment_method.detach
+            ),
+            (0.0, 0.0, 0.0)
+        );
+        for (toml, key) in [
+            (
+                "[actions]
+save_payment_method = -1.0",
+                "actions.save_payment_method",
+            ),
+            (
+                "[actions]
+checkout = -1.0",
+                "actions.checkout",
+            ),
+            (
+                "[churn.payment_method]
+detach = -1.0",
+                "churn.payment_method.detach",
+            ),
+        ] {
+            let msg = Config::from_toml_str(toml).unwrap_err().to_string();
+            assert!(msg.contains(key), "{msg}");
+        }
     }
 
     #[test]
