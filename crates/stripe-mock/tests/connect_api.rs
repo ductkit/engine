@@ -262,10 +262,8 @@ async fn v2_accounts_view() {
         assert!(v.get(absent).is_none(), "{absent}: {v}");
     }
     let (_, one) = json_of(get(&m, &format!("/v1/accounts/{id}")).await).await;
-    assert_eq!(
-        one["controller"],
-        serde_json::json!({"is_controller": false, "type": "account"})
-    );
+    assert_eq!(one["controller"], serde_json::json!({"type": "account"}));
+    assert!(one.get("external_accounts").is_none(), "{one}");
     let created = v["created"].as_str().unwrap();
     let b = created.as_bytes();
     assert_eq!(created.len(), 24, "{created}");

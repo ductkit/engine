@@ -6,7 +6,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::{Extension, Json};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::SimTime;
 use crate::api::events_v1::type_matches;
@@ -14,6 +14,7 @@ use crate::api::list::decode;
 use crate::api::{ApiError, RequestScope, ensure_connected};
 use crate::engine::events::{EventFormat, EventRecord};
 use crate::handle::Shared;
+use crate::stripe;
 
 /// Filters and cursor, carried inside the opaque page token.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -174,7 +175,7 @@ pub(crate) async fn list(
     State(shared): State<Arc<Shared>>,
     Extension(RequestScope(scope)): Extension<RequestScope>,
     RawQuery(query): RawQuery,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<stripe::V2List<Value>>, ApiError> {
     let q = parse_query(decode(query))?;
     let sim = shared.lock();
     let engine = &sim.engine;
@@ -201,12 +202,12 @@ pub(crate) async fn list(
     let previous = (q.cursor.is_some() && start > 0)
         .then(|| page.first().map(|r| page_url(&q, "before", &r.id)))
         .flatten();
-    let data: Vec<Value> = page.iter().map(|r| r.payload.clone()).collect();
-    Ok(Json(json!({
-        "data": data,
-        "next_page_url": next,
-        "previous_page_url": previous,
-    })))
+    // Each item is a stored `v2.core.event` payload, built from the generated type.
+    Ok(Json(stripe::V2List {
+        data: page.iter().map(|r| r.payload.clone()).collect(),
+        next_page_url: next,
+        previous_page_url: previous,
+    }))
 }
 
 pub(crate) async fn retrieve(

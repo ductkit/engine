@@ -40,6 +40,7 @@ pub const ROOTS: &[&str] = &[
     "webhook_endpoint",
     "v2.core.event_destination",
     "error",
+    "v2.error",
     "payment_intent",
     "charge",
     "refund",

@@ -95,11 +95,14 @@ impl AccountKind {
                 type_: stripe::AccountUnificationAccountControllerType::Application,
             };
         match self {
-            // An account that controls itself shows only its controller type and
-            // `is_controller` to the platform.
+            // An account that controls itself shows only its controller type. Per the
+            // schema, `is_controller` is "`true` if the Connect application retrieving the
+            // resource controls the account ... Otherwise, this field is null", and it is
+            // not nullable, so it is absent; `requirement_collection` is "only returned when
+            // the Connect application retrieving the resource controls the account".
             AccountKind::Standard => stripe::AccountUnificationAccountController {
                 fees: None,
-                is_controller: Some(false),
+                is_controller: None,
                 losses: None,
                 requirement_collection: None,
                 stripe_dashboard: None,
@@ -336,7 +339,8 @@ fn settings() -> stripe::AccountSettings {
 
 /// The account's truth state: the v1 object. Presence follows ruling R1: every field is
 /// present (`null` when unset) except `company` and `individual`, which Stripe returns only
-/// for a matching `business_type` (always `null` here).
+/// for a matching `business_type` (always `null` here), and `external_accounts` on a
+/// Standard account, which the platform does not control.
 pub(crate) fn v1_account(
     id: &str,
     kind: AccountKind,
@@ -355,7 +359,9 @@ pub(crate) fn v1_account(
         default_currency: Some("usd".to_string()),
         details_submitted: Some(true),
         email: Some(Some(c.email.clone())),
-        external_accounts: Some(stripe::List {
+        // "External accounts are only returned for requests where `controller[is_controller]`
+        // is true": the platform controls every kind but Standard.
+        external_accounts: (kind != AccountKind::Standard).then(|| stripe::List {
             object: stripe::ListObject::List,
             data: Vec::new(),
             has_more: false,
@@ -499,10 +505,9 @@ mod tests {
         for absent in ["company", "individual"] {
             assert!(s.get(absent).is_none(), "{absent}");
         }
-        assert_eq!(
-            v1(AccountKind::Standard)["controller"],
-            json!({"is_controller": false, "type": "account"})
-        );
+        let standard = v1(AccountKind::Standard);
+        assert_eq!(standard["controller"], json!({"type": "account"}));
+        assert!(standard.get("external_accounts").is_none());
         assert_eq!(v1(AccountKind::Custom)["controller"]["is_controller"], true);
         let v = v1(AccountKind::V2);
         assert_eq!(

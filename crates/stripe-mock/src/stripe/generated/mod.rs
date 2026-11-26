@@ -32,6 +32,7 @@ mod v2_core_event;
 mod webhook_endpoint;
 mod v2_core_event_destination;
 mod error;
+mod v2_error;
 mod payment_intent;
 mod charge;
 mod refund;
@@ -62,6 +63,7 @@ pub use v2_core_event::*;
 pub use webhook_endpoint::*;
 pub use v2_core_event_destination::*;
 pub use error::*;
+pub use v2_error::*;
 pub use payment_intent::*;
 pub use charge::*;
 pub use refund::*;
@@ -4069,6 +4071,7 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
                     "webhook_endpoint",
                 ]
             }
+            "v2.error" => &["error"],
             "webhook_endpoint" => {
                 &[
                     "api_version",

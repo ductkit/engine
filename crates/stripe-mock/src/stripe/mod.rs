@@ -16,7 +16,7 @@ mod generated;
 pub use conformance::{ConformanceError, check_payload};
 pub use expandable::{Expandable, HasId};
 pub use generated::*;
-pub use list::{List, ListObject};
+pub use list::{List, ListObject, V2List};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;

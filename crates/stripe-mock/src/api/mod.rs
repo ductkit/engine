@@ -11,6 +11,11 @@ mod resources;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::PINNED_API_VERSION;
+use crate::engine::{Engine, Scope};
+use crate::faults::api::Fault;
+use crate::handle::Shared;
+use crate::stripe;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
@@ -18,13 +23,6 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use serde::Serialize;
-
-use crate::PINNED_API_VERSION;
-use crate::engine::{Engine, Scope};
-use crate::faults::api::Fault;
-use crate::handle::Shared;
-use crate::stripe;
 
 /// How long a `timeout` fault holds the response: Stripe's own request limit.
 const TIMEOUT_HOLD: Duration = Duration::from_secs(80);
@@ -33,15 +31,14 @@ const TIMEOUT_HOLD: Duration = Duration::from_secs(80);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ErrorType {
     V1(stripe::ApiErrorsType),
-    /// `/v2/` retrieve of an unknown ID: `{"error": {"type": "not_found", "code":
-    /// "not_found", "message"}}`, the pinned `v2.error` shape. No generated type covers v2
-    /// errors (the allowlist has only `error`), so this one envelope is hand-built.
+    /// `/v2/` retrieve of an unknown ID: `type` and `code` `not_found`.
     V2NotFound,
 }
 
 const INVALID_REQUEST: ErrorType = ErrorType::V1(stripe::ApiErrorsType::InvalidRequestError);
 
-/// A Stripe-style error response.
+/// A Stripe-style error response. On a `/v2/` path the gate renders it in the v2 envelope
+/// (`stripe::V2Error`), everywhere else in the v1 one (`stripe::Error`).
 #[derive(Debug, Clone)]
 pub(crate) struct ApiError {
     pub status: StatusCode,
@@ -112,45 +109,38 @@ impl ApiError {
     }
 }
 
-/// The v2 not-found envelope (see [`ErrorType::V2NotFound`]).
-#[derive(Serialize)]
-struct V2Error {
-    error: V2ErrorDetail,
+/// A fallback v2 `code` for an error without one: the v2 schema requires a `code`.
+fn v2_code(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "bad_request",
+        StatusCode::UNAUTHORIZED => "unauthorized",
+        StatusCode::FORBIDDEN => "forbidden",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit",
+        StatusCode::SERVICE_UNAVAILABLE => "service_unavailable",
+        _ => "internal_server_error",
+    }
 }
 
-#[derive(Serialize)]
-struct V2ErrorDetail {
-    #[serde(rename = "type")]
-    type_: &'static str,
-    code: &'static str,
-    message: String,
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let ErrorType::V1(type_) = self.error_type else {
-            let body = V2Error {
-                error: V2ErrorDetail {
-                    type_: "not_found",
-                    code: self.code.unwrap_or("not_found"),
-                    message: self.message,
-                },
-            };
-            return (self.status, axum::Json(body)).into_response();
+impl ApiError {
+    /// The v1 body, `stripe::Error`. Presence: only what the mock knows. The card, payment
+    /// and request-log fields describe a failed payment or a dashboard log the mock never has.
+    fn v1_body(&self) -> stripe::Error {
+        let type_ = match self.error_type {
+            ErrorType::V1(t) => t,
+            ErrorType::V2NotFound => stripe::ApiErrorsType::InvalidRequestError,
         };
-        // Presence: only what the mock knows. The card, payment and request-log fields
-        // describe a failed payment or a dashboard log the mock never has.
-        let body = stripe::Error {
+        stripe::Error {
             error: stripe::ApiErrors {
                 advice_code: None,
                 charge: None,
                 code: self.code.map(str::to_string),
                 decline_code: None,
                 doc_url: None,
-                message: Some(self.message),
+                message: Some(self.message.clone()),
                 network_advice_code: None,
                 network_decline_code: None,
-                param: self.param,
+                param: self.param.clone(),
                 payment_intent: None,
                 payment_method: None,
                 payment_method_type: None,
@@ -159,8 +149,50 @@ impl IntoResponse for ApiError {
                 source: None,
                 type_,
             },
+        }
+    }
+
+    /// The v2 body, `stripe::V2Error`: `code` (a fallback by status when the error has
+    /// none), `message` and `type`. The schema has no `param`, so it is dropped; `doc_url`
+    /// and `user_message` are absent because the mock has neither.
+    fn v2_body(&self) -> stripe::V2Error {
+        let type_ = match self.error_type {
+            ErrorType::V1(t) => serde_json::to_value(t)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .expect("an error type serializes as a string"),
+            ErrorType::V2NotFound => "not_found".to_string(),
         };
-        (self.status, axum::Json(body)).into_response()
+        stripe::V2Error {
+            error: stripe::V2ErrorError {
+                code: self
+                    .code
+                    .unwrap_or_else(|| v2_code(self.status))
+                    .to_string(),
+                doc_url: None,
+                message: self.message.clone(),
+                type_: Some(type_),
+                user_message: None,
+            },
+        }
+    }
+
+    /// The response in the v1 (`v2 = false`) or v2 envelope.
+    fn render(&self, v2: bool) -> Response {
+        let mut r = if v2 {
+            (self.status, axum::Json(self.v2_body())).into_response()
+        } else {
+            (self.status, axum::Json(self.v1_body())).into_response()
+        };
+        // Kept so the gate can re-render the error in the v2 envelope on `/v2/` paths.
+        r.extensions_mut().insert(self.clone());
+        r
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        self.render(self.error_type == ErrorType::V2NotFound)
     }
 }
 
@@ -208,6 +240,7 @@ async fn fallback(req: Request) -> ApiError {
 /// Checks that apply to every request, in spec order, then the injected faults
 /// (rate limit, error, latency) for requests that pass, and sets `Request-Id`.
 async fn gate(State(shared): State<Arc<Shared>>, mut req: Request, next: Next) -> Response {
+    let v2 = is_under(req.uri().path(), "/v2");
     let (request_id, decision) = {
         let mut sim = shared.lock();
         let request_id = sim.api_rng.id("req");
@@ -236,6 +269,17 @@ async fn gate(State(shared): State<Arc<Shared>>, mut req: Request, next: Next) -
             next.run(req).await
         }
     };
+    // Every error on a `/v2/` path, from the gate, a fault or a handler, uses the v2 envelope.
+    if v2 && let Some(e) = response.extensions_mut().remove::<ApiError>() {
+        let headers = response.headers().clone();
+        response = e.render(true);
+        response.extensions_mut().remove::<ApiError>();
+        for (name, value) in &headers {
+            if name != header::CONTENT_LENGTH && name != header::CONTENT_TYPE {
+                response.headers_mut().insert(name.clone(), value.clone());
+            }
+        }
+    }
     response.headers_mut().insert(
         "request-id",
         HeaderValue::from_str(&request_id).expect("ascii id"),

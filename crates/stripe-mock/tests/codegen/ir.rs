@@ -845,6 +845,6 @@ mod tests {
             .values()
             .filter(|t| matches!(t, TypeDef::Struct(s) if !s.schema.contains('/')))
             .count();
-        assert_eq!(named_schemas, 754);
+        assert_eq!(named_schemas, 755);
     }
 }

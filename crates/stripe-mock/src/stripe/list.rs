@@ -20,3 +20,14 @@ pub enum ListObject {
     #[serde(rename = "list")]
     List,
 }
+
+/// A page of a v2 list: `{data, next_page_url, previous_page_url}`. The pinned spec types
+/// this envelope inline in each v2 list response, so it is hand-written; both page URLs are
+/// required and nullable there, so both are always serialized.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct V2List<T> {
+    pub data: Vec<T>,
+    pub next_page_url: Option<String>,
+    pub previous_page_url: Option<String>,
+}

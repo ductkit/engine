@@ -8,7 +8,6 @@ use std::sync::Arc;
 use axum::extract::{Path, RawQuery, State};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 use crate::api::events_v2::{decode_token, encode_token};
 use crate::api::list::decode;
@@ -146,7 +145,7 @@ pub(crate) async fn list_v2(
     State(shared): State<Arc<Shared>>,
     Extension(RequestScope(scope)): Extension<RequestScope>,
     RawQuery(query): RawQuery,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<stripe::V2List<stripe::V2CoreAccount>>, ApiError> {
     let q = parse_query(decode(query))?;
     let mut sim = shared.lock();
     // A write during pagination runs before the view is taken, so this page sees it.
@@ -223,11 +222,11 @@ pub(crate) async fn list_v2(
         .iter()
         .map(|(u, meta, closed)| account::v2_view(&account::from_state(&u.state), meta, *closed))
         .collect();
-    Ok(Json(json!({
-        "data": data,
-        "next_page_url": next,
-        "previous_page_url": previous,
-    })))
+    Ok(Json(stripe::V2List {
+        data,
+        next_page_url: next,
+        previous_page_url: previous,
+    }))
 }
 
 /// `GET /v2/core/accounts/{id}`. A closed account is still served, with `closed: true`.

@@ -2,8 +2,8 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Receiver, get, get_as, get_with, mock_with};
-use ductkit_stripe_mock::stripe::check_payload;
+use common::{Receiver, get, get_as, get_ctx, get_with, mock_with};
+use ductkit_stripe_mock::stripe::{self, check_payload};
 use ductkit_stripe_mock::{AccountApi, MockStripe};
 use serde_json::{Value, json};
 
@@ -92,6 +92,29 @@ fn event_previous_attributes_keys_must_be_fields() {
 }
 
 #[test]
+fn v2_list_envelope_rejects_unknown_and_missing_keys() {
+    let ok = json!({ "data": [customer()], "next_page_url": null, "previous_page_url": null });
+    check_payload(&ok).unwrap();
+    let mut extra = ok.clone();
+    extra["has_more"] = json!(false);
+    let err = check_payload(&extra).unwrap_err();
+    assert!(err.path.contains("has_more"), "{err}");
+    let mut missing = ok.clone();
+    missing.as_object_mut().unwrap().remove("previous_page_url");
+    let err = check_payload(&missing).unwrap_err();
+    assert!(err.path.contains("previous_page_url"), "{err}");
+}
+
+#[test]
+fn v2_error_envelope_conforms() {
+    let ok = json!({ "error": { "type": "not_found", "code": "not_found", "message": "no" } });
+    check_payload(&ok).unwrap();
+    let err =
+        check_payload(&json!({ "error": { "type": "not_found", "message": "no" } })).unwrap_err();
+    assert_eq!(err.object, "v2.error");
+}
+
+#[test]
 fn deleted_customer_conforms() {
     check_payload(&json!({ "id": "cus_1", "object": "customer", "deleted": true })).unwrap();
 }
@@ -114,22 +137,14 @@ async fn error_body(r: reqwest::Response, status: u16) -> Value {
     assert_eq!(r.status().as_u16(), status);
     let v: Value = r.json().await.expect("JSON error body");
     if let Err(e) = check_payload(&v) {
-        panic!(
-            "{status} body does not conform: {e}
-{v:#}"
-        );
+        panic!("{status} body does not conform: {e}\n{v:#}");
     }
     v
 }
 
 #[tokio::test]
 async fn error_bodies_conform() {
-    let m = mock_with(
-        "[accounts]
-connect = true
-",
-    )
-    .await;
+    let m = mock_with("[accounts]\nconnect = true\n").await;
     let bad_version = get_with(&m, "/v1/customers", &[("Stripe-Version", "2020-08-27")]).await;
     error_body(bad_version, 400).await;
     let unauthorized = reqwest::Client::new()
@@ -145,15 +160,47 @@ connect = true
     error_body(get(&m, "/v1/customers/cus_nope").await, 404).await;
     m.force_rate_limit(Duration::from_secs(30));
     error_body(get(&m, "/v1/customers").await, 429).await;
+    let v = error_body(get(&m, "/v2/core/events").await, 429).await;
+    v2_error(&v);
 
     for (errors, status) in [("\"500\"", 500), ("\"503\"", 503)] {
-        let m = mock_with(&format!(
-            "[api]
-errors = {{ {errors} = 1.0 }}"
-        ))
-        .await;
+        let m = mock_with(&format!("[api]\nerrors = {{ {errors} = 1.0 }}")).await;
         error_body(get(&m, "/v1/customers").await, status).await;
+        // On a v2 path the same fault uses the v2 envelope.
+        let v = error_body(get(&m, "/v2/core/events").await, status).await;
+        v2_error(&v);
     }
+}
+
+/// `v` is a v2 error body: a `stripe::V2Error`, with no v1-only `param`.
+fn v2_error(v: &Value) -> stripe::V2Error {
+    assert!(v["error"].get("param").is_none(), "{v}");
+    serde_json::from_value(v.clone()).unwrap_or_else(|e| panic!("not a v2 error ({e}): {v}"))
+}
+
+#[tokio::test]
+async fn v2_error_bodies_conform() {
+    let m = mock_with("[accounts]\nconnect = true\n").await;
+    let v = error_body(get(&m, "/v2/core/accounts/acct_nope").await, 404).await;
+    let e = v2_error(&v).error;
+    assert_eq!(
+        (e.code.as_str(), e.type_.as_deref()),
+        ("not_found", Some("not_found"))
+    );
+    let v = error_body(get(&m, "/v2/core/events/evt_test_nope").await, 404).await;
+    v2_error(&v);
+    let v = error_body(get(&m, "/v2/core/events?limit=0").await, 400).await;
+    assert_eq!(v2_error(&v).error.code, "parameter_invalid_integer");
+    let v = error_body(get(&m, "/v2/core/accounts?bogus=1").await, 400).await;
+    assert_eq!(v2_error(&v).error.code, "parameter_unknown");
+    // Errors from the request gate on a v2 path use the v2 envelope too.
+    let v = error_body(get_as(&m, "/v2/core/events", "acct_x").await, 400).await;
+    assert_eq!(v2_error(&v).error.code, "bad_request");
+    let v = error_body(get_ctx(&m, "/v2/core/events", "acct_nope").await, 403).await;
+    assert_eq!(v2_error(&v).error.code, "account_invalid");
+    // v1 paths keep the v1 envelope, `param` included.
+    let v = error_body(get(&m, "/v1/customers?limit=0").await, 400).await;
+    assert_eq!(v["error"]["param"], "limit");
 }
 
 fn bodies(rx: &Receiver) -> Vec<Value> {
@@ -214,29 +261,13 @@ async fn accounts_events_destinations_and_deliveries_conform() {
     let snap = Receiver::start(|_| (200, Duration::ZERO));
     let thin = Receiver::start(|_| (200, Duration::ZERO));
     let m = mock_with(&format!(
-        "seed = 7
-[actions]
-new_customer = 30
-[churn.customer]
-update = 30
-         [churn.account]
-update = 30
-         [accounts]
-connect = true
-connected_accounts = {{ initial = 6 }}
-         [[destinations]]
-name = \"snap\"
-url = \"{}\"
-payload = \"snapshot\"
-         enabled_events = [\"*\"]
-connect = true
-         [[destinations]]
-name = \"thin\"
-url = \"{}\"
-payload = \"thin\"
-         enabled_events = [\"*\"]
-events_from = [\"@self\", \"@accounts\"]
-",
+        "seed = 7\n[actions]\nnew_customer = 30\n[churn.customer]\nupdate = 30\n\
+         [churn.account]\nupdate = 30\n\
+         [accounts]\nconnect = true\nconnected_accounts = {{ initial = 6 }}\n\
+         [[destinations]]\nname = \"snap\"\nurl = \"{}\"\npayload = \"snapshot\"\n\
+         enabled_events = [\"*\"]\nconnect = true\n\
+         [[destinations]]\nname = \"thin\"\nurl = \"{}\"\npayload = \"thin\"\n\
+         enabled_events = [\"*\"]\nevents_from = [\"@self\", \"@accounts\"]\n",
         snap.url("/s"),
         thin.url("/t"),
     ))
@@ -256,10 +287,7 @@ events_from = [\"@self\", \"@accounts\"]
         assert!(!bodies.is_empty(), "no {format} deliveries");
         for b in bodies {
             if let Err(e) = check_payload(b) {
-                panic!(
-                    "delivered {format} body does not conform: {e}
-{b:#}"
-                );
+                panic!("delivered {format} body does not conform: {e}\n{b:#}");
             }
         }
     }

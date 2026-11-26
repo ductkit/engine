@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde_json::Value;
 
-use super::{Error, SCHEMA_OBJECTS, check, check_by_object, schema_fields};
+use super::{Error, SCHEMA_OBJECTS, V2Error, V2List, check, check_by_object, schema_fields};
 
 /// Why a payload does not match the schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +116,33 @@ fn check_event(v: &Value, base: &str) -> Result<(), ConformanceError> {
     Ok(())
 }
 
+/// The v1 schema's error `type` values; any other `type` (or none) marks a v2 error.
+const V1_ERROR_TYPES: [&str; 4] = [
+    "api_error",
+    "card_error",
+    "idempotency_error",
+    "invalid_request_error",
+];
+
+/// An error envelope passes as the v1 `error` or the v2 `v2.error`. When both fail, the
+/// error reported is the v1 one if `error.type` is a v1 type, else the v2 one.
+fn check_error(v: &Value, base: &str) -> Result<(), ConformanceError> {
+    let v1 = check::<Error>(v);
+    if v1.is_ok() || check::<V2Error>(v).is_ok() {
+        return Ok(());
+    }
+    let is_v1 = v
+        .pointer("/error/type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| V1_ERROR_TYPES.contains(&t));
+    let (schema, text) = if is_v1 {
+        ("error", v1.unwrap_err())
+    } else {
+        ("v2.error", check::<V2Error>(v).unwrap_err())
+    };
+    Err(parse(schema, base, &format!("{schema}: {text}")))
+}
+
 fn check_at(v: &Value, base: &str) -> Result<(), ConformanceError> {
     let Some(map) = v.as_object() else {
         return Err(fail("", base, "payload is not a JSON object"));
@@ -127,10 +154,11 @@ fn check_at(v: &Value, base: &str) -> Result<(), ConformanceError> {
         None => {}
     }
     if map.contains_key("next_page_url") && map.get("data").is_some_and(Value::is_array) {
+        check::<V2List<Value>>(v).map_err(|text| parse("list", base, &format!("list: {text}")))?;
         return check_items(v, base);
     }
     if map.get("error").is_some_and(Value::is_object) {
-        return check::<Error>(v).map_err(|text| parse("error", base, &format!("error: {text}")));
+        return check_error(v, base);
     }
     Err(fail(
         "",
@@ -141,7 +169,8 @@ fn check_at(v: &Value, base: &str) -> Result<(), ConformanceError> {
 
 /// Checks `v` against the pinned schema. Lists and v2 lists check every `data` item. An
 /// event checks its envelope, its `data.object`, and that every `previous_attributes` key is
-/// a field of that object. `{"error": {...}}` checks as the error envelope. Everything else
+/// a field of that object. A v2 list envelope must have exactly `data`, `next_page_url` and
+/// `previous_page_url`. `{"error": {...}}` checks as the v1 or the v2 error envelope. Everything else
 /// is checked by its `object` (a `deleted: true` payload against the `deleted_*` schema); an
 /// unknown `object` is an error.
 pub fn check_payload(v: &Value) -> Result<(), ConformanceError> {

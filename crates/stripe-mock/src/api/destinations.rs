@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use axum::extract::{RawQuery, State};
 use axum::{Extension, Json};
-use serde_json::{Value, json};
 
 use crate::api::list::decode;
 use crate::api::list::{Cursorable, paginate, parse_list_params};
@@ -109,7 +108,7 @@ pub(crate) async fn list_v1(
 pub(crate) async fn list_v2(
     State(shared): State<Arc<Shared>>,
     Extension(RequestScope(scope)): Extension<RequestScope>,
-) -> Json<Value> {
+) -> Json<stripe::V2List<stripe::V2CoreEventDestination>> {
     let sim = shared.lock();
     let data: Vec<stripe::V2CoreEventDestination> = sim
         .engine
@@ -118,9 +117,9 @@ pub(crate) async fn list_v2(
         .filter(|d| scope.is_none() && d.info.payload == PayloadFormat::Thin)
         .map(v2_object)
         .collect();
-    Json(json!({
-        "data": data,
-        "next_page_url": null,
-        "previous_page_url": null,
-    }))
+    Json(stripe::V2List {
+        data,
+        next_page_url: None,
+        previous_page_url: None,
+    })
 }
