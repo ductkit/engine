@@ -12,14 +12,50 @@ const MAX_DEPTH: usize = 4;
 /// Paths a retrieve of `t` may expand; lists take the same paths after `data.`.
 fn allowed(t: ObjectType) -> &'static [&'static str] {
     match t {
-        ObjectType::Subscription => &["customer", "latest_invoice", "items.data.price.product"],
-        ObjectType::Invoice => &["customer", "parent.subscription_details.subscription"],
+        ObjectType::Subscription => &[
+            "customer",
+            "default_payment_method",
+            "latest_invoice",
+            "items.data.price.product",
+        ],
+        ObjectType::Invoice => &[
+            "customer",
+            "default_payment_method",
+            "parent.subscription_details.subscription",
+        ],
+        ObjectType::Customer => &["invoice_settings.default_payment_method"],
         ObjectType::Price => &["product"],
         ObjectType::SubscriptionItem => &["price.product"],
-        ObjectType::Customer
-        | ObjectType::Product
-        | ObjectType::InvoiceLineItem
-        | ObjectType::Account => &[],
+        // Each new type's `expandable_fields` whose target is modelled (not `application`
+        // or `on_behalf_of`: accounts are platform-scope, and `application` is not a type).
+        ObjectType::PaymentIntent => &["customer", "latest_charge", "payment_method"],
+        ObjectType::Charge => &[
+            "balance_transaction",
+            "customer",
+            "failure_balance_transaction",
+            "payment_intent",
+        ],
+        ObjectType::Refund => &[
+            "balance_transaction",
+            "charge",
+            "customer",
+            "failure_balance_transaction",
+            "payment_intent",
+            "payment_method",
+        ],
+        ObjectType::Dispute => &["charge", "payment_intent"],
+        ObjectType::BalanceTransaction => &["source"],
+        ObjectType::PaymentMethod => &["customer"],
+        ObjectType::SetupIntent => &["customer", "payment_method"],
+        ObjectType::CheckoutSession => &[
+            "customer",
+            "invoice",
+            "payment_intent",
+            "setup_intent",
+            "subscription",
+        ],
+        ObjectType::InvoicePayment => &["invoice"],
+        ObjectType::Product | ObjectType::InvoiceLineItem | ObjectType::Account => &[],
     }
 }
 
@@ -49,13 +85,22 @@ fn validate(t: ObjectType, paths: &[String], list: bool) -> Result<(), ApiError>
     Ok(())
 }
 
+/// The type an ID names. The longest matching `prefix_` wins, so `cs_test_...` is a checkout
+/// session even though prefixes could contain underscores.
+fn type_of_id(id: &str) -> Option<ObjectType> {
+    ObjectType::ALL
+        .into_iter()
+        .filter(|t| {
+            id.strip_prefix(t.id_prefix())
+                .is_some_and(|rest| rest.starts_with('_'))
+        })
+        .max_by_key(|t| t.id_prefix().len())
+}
+
 /// The object an ID names, as expansion shows it: a deleted customer is its
 /// stub, other deleted objects are `null`, unknown IDs stay strings.
 fn lookup(view: &View, id: &str) -> Option<Value> {
-    let prefix = id.split_once('_')?.0;
-    let t = ObjectType::ALL
-        .into_iter()
-        .find(|t| t.id_prefix() == prefix)?;
+    let t = type_of_id(id)?;
     let u = view.state(view.store().get(t, id)?)?;
     if u.kind == ChangeKind::Deleted && t != ObjectType::Customer {
         return Some(Value::Null);
@@ -99,4 +144,23 @@ pub(crate) fn expand(
         apply(view, obj, &segs);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_resolve_by_longest_prefix() {
+        assert_eq!(
+            type_of_id("cs_test_a1B2"),
+            Some(ObjectType::CheckoutSession)
+        );
+        assert_eq!(type_of_id("cus_1"), Some(ObjectType::Customer));
+        assert_eq!(type_of_id("in_1"), Some(ObjectType::Invoice));
+        assert_eq!(type_of_id("inpay_1"), Some(ObjectType::InvoicePayment));
+        assert_eq!(type_of_id("pi_1"), Some(ObjectType::PaymentIntent));
+        assert_eq!(type_of_id("cs_live_1"), None);
+        assert_eq!(type_of_id("nope"), None);
+    }
 }

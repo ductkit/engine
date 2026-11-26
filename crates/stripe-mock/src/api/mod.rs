@@ -211,11 +211,24 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         &resources::SUBSCRIPTION_ITEMS,
         &resources::INVOICES,
         &resources::ACCOUNTS,
+        &resources::PAYMENT_INTENTS,
+        &resources::CHARGES,
+        &resources::REFUNDS,
+        &resources::DISPUTES,
+        &resources::BALANCE_TRANSACTIONS,
+        &resources::PAYMENT_METHODS,
+        &resources::SETUP_INTENTS,
+        &resources::CHECKOUT_SESSIONS,
+        &resources::INVOICE_PAYMENTS,
     ] {
         router = resources::routes(router, r);
     }
     router
         .route("/v1/invoices/{id}/lines", get(resources::invoice_lines))
+        .route(
+            "/v1/customers/{id}/payment_methods",
+            get(resources::customer_payment_methods),
+        )
         .route("/v2/core/accounts", get(accounts::list_v2))
         .route("/v2/core/accounts/{id}", get(accounts::retrieve_v2))
         .route("/v1/events", get(events_v1::list))

@@ -538,7 +538,18 @@ impl Generator {
                 ActionKind::CancelSubscription,
             ],
             ObjectType::Invoice => &[ActionKind::OneOffInvoice, ActionKind::InvoiceUpdate],
-            ObjectType::SubscriptionItem | ObjectType::InvoiceLineItem | ObjectType::Account => {
+            ObjectType::SubscriptionItem
+            | ObjectType::InvoiceLineItem
+            | ObjectType::Account
+            | ObjectType::PaymentIntent
+            | ObjectType::Charge
+            | ObjectType::Refund
+            | ObjectType::Dispute
+            | ObjectType::BalanceTransaction
+            | ObjectType::PaymentMethod
+            | ObjectType::SetupIntent
+            | ObjectType::CheckoutSession
+            | ObjectType::InvoicePayment => {
                 return;
             }
         };

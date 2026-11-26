@@ -90,6 +90,70 @@ pub(crate) static ACCOUNTS: Resource = Resource {
     required: None,
 };
 
+pub(crate) static PAYMENT_INTENTS: Resource = Resource {
+    t: ObjectType::PaymentIntent,
+    path: "/v1/payment_intents",
+    filters: &["customer"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static CHARGES: Resource = Resource {
+    t: ObjectType::Charge,
+    path: "/v1/charges",
+    filters: &["customer", "payment_intent"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static REFUNDS: Resource = Resource {
+    t: ObjectType::Refund,
+    path: "/v1/refunds",
+    filters: &["charge", "payment_intent"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static DISPUTES: Resource = Resource {
+    t: ObjectType::Dispute,
+    path: "/v1/disputes",
+    filters: &["charge", "payment_intent"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static BALANCE_TRANSACTIONS: Resource = Resource {
+    t: ObjectType::BalanceTransaction,
+    path: "/v1/balance_transactions",
+    filters: &["type", "source", "payout"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static PAYMENT_METHODS: Resource = Resource {
+    t: ObjectType::PaymentMethod,
+    path: "/v1/payment_methods",
+    filters: &["customer", "type"],
+    order: Order::CreatedDesc,
+    required: Some("customer"),
+};
+pub(crate) static SETUP_INTENTS: Resource = Resource {
+    t: ObjectType::SetupIntent,
+    path: "/v1/setup_intents",
+    filters: &["customer", "payment_method"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static CHECKOUT_SESSIONS: Resource = Resource {
+    t: ObjectType::CheckoutSession,
+    path: "/v1/checkout/sessions",
+    filters: &["customer", "payment_intent", "subscription", "status"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static INVOICE_PAYMENTS: Resource = Resource {
+    t: ObjectType::InvoicePayment,
+    path: "/v1/invoice_payments",
+    filters: &["invoice", "payment"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+
 fn bool_param(p: &ListParams, name: &str) -> Result<Option<bool>, ApiError> {
     match p.extra.get(name).map(String::as_str) {
         None => Ok(None),
@@ -199,6 +263,34 @@ fn matches(
                 })
         }
         ObjectType::InvoiceLineItem | ObjectType::Account => true,
+        ObjectType::PaymentIntent => eq("customer", "customer"),
+        ObjectType::SetupIntent => {
+            eq("customer", "customer") && eq("payment_method", "payment_method")
+        }
+        ObjectType::Charge => eq("customer", "customer") && eq("payment_intent", "payment_intent"),
+        ObjectType::Refund | ObjectType::Dispute => {
+            eq("charge", "charge") && eq("payment_intent", "payment_intent")
+        }
+        // Payouts are not modelled, so a `payout` filter matches nothing.
+        ObjectType::BalanceTransaction => {
+            eq("type", "type") && eq("source", "source") && !f.contains_key("payout")
+        }
+        ObjectType::PaymentMethod => eq("type", "type"),
+        ObjectType::CheckoutSession => {
+            eq("customer", "customer")
+                && eq("payment_intent", "payment_intent")
+                && eq("subscription", "subscription")
+                && eq("status", "status")
+        }
+        // `payment` names the paid object: a payment intent, charge or payment record.
+        ObjectType::InvoicePayment => {
+            eq("invoice", "invoice")
+                && f.get("payment").is_none_or(|want| {
+                    ["payment_intent", "charge", "payment_record"]
+                        .iter()
+                        .any(|k| s["payment"][k].as_str() == Some(want))
+                })
+        }
     }
 }
 
@@ -275,7 +367,13 @@ async fn list(
     };
     // A required filter is always a parent field, so its children index serves it.
     let all = match r.required {
-        Some(name) => view.store().children(r.t, name, &p.extra[name]),
+        Some(name) => {
+            let mut children = view.store().children(r.t, name, &p.extra[name]);
+            if r.order == Order::CreatedDesc {
+                children.reverse();
+            }
+            children
+        }
         None => ordered(&view, r),
     };
     let (page, has_more) = paginate(
@@ -395,5 +493,47 @@ pub(crate) async fn invoice_lines(
         &mut out,
         expand_paths(&p),
     )?;
+    Ok(Json(out))
+}
+
+/// `GET /v1/customers/{id}/payment_methods`.
+pub(crate) async fn customer_payment_methods(
+    State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
+    Path(id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    let r = &PAYMENT_METHODS;
+    let p = parse_list_params(decode(query), &["type"], &["expand"])?;
+    let mut sim = shared.lock();
+    ensure_connected(&sim.engine, &scope)?;
+    let at = stale_at(&mut sim);
+    let view = View {
+        engine: &sim.engine,
+        at,
+        scope,
+    };
+    if view.visible(ObjectType::Customer, &id).is_none() {
+        return Err(no_such(ObjectType::Customer, &id));
+    }
+    let mut all = view.store().children(r.t, "customer", &id);
+    all.reverse();
+    let (page, has_more) = paginate(
+        &all,
+        |o| {
+            p.created.matches(o.created)
+                && view
+                    .listed(o)
+                    .is_some_and(|u| matches(&view, r, o, &u.state, &p.extra, None))
+        },
+        &p,
+    )?;
+    let mut out = json!({
+        "object": "list",
+        "url": format!("/v1/customers/{id}/payment_methods"),
+        "has_more": has_more,
+        "data": states(&view, &page),
+    });
+    expand(&view, r.t, &mut out, expand_paths(&p))?;
     Ok(Json(out))
 }

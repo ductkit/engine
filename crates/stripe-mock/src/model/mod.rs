@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod customer;
 pub mod embedded;
 pub mod invoice;
+pub mod payments;
 pub mod subscription;
 
 /// A simulated Stripe object type.
@@ -22,11 +23,20 @@ pub enum ObjectType {
     InvoiceLineItem,
     /// A connected account. Lives in the platform scope.
     Account,
+    PaymentIntent,
+    Charge,
+    Refund,
+    Dispute,
+    BalanceTransaction,
+    PaymentMethod,
+    SetupIntent,
+    CheckoutSession,
+    InvoicePayment,
 }
 
 impl ObjectType {
     /// Every type, in declaration order.
-    pub const ALL: [ObjectType; 8] = [
+    pub const ALL: [ObjectType; 17] = [
         ObjectType::Customer,
         ObjectType::Product,
         ObjectType::Price,
@@ -35,6 +45,15 @@ impl ObjectType {
         ObjectType::Invoice,
         ObjectType::InvoiceLineItem,
         ObjectType::Account,
+        ObjectType::PaymentIntent,
+        ObjectType::Charge,
+        ObjectType::Refund,
+        ObjectType::Dispute,
+        ObjectType::BalanceTransaction,
+        ObjectType::PaymentMethod,
+        ObjectType::SetupIntent,
+        ObjectType::CheckoutSession,
+        ObjectType::InvoicePayment,
     ];
 
     /// The Stripe `object` name.
@@ -48,6 +67,15 @@ impl ObjectType {
             ObjectType::Invoice => "invoice",
             ObjectType::InvoiceLineItem => "line_item",
             ObjectType::Account => "account",
+            ObjectType::PaymentIntent => "payment_intent",
+            ObjectType::Charge => "charge",
+            ObjectType::Refund => "refund",
+            ObjectType::Dispute => "dispute",
+            ObjectType::BalanceTransaction => "balance_transaction",
+            ObjectType::PaymentMethod => "payment_method",
+            ObjectType::SetupIntent => "setup_intent",
+            ObjectType::CheckoutSession => "checkout.session",
+            ObjectType::InvoicePayment => "invoice_payment",
         }
     }
 
@@ -71,6 +99,16 @@ impl ObjectType {
             ObjectType::Invoice => "in",
             ObjectType::InvoiceLineItem => "il",
             ObjectType::Account => "acct",
+            ObjectType::PaymentIntent => "pi",
+            ObjectType::Charge => "ch",
+            ObjectType::Refund => "re",
+            ObjectType::Dispute => "dp",
+            ObjectType::BalanceTransaction => "txn",
+            ObjectType::PaymentMethod => "pm",
+            ObjectType::SetupIntent => "seti",
+            // Includes the mode: real session IDs read `cs_test_...`.
+            ObjectType::CheckoutSession => "cs_test",
+            ObjectType::InvoicePayment => "inpay",
         }
     }
 
@@ -85,6 +123,15 @@ impl ObjectType {
             ObjectType::SubscriptionItem => "subscription_items",
             ObjectType::Invoice => "invoices",
             ObjectType::Account => "accounts",
+            ObjectType::PaymentIntent => "payment_intents",
+            ObjectType::Charge => "charges",
+            ObjectType::Refund => "refunds",
+            ObjectType::Dispute => "disputes",
+            ObjectType::BalanceTransaction => "balance_transactions",
+            ObjectType::PaymentMethod => "payment_methods",
+            ObjectType::SetupIntent => "setup_intents",
+            ObjectType::CheckoutSession => "checkout/sessions",
+            ObjectType::InvoicePayment => "invoice_payments",
             ObjectType::InvoiceLineItem => return None,
         };
         Some(format!("/v1/{collection}/{id}"))

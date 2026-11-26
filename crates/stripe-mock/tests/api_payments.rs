@@ -1,0 +1,165 @@
+mod common;
+
+use common::{get, mock_with};
+use ductkit_stripe_mock::{NewCustomer, ObjectType};
+use serde_json::Value;
+
+async fn json(m: &ductkit_stripe_mock::MockStripe, path: &str) -> (u16, Value) {
+    let r = get(m, path).await;
+    let status = r.status().as_u16();
+    (status, r.json().await.unwrap())
+}
+
+/// Every new top-level list path, with the query that makes it servable.
+const LISTS: [(&str, &str); 9] = [
+    ("/v1/payment_intents", ""),
+    ("/v1/charges", ""),
+    ("/v1/refunds", ""),
+    ("/v1/disputes", ""),
+    ("/v1/balance_transactions", ""),
+    ("/v1/payment_methods", "?customer=cus_none"),
+    ("/v1/setup_intents", ""),
+    ("/v1/checkout/sessions", ""),
+    ("/v1/invoice_payments", ""),
+];
+
+#[tokio::test]
+async fn new_lists_are_empty_and_well_formed() {
+    let m = mock_with("").await;
+    for (path, query) in LISTS {
+        let (s, v) = json(&m, &format!("{path}{query}")).await;
+        assert_eq!(s, 200, "{path}: {v}");
+        assert_eq!(v["object"], "list", "{path}");
+        assert_eq!(v["data"].as_array().unwrap().len(), 0, "{path}");
+        assert_eq!(v["has_more"], false, "{path}");
+        assert_eq!(v["url"], format!("{path}{query}"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn customer_payment_methods_sub_list() {
+    let m = mock_with("").await;
+    let id = m.create_customer(NewCustomer::default()).unwrap();
+    let path = format!("/v1/customers/{id}/payment_methods");
+    let (s, v) = json(&m, &path).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["object"], "list");
+    assert_eq!(v["url"], path);
+    assert_eq!(v["data"].as_array().unwrap().len(), 0);
+    let (s, v) = json(&m, "/v1/customers/cus_nope/payment_methods").await;
+    assert_eq!(s, 404, "{v}");
+    assert_eq!(v["error"]["code"], "resource_missing");
+}
+
+#[tokio::test]
+async fn filters_are_accepted() {
+    let m = mock_with("").await;
+    for q in [
+        "/v1/payment_intents?customer=cus_1",
+        "/v1/charges?customer=cus_1&payment_intent=pi_1",
+        "/v1/refunds?charge=ch_1&payment_intent=pi_1",
+        "/v1/disputes?charge=ch_1&payment_intent=pi_1",
+        "/v1/balance_transactions?type=charge&source=ch_1&payout=po_1",
+        "/v1/payment_methods?customer=cus_1&type=card",
+        "/v1/setup_intents?customer=cus_1&payment_method=pm_1",
+        "/v1/checkout/sessions?customer=cus_1&payment_intent=pi_1&subscription=sub_1&status=open",
+        "/v1/invoice_payments?invoice=in_1&payment=pi_1",
+    ] {
+        let (s, v) = json(&m, q).await;
+        assert_eq!(s, 200, "{q}: {v}");
+    }
+}
+
+#[tokio::test]
+async fn payment_methods_list_requires_customer() {
+    let m = mock_with("").await;
+    let (s, v) = json(&m, "/v1/payment_methods").await;
+    assert_eq!(s, 400);
+    assert_eq!(v["error"]["code"], "parameter_missing");
+    assert_eq!(v["error"]["param"], "customer");
+}
+
+#[tokio::test]
+async fn unknown_payment_ids_404() {
+    let m = mock_with("").await;
+    for (path, _) in LISTS {
+        let (s, v) = json(&m, &format!("{path}/x_nope")).await;
+        assert_eq!(s, 404, "{path}: {v}");
+        assert_eq!(v["error"]["code"], "resource_missing", "{path}");
+    }
+    let (s, v) = json(&m, "/v1/charges/ch_nope").await;
+    assert_eq!(s, 404);
+    assert_eq!(v["error"]["code"], "resource_missing");
+    assert_eq!(v["error"]["message"], "No such charge: 'ch_nope'");
+}
+
+#[tokio::test]
+async fn new_endpoints_are_read_only() {
+    let m = mock_with("").await;
+    for (path, _) in LISTS {
+        let r = reqwest::Client::new()
+            .post(format!("{}{path}", m.api_url()))
+            .bearer_auth("sk_test_mock")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{path}");
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error", "{path}");
+    }
+}
+
+#[test]
+fn new_types_have_the_documented_names() {
+    let expected = [
+        (
+            ObjectType::PaymentIntent,
+            "payment_intent",
+            "payment_intent",
+            "pi",
+        ),
+        (ObjectType::Charge, "charge", "charge", "ch"),
+        (ObjectType::Refund, "refund", "refund", "re"),
+        (ObjectType::Dispute, "dispute", "dispute", "dp"),
+        (
+            ObjectType::BalanceTransaction,
+            "balance_transaction",
+            "balance_transaction",
+            "txn",
+        ),
+        (
+            ObjectType::PaymentMethod,
+            "payment_method",
+            "payment_method",
+            "pm",
+        ),
+        (
+            ObjectType::SetupIntent,
+            "setup_intent",
+            "setup_intent",
+            "seti",
+        ),
+        (
+            ObjectType::CheckoutSession,
+            "checkout.session",
+            "checkout_session",
+            "cs_test",
+        ),
+        (
+            ObjectType::InvoicePayment,
+            "invoice_payment",
+            "invoice_payment",
+            "inpay",
+        ),
+    ];
+    assert_eq!(ObjectType::ALL.len(), 17);
+    for (t, name, serde_name, prefix) in expected {
+        assert_eq!(t.as_str(), name);
+        assert_eq!(t.serde_name(), serde_name);
+        assert_eq!(t.id_prefix(), prefix);
+    }
+    assert_eq!(
+        ObjectType::CheckoutSession.api_path("cs_test_1").unwrap(),
+        "/v1/checkout/sessions/cs_test_1"
+    );
+}
