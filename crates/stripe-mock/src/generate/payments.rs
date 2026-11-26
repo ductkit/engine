@@ -1,5 +1,5 @@
 //! Payments (spec sections 5.5 and 6.1): the objects an invoice payment creates, and the
-//! `one_off_payment` and `refund` actions.
+//! `one_off_payment`, `refund` and `dispute` actions.
 //!
 //! Every object draw here (IDs, card details, risk scores) comes from `ctx.payments`
 //! (stream `"generate.payments"`); whether a payment succeeds, and an action's targets and
@@ -7,17 +7,18 @@
 
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::generate::catalog::active_ids;
-use crate::generate::{Ctx, billing, pick};
+use crate::generate::{Continuation, Ctx, billing, pick};
 use crate::model::catalog::{random_currency, random_nonzero_amount};
 use crate::model::payments::{
-    CardDraw, NewCharge, NewPaymentIntent, NewRefund, decline_error, new_card_payment_method,
-    new_charge, new_charge_balance_transaction, new_invoice_payment, new_payment_intent,
-    new_refund, new_refund_balance_transaction, push_refund,
+    CardDraw, NewCharge, NewDispute, NewPaymentIntent, NewRefund, decline_error,
+    new_card_payment_method, new_charge, new_charge_balance_transaction, new_dispute,
+    new_dispute_balance_transaction, new_invoice_payment, new_payment_intent, new_refund,
+    new_refund_balance_transaction, push_refund, submit_evidence,
 };
 use crate::rng::SimRng;
 use crate::stripe::{
-    BalanceTransaction, Charge, Expandable, Invoice, InvoicePayment, PaymentIntent,
-    PaymentIntentCancellationReason, PaymentIntentStatus, PaymentMethod,
+    BalanceTransaction, Charge, Dispute, DisputeStatus, Expandable, Invoice, InvoicePayment,
+    PaymentIntent, PaymentIntentCancellationReason, PaymentIntentStatus, PaymentMethod,
 };
 use crate::{MockError, ObjectType, SimTime};
 
@@ -440,11 +441,22 @@ pub(crate) fn make_available(engine: &mut Engine, id: &str, cause: &Cause) {
     }
 }
 
-/// What is left to refund on `charge`: `None` unless it `succeeded` with something left.
+/// What is left to refund on `charge`: `None` unless it `succeeded` with something left
+/// and no chargeback blocks it (a dispute with `is_charge_refundable: false`).
 fn refundable(engine: &Engine, charge: &str) -> Option<i64> {
     let c = engine.latest(ObjectType::Charge, charge)?;
     if c.state["status"] != "succeeded" {
         return None;
+    }
+    if c.state["disputed"] == true {
+        let allowed = engine
+            .store()
+            .children(ObjectType::Dispute, "charge", charge)
+            .last()
+            .is_some_and(|d| d.latest.state["is_charge_refundable"] == true);
+        if !allowed {
+            return None;
+        }
     }
     let amount = c.state["amount"].as_i64()?;
     let refunded = c.state["amount_refunded"].as_i64()?;
@@ -622,7 +634,8 @@ pub(crate) fn refund_action(
             }
             let Some(left) = refundable(engine, &id) else {
                 return Err(MockError::InvalidAction(format!(
-                    "charge {id} cannot be refunded: it did not succeed or is fully refunded"
+                    "charge {id} cannot be refunded: it did not succeed, is fully refunded or \
+                     has a chargeback"
                 )));
             };
             (id, left)
@@ -653,5 +666,246 @@ pub(crate) fn refund_action(
     };
     let cause = engine.begin_action("refund");
     refund(engine, ctx, &charge, amount, &cause).expect("the charge is refundable");
+    Ok(Some(cause))
+}
+
+/// How a dispute ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisputeOutcome {
+    /// A chargeback won: `won`, the amount and fee reinstated.
+    Won,
+    /// A chargeback lost: `lost`, the funds stay withdrawn.
+    Lost,
+    /// An inquiry that closed without becoming a chargeback: `warning_closed`, no funds moved.
+    WarningClosed,
+}
+
+/// Dispute reasons drawn for a new dispute.
+const DISPUTE_REASONS: [&str; 5] = [
+    "fraudulent",
+    "product_not_received",
+    "duplicate",
+    "subscription_canceled",
+    "general",
+];
+/// Chance of each drawn outcome: won 0.4, lost 0.5, the rest (0.1) `warning_closed`.
+const WON_PROBABILITY: f64 = 0.4;
+const LOST_PROBABILITY: f64 = 0.5;
+
+const DAY_MS: i64 = 86_400_000;
+/// Open to evidence submitted (`under_review`).
+const REVIEW_AFTER_MS: (i64, i64) = (2 * DAY_MS, 7 * DAY_MS);
+/// Evidence submitted to closed.
+const CLOSE_AFTER_MS: (i64, i64) = (7 * DAY_MS, 60 * DAY_MS);
+
+/// Whether `charge` can be disputed: it `succeeded`, has a non-zero amount, nothing
+/// refunded and no dispute yet.
+fn disputable(engine: &Engine, charge: &str) -> bool {
+    engine.latest(ObjectType::Charge, charge).is_some_and(|c| {
+        let s = &c.state;
+        s["status"] == "succeeded"
+            && s["amount"].as_i64().is_some_and(|a| a > 0)
+            && s["amount_refunded"] == 0
+            && s["disputed"] == false
+    })
+}
+
+fn draw_outcome(rng: &mut SimRng) -> DisputeOutcome {
+    let u = rng.unit_f64();
+    if u < WON_PROBABILITY {
+        DisputeOutcome::Won
+    } else if u < WON_PROBABILITY + LOST_PROBABILITY {
+        DisputeOutcome::Lost
+    } else {
+        DisputeOutcome::WarningClosed
+    }
+}
+
+/// Opens a dispute on `charge`. A chargeback first withdraws the funds: its balance
+/// transaction (`type: adjustment`, `-amount` plus the dispute fee, `available` at once,
+/// no event). Then the dispute (`charge.dispute.created`, and
+/// `charge.dispute.funds_withdrawn` for a chargeback) and the charge with `disputed: true`
+/// (no event). An inquiry moves no funds.
+fn open_dispute(
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    charge: &str,
+    reason: &str,
+    inquiry: bool,
+    cause: &Cause,
+) -> String {
+    let ch: Charge = engine
+        .latest_obj(ObjectType::Charge, charge)
+        .expect("disputable charge");
+    let created = engine.now().unix_seconds();
+    let id = ctx.payments.id(ObjectType::Dispute.id_prefix());
+    let mut balance_transactions = Vec::new();
+    if !inquiry {
+        let txn = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
+        let bt = new_dispute_balance_transaction(
+            &txn,
+            created,
+            ch.amount,
+            &ch.currency,
+            &id,
+            charge,
+            false,
+        );
+        engine.create_obj(ObjectType::BalanceTransaction, txn, &bt, cause.clone(), &[]);
+        balance_transactions.push(bt);
+    }
+    let du = new_dispute(&NewDispute {
+        id: &id,
+        created,
+        charge: &ch,
+        reason,
+        inquiry,
+        balance_transactions,
+    });
+    let events: &[&str] = if inquiry {
+        &["charge.dispute.created"]
+    } else {
+        &["charge.dispute.created", "charge.dispute.funds_withdrawn"]
+    };
+    engine.create_obj(ObjectType::Dispute, id.clone(), &du, cause.clone(), events);
+    engine
+        .update_obj::<Charge>(
+            ObjectType::Charge,
+            charge,
+            |c| c.disputed = true,
+            cause.clone(),
+            ChangeKind::Updated,
+            &[],
+        )
+        .expect("live charge");
+    id
+}
+
+/// Evidence submitted: `under_review` (`warning_under_review` for an inquiry),
+/// `charge.dispute.updated`.
+pub(crate) fn dispute_update(engine: &mut Engine, id: &str, cause: &Cause) {
+    engine
+        .update_obj::<Dispute>(
+            ObjectType::Dispute,
+            id,
+            submit_evidence,
+            cause.clone(),
+            ChangeKind::StateChanged,
+            &["charge.dispute.updated"],
+        )
+        .expect("live dispute");
+}
+
+/// Closes the dispute with `outcome` (`charge.dispute.closed`). A won dispute first gets
+/// its reinstating balance transaction (`+amount`, the fee returned, `available` at once,
+/// no event) and announces `charge.dispute.funds_reinstated` too.
+pub(crate) fn dispute_close(
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    id: &str,
+    outcome: DisputeOutcome,
+    cause: &Cause,
+) {
+    let du: Dispute = engine
+        .latest_obj(ObjectType::Dispute, id)
+        .expect("live dispute");
+    let reinstated = (outcome == DisputeOutcome::Won).then(|| {
+        let txn = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
+        let bt = new_dispute_balance_transaction(
+            &txn,
+            engine.now().unix_seconds(),
+            du.amount,
+            &du.currency,
+            id,
+            du.charge.id(),
+            true,
+        );
+        engine.create_obj(ObjectType::BalanceTransaction, txn, &bt, cause.clone(), &[]);
+        bt
+    });
+    let (status, events): (DisputeStatus, &[&str]) = match outcome {
+        DisputeOutcome::Won => (
+            DisputeStatus::Won,
+            &["charge.dispute.closed", "charge.dispute.funds_reinstated"],
+        ),
+        DisputeOutcome::Lost => (DisputeStatus::Lost, &["charge.dispute.closed"]),
+        DisputeOutcome::WarningClosed => (DisputeStatus::WarningClosed, &["charge.dispute.closed"]),
+    };
+    engine
+        .update_obj::<Dispute>(
+            ObjectType::Dispute,
+            id,
+            |d| {
+                d.status = status;
+                d.balance_transactions.extend(reinstated);
+            },
+            cause.clone(),
+            ChangeKind::StateChanged,
+            events,
+        )
+        .expect("live dispute");
+}
+
+/// `dispute`: disputes the named charge, or a random disputable one (see
+/// [`disputable`]). Every draw happens now, from `rng`: the target, the reason (uniform),
+/// the outcome when `None` (won 0.4, lost 0.5, `warning_closed` 0.1), the time to
+/// evidence (2–7 days) and from evidence to close (7–60 days). Both later steps are
+/// queued now. Returns `None` when no charge was named and none is disputable; a named
+/// charge that cannot be disputed is an `InvalidAction` error naming it.
+pub(crate) fn dispute_action(
+    rng: &mut SimRng,
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    charge: Option<String>,
+    outcome: Option<DisputeOutcome>,
+) -> Result<Option<Cause>, MockError> {
+    let charge = match charge {
+        Some(id) => {
+            if engine.latest(ObjectType::Charge, &id).is_none() {
+                return Err(MockError::NoSuchObject {
+                    object_type: ObjectType::Charge,
+                    id,
+                });
+            }
+            if !disputable(engine, &id) {
+                return Err(MockError::InvalidAction(format!(
+                    "charge {id} cannot be disputed: it did not succeed, is refunded or is \
+                     already disputed"
+                )));
+            }
+            id
+        }
+        None => {
+            let candidates: Vec<&String> = engine
+                .store()
+                .live_ids(ObjectType::Charge)
+                .iter()
+                .filter(|id| disputable(engine, id))
+                .collect();
+            if candidates.is_empty() {
+                return Ok(None);
+            }
+            (*pick(rng, &candidates)).clone()
+        }
+    };
+    let reason = *pick(rng, &DISPUTE_REASONS);
+    let outcome = outcome.unwrap_or_else(|| draw_outcome(rng));
+    let review_after = rng.uniform_ms(REVIEW_AFTER_MS.0, REVIEW_AFTER_MS.1);
+    let close_after = rng.uniform_ms(CLOSE_AFTER_MS.0, CLOSE_AFTER_MS.1);
+    let cause = engine.begin_action("dispute");
+    let inquiry = outcome == DisputeOutcome::WarningClosed;
+    let id = open_dispute(engine, ctx, &charge, reason, inquiry, &cause);
+    let review_at = engine.now().plus_ms(review_after);
+    ctx.schedule(
+        review_at,
+        Continuation::DisputeUpdate { id: id.clone() },
+        cause.clone(),
+    );
+    ctx.schedule(
+        review_at.plus_ms(close_after),
+        Continuation::DisputeClose { id, outcome },
+        cause.clone(),
+    );
     Ok(Some(cause))
 }

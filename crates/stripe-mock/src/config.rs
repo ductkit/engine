@@ -18,24 +18,6 @@ pub const MAX_DURATION_MS: i64 = 100 * 365 * 86_400_000;
 /// Upper bound for `clock.speed` (simulated seconds per real second).
 pub const MAX_SPEED: f64 = 1e6;
 
-/// Spec keys inside supported sections that are not implemented yet, with an
-/// optional reason appended to the error.
-const UNIMPLEMENTED_KEYS: [(&str, &[&str], &str); 1] =
-    [("actions", &["dispute"], " (needs disputes, phase 7)")];
-
-/// The first spec section or key that is not implemented, e.g. `[history]` or
-/// `api.latency`, with its reason.
-fn first_unimplemented(table: &toml::Table) -> Option<String> {
-    for (section, keys, reason) in UNIMPLEMENTED_KEYS {
-        if let Some(inner) = table.get(section).and_then(|v| v.as_table())
-            && let Some(key) = keys.iter().find(|k| inner.contains_key(**k))
-        {
-            return Some(format!("`{section}.{key}` is not implemented yet{reason}"));
-        }
-    }
-    None
-}
-
 /// Full mock configuration.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -339,6 +321,8 @@ pub struct ActionsConfig {
     pub one_off_payment: f64,
     /// A full or partial refund of a random refundable charge.
     pub refund: f64,
+    /// A dispute on a random succeeded, unrefunded, undisputed charge.
+    pub dispute: f64,
     pub renew_subscription_cycle: RenewMode,
     /// Gap between consecutive steps of one action.
     pub step_delay: Distribution,
@@ -356,6 +340,7 @@ impl ActionsConfig {
             ("actions.one_off_invoice", self.one_off_invoice),
             ("actions.one_off_payment", self.one_off_payment),
             ("actions.refund", self.refund),
+            ("actions.dispute", self.dispute),
         ] {
             check_rate(name, rate)?;
         }
@@ -475,10 +460,6 @@ impl Default for ApiConfig {
 impl Config {
     /// Parses and validates a TOML config.
     pub fn from_toml_str(s: &str) -> Result<Config, MockError> {
-        let table: toml::Table = s.parse().map_err(|e| MockError::Config(format!("{e}")))?;
-        if let Some(message) = first_unimplemented(&table) {
-            return Err(MockError::Config(message));
-        }
         let config: Config = toml::from_str(s).map_err(|e| MockError::Config(format!("{e}")))?;
         config.validate()?;
         Ok(config)
@@ -1073,10 +1054,9 @@ mod tests {
         }
     }
 
-    /// The spec's example config uses every action key; `dispute` is the only one still
-    /// reserved, so the example fails on it alone.
+    /// The spec's example config uses every action key, `dispute` included, and parses.
     #[test]
-    fn spec_example_config_fails_only_on_dispute() {
+    fn spec_example_config_parses() {
         let spec = include_str!("../../../docs/stripe-mock-spec.md");
         let toml = spec
             .split("```toml\n")
@@ -1085,28 +1065,14 @@ mod tests {
             .split("```")
             .next()
             .unwrap();
-        let msg = Config::from_toml_str(toml).unwrap_err().to_string();
-        assert!(
-            msg.contains("`actions.dispute`") && msg.contains("not implemented"),
-            "{msg}"
-        );
-        let without_dispute: String = toml
-            .lines()
-            .filter(|l| !l.starts_with("dispute ="))
-            .map(|l| format!("{l}\n"))
-            .collect();
-        let c = Config::from_toml_str(&without_dispute).unwrap();
-        assert_eq!((c.actions.one_off_payment, c.actions.refund), (6.0, 0.4));
-    }
-
-    #[test]
-    fn nested_unimplemented_keys_are_named() {
-        let msg = Config::from_toml_str("[actions]\ndispute = 0.05")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            msg.contains("actions.dispute") && msg.contains("not implemented"),
-            "{msg}"
+        let c = Config::from_toml_str(toml).unwrap();
+        assert_eq!(
+            (
+                c.actions.one_off_payment,
+                c.actions.refund,
+                c.actions.dispute
+            ),
+            (6.0, 0.4, 0.05)
         );
     }
 
@@ -1140,17 +1106,6 @@ scale = 0.5",
             (c.history.duration.ms(), c.history.scale),
             (90 * 86_400_000, 0.5)
         );
-    }
-
-    #[test]
-    fn not_implemented_message_is_tidy() {
-        let msg = Config::from_toml_str(
-            "[actions]
-dispute = 1",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(!msg.contains("  "), "{msg:?}");
     }
 
     #[test]
@@ -1374,14 +1329,14 @@ enabled_events = [\"{events}\"]
     }
 
     #[test]
-    fn dispute_not_implemented() {
-        let msg = Config::from_toml_str("[actions]\ndispute = 0.05")
+    fn config_accepts_dispute_rate() {
+        let c = Config::from_toml_str("[actions]\ndispute = 0.05").unwrap();
+        assert_eq!(c.actions.dispute, 0.05);
+        assert_eq!(Config::default().actions.dispute, 0.0);
+        let msg = Config::from_toml_str("[actions]\ndispute = -1")
             .unwrap_err()
             .to_string();
-        assert!(
-            msg.contains("`actions.dispute`") && msg.contains("phase 7"),
-            "{msg}"
-        );
+        assert!(msg.contains("actions.dispute"), "{msg}");
     }
 
     #[test]

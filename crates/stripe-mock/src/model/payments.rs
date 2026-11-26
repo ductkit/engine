@@ -764,6 +764,211 @@ pub(crate) fn push_refund(c: &mut stripe::Charge, refund: stripe::Refund, page_s
     list.has_more = count > list.data.len() as i64;
 }
 
+/// Stripe's dispute fee, in the minor unit, withdrawn with a chargeback and returned
+/// when it is won.
+pub(crate) const DISPUTE_FEE: i64 = 1500;
+
+/// Seconds from a dispute opening to its evidence being due.
+pub(crate) const EVIDENCE_DUE_SECS: i64 = 14 * 86_400;
+
+/// A chargeback's balance transaction (`type: adjustment`, `available` at once, as
+/// Stripe's dispute adjustments are): the withdrawal (`-amount`, plus the dispute fee) or,
+/// for a won dispute, the reinstatement (`+amount`, the fee returned).
+pub(crate) fn new_dispute_balance_transaction(
+    id: &str,
+    created: i64,
+    amount: i64,
+    currency: &str,
+    dispute: &str,
+    charge: &str,
+    reinstate: bool,
+) -> stripe::BalanceTransaction {
+    let (sign, category, description, fee_description) = if reinstate {
+        (
+            1,
+            "dispute_reversal",
+            format!("Chargeback reversal for {charge}"),
+            "Dispute fee refund",
+        )
+    } else {
+        (
+            -1,
+            "dispute",
+            format!("Chargeback withdrawal for {charge}"),
+            "Dispute fee",
+        )
+    };
+    let fee = -sign * DISPUTE_FEE;
+    stripe::BalanceTransaction {
+        amount: sign * amount,
+        available_on: created,
+        balance_type: stripe::BalanceTransactionBalanceType::Payments,
+        created,
+        currency: currency.to_string(),
+        description: Some(Some(description)),
+        exchange_rate: Some(None),
+        fee,
+        fee_details: vec![stripe::Fee {
+            amount: fee,
+            application: Some(None),
+            currency: currency.to_string(),
+            description: Some(Some(fee_description.to_string())),
+            type_: "stripe_fee".to_string(),
+        }],
+        id: id.to_string(),
+        net: sign * amount - fee,
+        object: stripe::BalanceTransactionObject::BalanceTransaction,
+        reporting_category: category.to_string(),
+        source: Some(Some(Expandable::Id(dispute.to_string()))),
+        status: "available".to_string(),
+        type_: stripe::BalanceTransactionType::Adjustment,
+    }
+}
+
+/// Inputs for a dispute.
+pub(crate) struct NewDispute<'a> {
+    pub id: &'a str,
+    pub created: i64,
+    /// The disputed charge.
+    pub charge: &'a stripe::Charge,
+    pub reason: &'a str,
+    /// An inquiry (`warning_*` statuses, no funds withdrawn) rather than a chargeback.
+    pub inquiry: bool,
+    /// The withdrawal, for a chargeback.
+    pub balance_transactions: Vec<stripe::BalanceTransaction>,
+}
+
+/// The Visa reason code the mock reports for a dispute reason; `null` for `general`.
+fn network_reason_code(reason: &str) -> Option<String> {
+    let code = match reason {
+        "fraudulent" => "10.4",
+        "product_not_received" => "13.1",
+        "duplicate" => "12.6.1",
+        "subscription_canceled" => "13.2",
+        _ => return None,
+    };
+    Some(code.to_string())
+}
+
+/// No evidence yet: every evidence field `null`.
+fn empty_evidence() -> stripe::DisputeEvidence {
+    stripe::DisputeEvidence {
+        access_activity_log: Some(None),
+        appeal: Some(None),
+        billing_address: Some(None),
+        cancellation_policy: Some(None),
+        cancellation_policy_disclosure: Some(None),
+        cancellation_rebuttal: Some(None),
+        customer_communication: Some(None),
+        customer_email_address: Some(None),
+        customer_name: Some(None),
+        customer_purchase_ip: Some(None),
+        customer_signature: Some(None),
+        duplicate_charge_documentation: Some(None),
+        duplicate_charge_explanation: Some(None),
+        duplicate_charge_id: Some(None),
+        enhanced_evidence: stripe::DisputeEnhancedEvidence {
+            mastercard_compliance: None,
+            visa_compelling_evidence_3: None,
+            visa_compliance: None,
+        },
+        product_description: Some(None),
+        receipt: Some(None),
+        refund_policy: Some(None),
+        refund_policy_disclosure: Some(None),
+        refund_refusal_explanation: Some(None),
+        service_date: Some(None),
+        service_documentation: Some(None),
+        shipping_address: Some(None),
+        shipping_carrier: Some(None),
+        shipping_date: Some(None),
+        shipping_documentation: Some(None),
+        shipping_tracking_number: Some(None),
+        uncategorized_file: Some(None),
+        uncategorized_text: Some(None),
+    }
+}
+
+/// A new card dispute on `charge` for its full amount: `needs_response` (a chargeback) or
+/// `warning_needs_response` (an inquiry), no evidence, due [`EVIDENCE_DUE_SECS`] later.
+pub(crate) fn new_dispute(d: &NewDispute) -> stripe::Dispute {
+    let c = d.charge;
+    let (status, case_type) = if d.inquiry {
+        (
+            stripe::DisputeStatus::WarningNeedsResponse,
+            stripe::DisputePaymentMethodDetailsCardCaseType::Inquiry,
+        )
+    } else {
+        (
+            stripe::DisputeStatus::NeedsResponse,
+            stripe::DisputePaymentMethodDetailsCardCaseType::Chargeback,
+        )
+    };
+    stripe::Dispute {
+        amount: c.amount,
+        balance_transactions: d.balance_transactions.clone(),
+        charge: Expandable::Id(c.id.clone()),
+        created: d.created,
+        currency: c.currency.clone(),
+        enhanced_eligibility_types: Vec::new(),
+        evidence: empty_evidence(),
+        evidence_details: stripe::DisputeEvidenceDetails {
+            due_by: Some(Some(d.created + EVIDENCE_DUE_SECS)),
+            enhanced_eligibility: stripe::DisputeEnhancedEligibility {
+                mastercard_compliance: None,
+                visa_compelling_evidence_3: None,
+                visa_compliance: None,
+            },
+            has_evidence: false,
+            past_due: false,
+            submission_count: 0,
+            submission_method: stripe::DisputeEvidenceDetailsSubmissionMethod::NotSubmitted,
+        },
+        id: d.id.to_string(),
+        intended_submission_method: Some(None),
+        // Stripe lets an inquiry's charge be refunded, not a chargeback's.
+        is_charge_refundable: d.inquiry,
+        livemode: false,
+        metadata: BTreeMap::new(),
+        object: stripe::DisputeObject::Dispute,
+        payment_intent: Some(
+            c.payment_intent
+                .clone()
+                .flatten()
+                .map(|p| Expandable::Id(p.id().to_string())),
+        ),
+        payment_method_details: Some(stripe::DisputePaymentMethodDetails {
+            amazon_pay: None,
+            card: Some(stripe::DisputePaymentMethodDetailsCard {
+                brand: BRAND.to_string(),
+                case_type,
+                network: BRAND.to_string(),
+                network_reason_code: Some(network_reason_code(d.reason)),
+            }),
+            klarna: None,
+            paypal: None,
+            type_: stripe::DisputePaymentMethodDetailsType::Card,
+        }),
+        reason: d.reason.to_string(),
+        status,
+    }
+}
+
+/// Evidence submitted by hand: the dispute goes `under_review` (`warning_under_review`
+/// for an inquiry).
+pub(crate) fn submit_evidence(d: &mut stripe::Dispute) {
+    d.status = if d.status == stripe::DisputeStatus::WarningNeedsResponse {
+        stripe::DisputeStatus::WarningUnderReview
+    } else {
+        stripe::DisputeStatus::UnderReview
+    };
+    d.evidence.uncategorized_text = Some(Some("Evidence submitted by the merchant.".to_string()));
+    let e = &mut d.evidence_details;
+    e.has_evidence = true;
+    e.submission_count += 1;
+    e.submission_method = stripe::DisputeEvidenceDetailsSubmissionMethod::Manual;
+}
+
 /// An `open` invoice payment through a payment intent, created at the invoice's first
 /// payment attempt; `amount_paid` is null until it is paid.
 pub(crate) fn new_invoice_payment(
@@ -925,6 +1130,47 @@ mod tests {
             ((-400).into(), (-400).into())
         );
         assert_eq!(txn["type"], "refund");
+
+        let withdrawal =
+            new_dispute_balance_transaction("txn_4", 3, 1000, "usd", "du_1", "ch_1", false);
+        let v = conforms(&withdrawal);
+        assert_eq!(
+            (v["amount"].clone(), v["fee"].clone(), v["net"].clone()),
+            ((-1000).into(), 1500.into(), (-2500).into())
+        );
+        assert_eq!(v["type"], "adjustment");
+        let v = conforms(&new_dispute_balance_transaction(
+            "txn_5", 4, 1000, "usd", "du_1", "ch_1", true,
+        ));
+        assert_eq!(
+            (v["amount"].clone(), v["fee"].clone(), v["net"].clone()),
+            (1000.into(), (-1500).into(), 2500.into())
+        );
+        for inquiry in [false, true] {
+            let mut du = new_dispute(&NewDispute {
+                id: "du_1",
+                created: 3,
+                charge: &ch,
+                reason: "general",
+                inquiry,
+                balance_transactions: (!inquiry).then(|| withdrawal.clone()).into_iter().collect(),
+            });
+            let v = conforms(&du);
+            assert_eq!(v["is_charge_refundable"], inquiry);
+            assert_eq!(
+                v["payment_method_details"]["card"]["network_reason_code"],
+                Value::Null
+            );
+            submit_evidence(&mut du);
+            let v = conforms(&du);
+            let want = if inquiry {
+                "warning_under_review"
+            } else {
+                "under_review"
+            };
+            assert_eq!(v["status"], want);
+            assert_eq!(v["evidence_details"]["submission_count"], 1);
+        }
 
         let ip = conforms(&new_invoice_payment(
             "inpay_1", 1, "in_1", 1000, "usd", "pi_1",

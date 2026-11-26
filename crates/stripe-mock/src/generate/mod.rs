@@ -22,6 +22,7 @@ pub(crate) use mux::Generators;
 pub(crate) use subscriptions::delete_customer_cascade;
 
 pub use billing::InvoiceOutcome;
+pub use payments::DisputeOutcome;
 
 use std::collections::BTreeMap;
 
@@ -74,6 +75,13 @@ pub enum Action {
         charge: Option<String>,
         amount: Option<i64>,
     },
+    /// Dispute the named or a random disputable charge (succeeded, nothing refunded, not
+    /// yet disputed), ending in `outcome` (drawn when `None`). A named charge that cannot
+    /// be disputed is an error naming it.
+    Dispute {
+        charge: Option<String>,
+        outcome: Option<DisputeOutcome>,
+    },
 }
 
 /// Generated actions, in tie-break order. New kinds are appended, so existing
@@ -95,6 +103,7 @@ enum ActionKind {
     SubscriptionUpdate,
     OneOffPayment,
     Refund,
+    Dispute,
 }
 
 /// A follow-up step of an action.
@@ -156,6 +165,15 @@ pub(crate) enum Continuation {
     DunningRetry {
         sub: String,
         invoice: String,
+    },
+    /// Evidence submitted: the dispute goes under review.
+    DisputeUpdate {
+        id: String,
+    },
+    /// The dispute closes with its outcome, drawn when it opened.
+    DisputeClose {
+        id: String,
+        outcome: DisputeOutcome,
     },
 }
 
@@ -324,6 +342,7 @@ impl Generator {
                 "generate.one_off_payment",
             ),
             (ActionKind::Refund, a.refund, "generate.refund"),
+            (ActionKind::Dispute, a.dispute, "generate.dispute"),
         ];
         let actions = specs
             .into_iter()
@@ -410,6 +429,7 @@ impl Generator {
                 ActionKind::CancelSubscription => config.cancel_subscription,
                 ActionKind::OneOffPayment => config.one_off_payment,
                 ActionKind::Refund => config.refund,
+                ActionKind::Dispute => config.dispute,
                 _ => continue,
             };
             a.base_rate = rate;
@@ -573,6 +593,14 @@ impl Generator {
                     MockError::InvalidAction("no succeeded charge to refund".to_string())
                 })?
             }
+            Action::Dispute { charge, outcome } => {
+                payments::dispute_action(&mut self.control, engine, &mut self.ctx, charge, outcome)?
+                    .ok_or_else(|| {
+                        MockError::InvalidAction(
+                            "no succeeded, unrefunded, undisputed charge to dispute".to_string(),
+                        )
+                    })?
+            }
         };
         self.run_due_now(engine);
         Ok(cause)
@@ -622,14 +650,12 @@ impl Generator {
             }
             ObjectType::Refund => &[ActionKind::Refund],
             ObjectType::InvoicePayment => &[ActionKind::OneOffInvoice],
+            ObjectType::Dispute => &[ActionKind::Dispute],
             ObjectType::SubscriptionItem | ObjectType::InvoiceLineItem | ObjectType::Account => {
                 return;
             }
-            // No action creates these yet; tasks 11 and 12 add theirs.
-            ObjectType::Dispute
-            | ObjectType::PaymentMethod
-            | ObjectType::SetupIntent
-            | ObjectType::CheckoutSession => {
+            // No action creates these yet; task 12 adds theirs.
+            ObjectType::PaymentMethod | ObjectType::SetupIntent | ObjectType::CheckoutSession => {
                 return;
             }
         };
@@ -669,6 +695,10 @@ fn run_continuation(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mu
         | Continuation::FinalizeRenewal { .. }
         | Continuation::PayRenewal { .. }
         | Continuation::DunningRetry { .. }) => subscriptions::run(c, cause, engine, ctx),
+        Continuation::DisputeUpdate { id } => payments::dispute_update(engine, &id, &cause),
+        Continuation::DisputeClose { id, outcome } => {
+            payments::dispute_close(engine, ctx, &id, outcome, &cause);
+        }
         c => billing::run(c, cause, engine, ctx),
     }
 }
@@ -764,6 +794,10 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
         }
         ActionKind::Refund => {
             payments::refund_action(rng, engine, ctx, None, None)
+                .expect("random targets are valid");
+        }
+        ActionKind::Dispute => {
+            payments::dispute_action(rng, engine, ctx, None, None)
                 .expect("random targets are valid");
         }
     }
