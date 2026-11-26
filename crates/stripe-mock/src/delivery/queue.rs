@@ -5,7 +5,9 @@ use std::collections::{BTreeSet, HashMap};
 use serde::Serialize;
 
 use crate::delivery::{Destinations, retry_delays};
-use crate::engine::events::{EventFormat, EventRecord, EventStore, thin_notification};
+use crate::engine::events::{
+    EventFormat, EventRecord, EventStore, thin_notification, with_pending_webhooks,
+};
 use crate::rng::{RngStreams, SimRng};
 use crate::{SimTime, WebhooksConfig};
 
@@ -263,9 +265,7 @@ impl Deliveries {
                 .expect("delivered events are stored");
             let body = match ev.format {
                 EventFormat::Snapshot => {
-                    let mut v = ev.payload.clone();
-                    v["pending_webhooks"] = self.pending_for_event(&d.event_id).into();
-                    v
+                    with_pending_webhooks(&ev.payload, self.pending_for_event(&d.event_id))
                 }
                 EventFormat::Thin => thin_notification(&ev.payload),
             };

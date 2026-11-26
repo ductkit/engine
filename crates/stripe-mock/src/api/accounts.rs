@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, RawQuery, State};
-use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,6 +19,7 @@ use crate::engine::store::StoredObject;
 use crate::engine::{ChangeKind, StateUpdate};
 use crate::handle::{Shared, Sim};
 use crate::model::account::{self, AccountMeta};
+use crate::stripe;
 use crate::{Configuration, ObjectType};
 
 /// Filters and cursor, carried inside the opaque page token.
@@ -138,13 +138,7 @@ fn live_version<'a>(view: &View<'a>, o: &'a StoredObject) -> Option<(&'a StateUp
 }
 
 fn no_such(id: &str) -> ApiError {
-    ApiError {
-        status: StatusCode::NOT_FOUND,
-        error_type: "not_found",
-        message: format!("No such account: '{id}'"),
-        code: Some("not_found"),
-        param: None,
-    }
+    ApiError::v2_not_found(format!("No such account: '{id}'"))
 }
 
 /// `GET /v2/core/accounts`.
@@ -225,9 +219,9 @@ pub(crate) async fn list_v2(
         .first()
         .filter(|first| !kept(0..**first).is_empty())
         .map(|first| page_url(&q, "before", entries[*first].0));
-    let data: Vec<Value> = page
+    let data: Vec<stripe::V2CoreAccount> = page
         .iter()
-        .map(|(u, meta, closed)| account::v2_view(&u.state, meta, *closed))
+        .map(|(u, meta, closed)| account::v2_view(&account::from_state(&u.state), meta, *closed))
         .collect();
     Ok(Json(json!({
         "data": data,
@@ -241,7 +235,7 @@ pub(crate) async fn retrieve_v2(
     State(shared): State<Arc<Shared>>,
     Extension(RequestScope(scope)): Extension<RequestScope>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<stripe::V2CoreAccount>, ApiError> {
     let mut sim = shared.lock();
     let at = stale_at(&mut sim);
     let view = View {
@@ -255,5 +249,9 @@ pub(crate) async fn retrieve_v2(
         .and_then(|o| live_version(&view, o))
         .ok_or_else(|| no_such(&id))?;
     let meta = view.engine.account_meta(&id).ok_or_else(|| no_such(&id))?;
-    Ok(Json(account::v2_view(&u.state, meta, closed)))
+    Ok(Json(account::v2_view(
+        &account::from_state(&u.state),
+        meta,
+        closed,
+    )))
 }

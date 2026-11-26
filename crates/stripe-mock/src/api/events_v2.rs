@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, RawQuery, State};
-use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -227,12 +226,6 @@ pub(crate) async fn retrieve(
         {
             Ok(Json(r.payload.clone()))
         }
-        _ => Err(ApiError {
-            status: StatusCode::NOT_FOUND,
-            error_type: "not_found",
-            message: format!("No such event: '{id}'"),
-            code: Some("not_found"),
-            param: None,
-        }),
+        _ => Err(ApiError::v2_not_found(format!("No such event: '{id}'"))),
     }
 }

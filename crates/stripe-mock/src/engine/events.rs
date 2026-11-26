@@ -1,13 +1,15 @@
 //! Event projection (spec section 8): each truth-log entry becomes one snapshot
 //! event and one thin event, with a hidden `visible_at`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 use crate::engine::{ChangeKind, Scope, StateUpdate};
 use crate::rng::{RngStreams, SimRng};
+use crate::stripe;
 use crate::{Config, EventsConfig, ObjectType, PINNED_API_VERSION, SimTime};
 
 /// Snapshot (v1) or thin (v2) event.
@@ -145,7 +147,7 @@ pub(crate) struct Projector {
     visibility: SimRng,
     shuffle: SimRng,
     /// The platform's application, the `data.object` of `account.application.*` events.
-    pub application: Option<Value>,
+    pub application: Option<stripe::Application>,
 }
 
 impl Projector {
@@ -207,26 +209,27 @@ impl Projector {
             format!("v1.{snapshot_type}")
         };
 
+        // `data.object` and `previous_attributes` are free-form in the schema, so they stay
+        // the stored JSON; the envelope around them is typed.
         let object = match (u.kind, previous) {
             _ if snapshot_type.starts_with("account.application.") => {
-                self.application.clone().unwrap_or(Value::Null)
+                let app = self
+                    .application
+                    .as_ref()
+                    .expect("account events need connect, which creates the application");
+                to_map(to_json(app))
             }
             // Ruling R2: the last live object, unchanged (no live schema has `deleted`).
-            (ChangeKind::Deleted, Some(prev)) => prev.clone(),
-            _ => u.state.clone(),
+            (ChangeKind::Deleted, Some(prev)) => to_map(prev.clone()),
+            _ => to_map(u.state.clone()),
         };
-        let mut data = Map::new();
-        data.insert("object".into(), object);
-        let mut changes = Value::Null;
-        if !matches!(u.kind, ChangeKind::Created | ChangeKind::Deleted)
-            && let Some(prev) = previous
-        {
-            data.insert(
-                "previous_attributes".into(),
-                previous_attributes(prev, &u.state),
-            );
-            changes = before_after(prev, &u.state);
-        }
+        let (previous_attributes, changes) = match previous {
+            Some(prev) if !matches!(u.kind, ChangeKind::Created | ChangeKind::Deleted) => (
+                Some(to_map(previous_attributes(prev, &u.state))),
+                Some(before_after(prev, &u.state)),
+            ),
+            _ => (None, None),
+        };
         // The one place an event's Connect label is assigned. An account's own events
         // are labelled with the account, except thin-only `v2.` events, which are
         // platform events. Every other event carries the scope it was recorded in.
@@ -235,47 +238,63 @@ impl Projector {
         } else {
             u.account.clone()
         };
-        let mut snapshot_payload = json!({
-            "id": snapshot_id,
-            "object": "event",
-            "api_version": PINNED_API_VERSION,
-            "created": u.at.unix_seconds(),
-            "data": Value::Object(data),
-            "livemode": false,
-            "pending_webhooks": 0,
-            "request": {"id": null, "idempotency_key": null},
-            "type": snapshot_type,
+        // Presence (ruling R1): `account` and `context` carry the Connect label and are
+        // absent for the platform's own events (neither is nullable). The mock's API is
+        // read-only, so no request causes an event: `request` has null `id` and
+        // `idempotency_key`.
+        let snapshot_payload = to_json(&stripe::Event {
+            account: account.clone(),
+            api_version: Some(Some(PINNED_API_VERSION.to_string())),
+            context: account.clone(),
+            created: u.at.unix_seconds(),
+            data: stripe::NotificationEventData {
+                object,
+                previous_attributes,
+            },
+            id: snapshot_id.clone(),
+            livemode: false,
+            object: stripe::EventObject::Event,
+            pending_webhooks: 0,
+            request: Some(Some(stripe::NotificationEventRequest {
+                id: Some(None),
+                idempotency_key: Some(None),
+            })),
+            type_: snapshot_type.clone(),
         });
-        if let Some(acct) = &account {
-            snapshot_payload["account"] = json!(acct);
-        }
         // Thin-only `v2.core.account.*` events point at the v2 account resource, which
         // still serves the account after it closes; the v1 URL would 404.
         let related = if thin_only && u.object_type == ObjectType::Account {
-            json!({
-                "id": u.object_id,
-                "type": "v2.core.account",
-                "url": format!("/v2/core/accounts/{}", u.object_id),
-            })
+            stripe::V2CoreEventRelatedObject {
+                id: Some(u.object_id.clone()),
+                type_: "v2.core.account".to_string(),
+                url: format!("/v2/core/accounts/{}", u.object_id),
+            }
         } else {
-            json!({
-                "id": u.object_id,
-                "type": name,
-                "url": u.object_type.api_path(&u.object_id),
-            })
+            stripe::V2CoreEventRelatedObject {
+                id: Some(u.object_id.clone()),
+                type_: name.to_string(),
+                url: u.object_type.api_path(&u.object_id).unwrap_or_else(|| {
+                    panic!("{} has no API path, so it cannot announce events", name)
+                }),
+            }
         };
-        let thin_payload = json!({
-            "id": thin_id,
-            "object": "v2.core.event",
-            "type": thin_type,
-            "created": u.at.to_string(),
-            "livemode": false,
-            "context": account,
-            "reason": null,
-            "related_object": related,
-            "snapshot_event": (!thin_only).then_some(&snapshot_id),
-            "changes": changes,
-            "data": null,
+        // Presence: none of `context`, `reason`, `snapshot_event`, `changes` and `data` is
+        // nullable, so each is absent when the mock has no value: `context` for the
+        // platform, `reason` always (no request causes an event), `snapshot_event` for a
+        // thin-only event, `changes` for a create or delete, and `data` always (v1 thin
+        // events carry no extra data).
+        let thin_payload = to_json(&stripe::V2CoreEvent {
+            changes,
+            context: account.clone(),
+            created: u.at.to_string(),
+            data: None,
+            id: thin_id.clone(),
+            livemode: false,
+            object: stripe::V2CoreEventObject::V2CoreEvent,
+            reason: None,
+            related_object: Some(related),
+            snapshot_event: (!thin_only).then(|| snapshot_id.clone()),
+            type_: thin_type.clone(),
         });
         let record = |id: &str, pair: &str, format, event_type: String, payload| EventRecord {
             id: id.to_string(),
@@ -361,15 +380,44 @@ fn before_after(old: &Value, new: &Value) -> Value {
     json!({"before": before, "after": after})
 }
 
+fn to_json(v: &impl Serialize) -> Value {
+    serde_json::to_value(v).expect("an event serializes")
+}
+
+/// A JSON object as the map the generated free-form fields hold.
+fn to_map(v: Value) -> BTreeMap<String, Value> {
+    match v {
+        Value::Object(m) => m.into_iter().collect(),
+        other => panic!("an event's object is a JSON object, not {other}"),
+    }
+}
+
+/// A stored event payload as its generated type; a payload that does not deserialize is a
+/// bug in the mock.
+fn typed<T: DeserializeOwned>(payload: &Value) -> T {
+    serde_path_to_error::deserialize(payload).unwrap_or_else(|e| {
+        panic!(
+            "stored event is not a valid event at {}: {}",
+            e.path(),
+            e.inner()
+        )
+    })
+}
+
+/// A snapshot event as served or delivered: its stored payload with `pending_webhooks` now.
+pub(crate) fn with_pending_webhooks(payload: &Value, pending: usize) -> Value {
+    let mut e: stripe::Event = typed(payload);
+    e.pending_webhooks = pending as i64;
+    to_json(&e)
+}
+
 /// The thin event as delivered: the full event without `snapshot_event`, `changes` and `data`.
 pub(crate) fn thin_notification(full: &Value) -> Value {
-    let mut v = full.clone();
-    if let Some(m) = v.as_object_mut() {
-        m.remove("snapshot_event");
-        m.remove("changes");
-        m.remove("data");
-    }
-    v
+    let mut e: stripe::V2CoreEvent = typed(full);
+    e.snapshot_event = None;
+    e.changes = None;
+    e.data = None;
+    to_json(&e)
 }
 
 #[cfg(test)]
@@ -393,7 +441,7 @@ mod tests {
     fn every_mutation_yields_a_pair() {
         let mut e = engine_with("");
         let c = e.begin_action("t");
-        let u = e.create(
+        let u = e.create_raw(
             ObjectType::Customer,
             "cus_1".into(),
             cust("cus_1"),
@@ -425,7 +473,7 @@ mod tests {
     fn update_has_previous_attributes_and_changes() {
         let mut e = engine_with("");
         let c = e.begin_action("t");
-        e.create(
+        e.create_raw(
             ObjectType::Customer,
             "cus_1".into(),
             cust("cus_1"),
@@ -433,7 +481,7 @@ mod tests {
             &["customer.created"],
         );
         let u = e
-            .update(
+            .update_raw(
                 ObjectType::Customer,
                 "cus_1",
                 |v| {
@@ -460,7 +508,7 @@ mod tests {
     fn delete_event_carries_full_last_state() {
         let mut e = engine_with("");
         let c = e.begin_action("t");
-        e.create(
+        e.create_raw(
             ObjectType::Customer,
             "cus_1".into(),
             cust("cus_1"),
@@ -471,7 +519,7 @@ mod tests {
             .delete(
                 ObjectType::Customer,
                 "cus_1",
-                json!({"id": "cus_1", "object": "customer", "deleted": true}),
+                &json!({"id": "cus_1", "object": "customer", "deleted": true}),
                 c,
                 &["customer.deleted"],
             )
@@ -488,7 +536,7 @@ mod tests {
             "[events]\nvisibility_lag = { distribution = \"fixed\", ms = 5000 }\n[event_retention]\nwindow = \"1h\"",
         );
         let c = e.begin_action("t");
-        let u = e.create(
+        let u = e.create_raw(
             ObjectType::Customer,
             "cus_1".into(),
             cust("cus_1"),
@@ -505,20 +553,46 @@ mod tests {
 
     #[test]
     fn thin_notification_strips_full_fields() {
-        let n = thin_notification(
-            &json!({"id": "evt_test_1", "snapshot_event": "evt_1", "changes": null, "data": null, "type": "v1.customer.created"}),
+        let full = json!({
+            "id": "evt_test_1", "object": "v2.core.event", "type": "v1.customer.updated",
+            "created": "2026-01-01T00:00:00.000Z", "livemode": false,
+            "related_object": {"id": "cus_1", "type": "customer", "url": "/v1/customers/cus_1"},
+            "snapshot_event": "evt_1", "changes": {"before": {}, "after": {}}, "data": {},
+        });
+        let mut want = full.clone();
+        for k in ["snapshot_event", "changes", "data"] {
+            want.as_object_mut().unwrap().remove(k);
+        }
+        assert_eq!(thin_notification(&full), want);
+    }
+
+    #[test]
+    fn platform_events_omit_what_they_lack() {
+        let mut e = engine_with("");
+        let c = e.begin_action("t");
+        let u = e.create_raw(
+            ObjectType::Customer,
+            "cus_1".into(),
+            cust("cus_1"),
+            c,
+            &["customer.created"],
         );
-        assert_eq!(
-            n,
-            json!({"id": "evt_test_1", "type": "v1.customer.created"})
-        );
+        let t = &e.events().get(&u.events.thin[0]).unwrap().payload;
+        for absent in ["context", "reason", "changes", "data"] {
+            assert!(t.get(absent).is_none(), "{absent}");
+        }
+        let s = &e.events().get(&u.events.snapshot[0]).unwrap().payload;
+        for absent in ["account", "context"] {
+            assert!(s.get(absent).is_none(), "{absent}");
+        }
+        assert_eq!(with_pending_webhooks(s, 3)["pending_webhooks"], 3);
     }
 
     #[test]
     fn unannounced_mutation_has_no_events() {
         let mut e = engine_with("");
         let c = e.begin_action("t");
-        let u = e.create(
+        let u = e.create_raw(
             ObjectType::SubscriptionItem,
             "si_1".into(),
             json!({"id": "si_1", "object": "subscription_item", "created": 1767225600}),
@@ -533,7 +607,7 @@ mod tests {
     fn two_types_two_pairs() {
         let mut e = engine_with("");
         let c = e.begin_action("t");
-        e.create(
+        e.create_raw(
             ObjectType::Invoice,
             "in_x".into(),
             json!({"id": "in_x", "object": "invoice", "created": 1767225600, "status": "open"}),
@@ -541,7 +615,7 @@ mod tests {
             &["invoice.created"],
         );
         let u = e
-            .update(
+            .update_raw(
                 ObjectType::Invoice,
                 "in_x",
                 |v| v["status"] = json!("paid"),
@@ -573,7 +647,7 @@ mod tests {
     fn subscription_related_object() {
         let mut e = engine_with("");
         let c = e.begin_action("t");
-        let u = e.create(
+        let u = e.create_raw(
             ObjectType::Subscription,
             "sub_1".into(),
             json!({"id": "sub_1", "object": "subscription", "created": 1767225600}),

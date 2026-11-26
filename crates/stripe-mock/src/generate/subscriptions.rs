@@ -593,7 +593,7 @@ pub(crate) fn delete_customer_cascade(
     engine.delete(
         ObjectType::Customer,
         id,
-        deleted_stub(id),
+        &deleted_stub(id),
         cause.clone(),
         &["customer.deleted"],
     )?;

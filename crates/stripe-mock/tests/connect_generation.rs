@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Receiver, dest, get_as, get_ctx, mock_with};
+use common::{Receiver, dest, get, get_as, get_ctx, mock_with};
 use ductkit_stripe_mock::{
     AccountApi, Action, ChangeKind, CustomerUpdate, DeliveryRecordKind, EventFormat, EventInfo,
     MockError, MockStripe, NewCustomer, ObjectType, SimTime,
@@ -53,6 +53,7 @@ async fn connect_v1_emits_authorized() {
     let body = payload(get_as(&m, &format!("/v1/events/{}", snap.id), &id).await).await;
     assert_eq!(body["data"]["object"]["object"], "application");
     assert_eq!(body["account"], id.as_str());
+    assert_eq!(body["context"], id.as_str());
     let thin = evs.iter().find(|e| e.format == EventFormat::Thin).unwrap();
     let body = payload(get_ctx(&m, &format!("/v2/core/events/{}", thin.id), &id).await).await;
     assert_eq!(body["related_object"]["id"], id.as_str());
@@ -90,6 +91,11 @@ async fn connect_v2_also_emits_thin_created() {
         .unwrap();
     assert_eq!(created.account, None);
     assert_eq!(created.pair_id, "");
+    // Schema wins: none of these is nullable, so a platform thin-only event omits them.
+    let body = payload(get(&m, &format!("/v2/core/events/{}", created.id)).await).await;
+    for absent in ["context", "snapshot_event", "reason", "changes", "data"] {
+        assert!(body.get(absent).is_none(), "{absent}: {body}");
+    }
 }
 
 #[tokio::test]

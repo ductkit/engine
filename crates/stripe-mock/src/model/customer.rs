@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::rng::SimRng;
 use crate::stripe;
@@ -108,13 +107,12 @@ pub(crate) fn apply_update(c: &mut stripe::Customer, u: &CustomerUpdate) {
 }
 
 /// What Stripe returns for a deleted customer.
-pub(crate) fn deleted_stub(id: &str) -> Value {
-    serde_json::to_value(stripe::DeletedCustomer {
+pub(crate) fn deleted_stub(id: &str) -> stripe::DeletedCustomer {
+    stripe::DeletedCustomer {
         deleted: true,
         id: id.to_string(),
         object: stripe::DeletedCustomerObject::Customer,
-    })
-    .expect("a deleted customer serializes")
+    }
 }
 
 pub(crate) fn random_metadata_value(rng: &mut SimRng) -> String {
@@ -172,7 +170,7 @@ pub(crate) fn random_update(rng: &mut SimRng, c: &stripe::Customer) -> CustomerU
 mod tests {
     use super::*;
     use crate::rng::RngStreams;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn new_customer_fields() {
@@ -227,7 +225,7 @@ mod tests {
     #[test]
     fn stub() {
         assert_eq!(
-            deleted_stub("cus_1"),
+            serde_json::to_value(deleted_stub("cus_1")).unwrap(),
             json!({"id": "cus_1", "object": "customer", "deleted": true})
         );
     }

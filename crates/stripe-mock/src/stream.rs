@@ -149,19 +149,14 @@ impl Stream for Subscription {
 mod tests {
     use super::*;
     use crate::engine::Engine;
+    use crate::model::customer::{NewCustomer, new_customer};
     use crate::rng::RngStreams;
     use crate::{Config, SimTime};
-    use serde_json::json;
 
     fn make(e: &mut Engine, id: &str) {
         let c = e.begin_action("t");
-        e.create(
-            ObjectType::Customer,
-            id.into(),
-            json!({"id": id, "object": "customer", "created": 0, "email": null}),
-            c,
-            &[],
-        );
+        let customer = new_customer(id, 0, "ABCD1234", &NewCustomer::default());
+        e.create_obj(ObjectType::Customer, id.into(), &customer, c, &[]);
     }
 
     fn updates(s: &mut Subscription) -> Vec<StateUpdate> {

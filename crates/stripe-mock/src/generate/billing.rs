@@ -259,7 +259,7 @@ pub(crate) fn delete_draft(engine: &mut Engine, id: &str, cause: &Cause) -> bool
             .delete(
                 ObjectType::InvoiceLineItem,
                 &line,
-                deleted_line(&line),
+                &deleted_line(&line),
                 cause.clone(),
                 &[],
             )
@@ -269,7 +269,7 @@ pub(crate) fn delete_draft(engine: &mut Engine, id: &str, cause: &Cause) -> bool
         .delete(
             ObjectType::Invoice,
             id,
-            deleted_invoice(id),
+            &deleted_invoice(id),
             cause.clone(),
             &["invoice.deleted"],
         )

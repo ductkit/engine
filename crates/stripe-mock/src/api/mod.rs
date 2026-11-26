@@ -18,22 +18,35 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use serde_json::{Map, Value, json};
+use serde::Serialize;
 
 use crate::PINNED_API_VERSION;
 use crate::engine::{Engine, Scope};
 use crate::faults::api::Fault;
 use crate::handle::Shared;
+use crate::stripe;
 
 /// How long a `timeout` fault holds the response: Stripe's own request limit.
 const TIMEOUT_HOLD: Duration = Duration::from_secs(80);
+
+/// The `type` of an error: one of the v1 schema's types, or a v2 not-found error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorType {
+    V1(stripe::ApiErrorsType),
+    /// `/v2/` retrieve of an unknown ID: `{"error": {"type": "not_found", "code":
+    /// "not_found", "message"}}`, the pinned `v2.error` shape. No generated type covers v2
+    /// errors (the allowlist has only `error`), so this one envelope is hand-built.
+    V2NotFound,
+}
+
+const INVALID_REQUEST: ErrorType = ErrorType::V1(stripe::ApiErrorsType::InvalidRequestError);
 
 /// A Stripe-style error response.
 #[derive(Debug, Clone)]
 pub(crate) struct ApiError {
     pub status: StatusCode,
-    /// `invalid_request_error` except for v2 not-found errors.
-    pub error_type: &'static str,
+    /// `invalid_request_error` except for server faults and v2 not-found errors.
+    pub error_type: ErrorType,
     pub message: String,
     pub code: Option<&'static str>,
     pub param: Option<String>,
@@ -43,7 +56,7 @@ impl ApiError {
     pub(crate) fn not_found(message: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::NOT_FOUND,
-            error_type: "invalid_request_error",
+            error_type: INVALID_REQUEST,
             message: message.into(),
             code: None,
             param: None,
@@ -57,7 +70,7 @@ impl ApiError {
     ) -> Self {
         ApiError {
             status: StatusCode::BAD_REQUEST,
-            error_type: "invalid_request_error",
+            error_type: INVALID_REQUEST,
             message: message.into(),
             code,
             param: param.map(str::to_string),
@@ -68,7 +81,7 @@ impl ApiError {
     pub(crate) fn account_invalid(acct: &str) -> Self {
         ApiError {
             status: StatusCode::FORBIDDEN,
-            error_type: "invalid_request_error",
+            error_type: INVALID_REQUEST,
             message: format!(
                 "The provided key does not have access to account '{acct}' (or that account does not exist). Application access may have been revoked."
             ),
@@ -80,30 +93,74 @@ impl ApiError {
     fn unauthorized() -> Self {
         ApiError {
             status: StatusCode::UNAUTHORIZED,
-            error_type: "invalid_request_error",
+            error_type: INVALID_REQUEST,
             message: "Invalid API Key provided.".to_string(),
             code: None,
             param: None,
         }
     }
+
+    /// A v2 retrieve of an unknown ID.
+    pub(crate) fn v2_not_found(message: impl Into<String>) -> Self {
+        ApiError {
+            status: StatusCode::NOT_FOUND,
+            error_type: ErrorType::V2NotFound,
+            message: message.into(),
+            code: Some("not_found"),
+            param: None,
+        }
+    }
+}
+
+/// The v2 not-found envelope (see [`ErrorType::V2NotFound`]).
+#[derive(Serialize)]
+struct V2Error {
+    error: V2ErrorDetail,
+}
+
+#[derive(Serialize)]
+struct V2ErrorDetail {
+    #[serde(rename = "type")]
+    type_: &'static str,
+    code: &'static str,
+    message: String,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let mut error = Map::new();
-        error.insert("type".into(), json!(self.error_type));
-        error.insert("message".into(), json!(self.message));
-        if let Some(code) = self.code {
-            error.insert("code".into(), json!(code));
-        }
-        if let Some(param) = self.param {
-            error.insert("param".into(), json!(param));
-        }
-        (
-            self.status,
-            axum::Json(json!({ "error": Value::Object(error) })),
-        )
-            .into_response()
+        let ErrorType::V1(type_) = self.error_type else {
+            let body = V2Error {
+                error: V2ErrorDetail {
+                    type_: "not_found",
+                    code: self.code.unwrap_or("not_found"),
+                    message: self.message,
+                },
+            };
+            return (self.status, axum::Json(body)).into_response();
+        };
+        // Presence: only what the mock knows. The card, payment and request-log fields
+        // describe a failed payment or a dashboard log the mock never has.
+        let body = stripe::Error {
+            error: stripe::ApiErrors {
+                advice_code: None,
+                charge: None,
+                code: self.code.map(str::to_string),
+                decline_code: None,
+                doc_url: None,
+                message: Some(self.message),
+                network_advice_code: None,
+                network_decline_code: None,
+                param: self.param,
+                payment_intent: None,
+                payment_method: None,
+                payment_method_type: None,
+                request_log_url: None,
+                setup_intent: None,
+                source: None,
+                type_,
+            },
+        };
+        (self.status, axum::Json(body)).into_response()
     }
 }
 
@@ -211,19 +268,19 @@ fn fault_response(fault: Fault) -> Response {
     match fault {
         Fault::RateLimited => retryable(
             StatusCode::TOO_MANY_REQUESTS,
-            "invalid_request_error",
+            INVALID_REQUEST,
             Some("rate_limit"),
             "Too many requests hit the API too quickly. We recommend an exponential backoff of your requests.",
         ),
         Fault::ServerError => retryable(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
+            ErrorType::V1(stripe::ApiErrorsType::ApiError),
             None,
             "An unknown error occurred.",
         ),
         Fault::Unavailable => retryable(
             StatusCode::SERVICE_UNAVAILABLE,
-            "api_error",
+            ErrorType::V1(stripe::ApiErrorsType::ApiError),
             None,
             "The server is temporarily unavailable. Please retry.",
         ),

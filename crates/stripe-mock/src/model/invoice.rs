@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
-use serde_json::Value;
 
 use crate::model::embedded::embedded_list;
 use crate::model::subscription::self_issuer;
@@ -139,28 +138,26 @@ pub(crate) fn new_line(l: &NewLine) -> stripe::LineItem {
 /// (line items have no retrieve endpoint, so Stripe never serves one); this is the
 /// `{deleted, id, object}` shape every `deleted_*` schema has.
 #[derive(Serialize)]
-struct DeletedLineItem<'a> {
+pub(crate) struct DeletedLineItem {
     deleted: bool,
-    id: &'a str,
+    id: String,
     object: stripe::LineItemObject,
 }
 
-pub(crate) fn deleted_line(id: &str) -> Value {
-    serde_json::to_value(DeletedLineItem {
+pub(crate) fn deleted_line(id: &str) -> DeletedLineItem {
+    DeletedLineItem {
         deleted: true,
-        id,
+        id: id.to_string(),
         object: stripe::LineItemObject::LineItem,
-    })
-    .expect("a deleted line item serializes")
+    }
 }
 
-pub(crate) fn deleted_invoice(id: &str) -> Value {
-    serde_json::to_value(stripe::DeletedInvoice {
+pub(crate) fn deleted_invoice(id: &str) -> stripe::DeletedInvoice {
+    stripe::DeletedInvoice {
         deleted: true,
         id: id.to_string(),
         object: stripe::DeletedInvoiceObject::Invoice,
-    })
-    .expect("a deleted invoice serializes")
+    }
 }
 
 /// Inputs for a draft invoice.
@@ -384,11 +381,11 @@ mod tests {
     #[test]
     fn tombstones_have_the_deleted_shape() {
         assert_eq!(
-            deleted_line("il_1"),
+            serde_json::to_value(deleted_line("il_1")).unwrap(),
             serde_json::json!({"id": "il_1", "object": "line_item", "deleted": true})
         );
         assert_eq!(
-            deleted_invoice("in_1"),
+            serde_json::to_value(deleted_invoice("in_1")).unwrap(),
             serde_json::json!({"id": "in_1", "object": "invoice", "deleted": true})
         );
     }

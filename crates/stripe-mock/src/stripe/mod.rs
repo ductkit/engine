@@ -18,17 +18,72 @@ pub use expandable::{Expandable, HasId};
 pub use generated::*;
 pub use list::{List, ListObject};
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 /// A conformance check for one generated type.
 type Check = fn(&Value) -> Result<(), String>;
 
-/// Deserializes `v` into `T`, unknown fields denied; the error names the failing path.
-fn check<T: DeserializeOwned>(v: &Value) -> Result<(), String> {
-    serde_path_to_error::deserialize::<_, T>(v)
-        .map(drop)
-        .map_err(|e| format!("{}: {}", e.path(), e.inner()))
+/// Deserializes `v` into `T`, unknown fields denied, then serializes it back and compares:
+/// what deserializes but does not round-trip (such as `null` in a field that is optional but
+/// not nullable, which serde reads as absent) is an error too. The error names the path.
+fn check<T: DeserializeOwned + Serialize>(v: &Value) -> Result<(), String> {
+    let typed: T =
+        serde_path_to_error::deserialize(v).map_err(|e| format!("{}: {}", e.path(), e.inner()))?;
+    let back = serde_json::to_value(&typed).map_err(|e| format!(".: does not serialize: {e}"))?;
+    match round_trip_diff(v, &back, "") {
+        None => Ok(()),
+        Some((path, message)) => Err(format!(
+            "{}: {message}",
+            if path.is_empty() { "." } else { &path }
+        )),
+    }
+}
+
+fn child_path(base: &str, key: &str) -> String {
+    if base.is_empty() {
+        key.to_string()
+    } else {
+        format!("{base}.{key}")
+    }
+}
+
+/// The first place where the served `sent` and its round trip `back` differ. Numbers compare
+/// by value, so `1` and `1.0` are equal.
+fn round_trip_diff(sent: &Value, back: &Value, path: &str) -> Option<(String, String)> {
+    match (sent, back) {
+        (Value::Object(s), Value::Object(b)) => {
+            for (k, sv) in s {
+                let p = child_path(path, k);
+                match b.get(k) {
+                    None if sv.is_null() => {
+                        return Some((p, "`null` is not allowed here (not nullable)".into()));
+                    }
+                    None => return Some((p, "lost on the round trip through the type".into())),
+                    Some(bv) => {
+                        if let Some(d) = round_trip_diff(sv, bv, &p) {
+                            return Some(d);
+                        }
+                    }
+                }
+            }
+            b.keys()
+                .find(|k| !s.contains_key(*k))
+                .map(|k| (child_path(path, k), "added by the round trip".into()))
+        }
+        (Value::Array(s), Value::Array(b)) if s.len() == b.len() => s
+            .iter()
+            .zip(b)
+            .enumerate()
+            .find_map(|(i, (sv, bv))| round_trip_diff(sv, bv, &format!("{path}[{i}]"))),
+        (Value::Number(s), Value::Number(b)) if s.as_f64() == b.as_f64() => None,
+        _ if sent == back => None,
+        _ => Some((
+            path.to_string(),
+            format!("`{sent}` round-trips as `{back}`"),
+        )),
+    }
 }
 
 /// Checks `v` against the schemas that share its `object` value (`customer` and

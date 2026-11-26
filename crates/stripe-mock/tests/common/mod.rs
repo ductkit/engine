@@ -15,18 +15,6 @@ pub async fn mock_with(toml: &str) -> MockStripe {
     MockStripe::start(config).await.expect("mock starts")
 }
 
-/// `object` values whose payloads `get` and friends check against the pinned schema. Each
-/// task that types an object adds its value here.
-pub const CONFORMANCE_CHECKED: &[&str] = &[
-    "customer",
-    "product",
-    "price",
-    "subscription",
-    "subscription_item",
-    "invoice",
-    "line_item",
-];
-
 /// Panics unless `v` conforms to the pinned Stripe schema.
 pub fn assert_conforms(v: &Value) {
     if let Err(e) = ductkit_stripe_mock::stripe::check_payload(v) {
@@ -34,29 +22,6 @@ pub fn assert_conforms(v: &Value) {
             "payload does not conform: {e}
 {v:#}"
         );
-    }
-}
-
-/// Checks every object in `v` whose `object` is in [`CONFORMANCE_CHECKED`], recursing into
-/// lists (`data`) and events (`data.object`).
-fn check_checked(v: &Value) {
-    let object = v.get("object").and_then(Value::as_str);
-    let is_list = object == Some("list")
-        || (v.get("next_page_url").is_some() && v.get("data").is_some_and(Value::is_array));
-    if is_list {
-        for item in v["data"].as_array().into_iter().flatten() {
-            check_checked(item);
-        }
-        return;
-    }
-    match object {
-        Some(o) if CONFORMANCE_CHECKED.contains(&o) => assert_conforms(v),
-        Some("event") => {
-            if let Some(obj) = v.pointer("/data/object") {
-                check_checked(obj);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -69,7 +34,7 @@ async fn checked(resp: reqwest::Response) -> reqwest::Response {
     if status.is_success()
         && let Ok(v) = serde_json::from_slice::<Value>(&body)
     {
-        check_checked(&v);
+        assert_conforms(&v);
     }
     let mut rebuilt = axum::http::Response::new(body);
     *rebuilt.status_mut() = status;

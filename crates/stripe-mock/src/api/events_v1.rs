@@ -10,7 +10,7 @@ use crate::api::list::decode;
 use crate::api::list::{paginate, parse_list_params};
 use crate::api::{ApiError, RequestScope, ensure_connected};
 use crate::engine::Engine;
-use crate::engine::events::{EventFormat, EventRecord};
+use crate::engine::events::{EventFormat, EventRecord, with_pending_webhooks};
 use crate::handle::Shared;
 
 /// `pattern` matches `event_type` exactly, as `*`, or as a `prefix.*` wildcard.
@@ -23,9 +23,7 @@ pub(crate) fn type_matches(pattern: &str, event_type: &str) -> bool {
 
 /// The served form of a snapshot event: its payload with the current `pending_webhooks`.
 pub(crate) fn served(engine: &Engine, r: &EventRecord) -> Value {
-    let mut v = r.payload.clone();
-    v["pending_webhooks"] = json!(engine.pending_webhooks(&r.id));
-    v
+    with_pending_webhooks(&r.payload, engine.pending_webhooks(&r.id))
 }
 
 fn missing_cursor(param: &str, id: &str) -> ApiError {

@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::delivery::{
     AbandonReason, AttemptOutcome, Deliveries, DeliveryRecord, Destinations, PreparedAttempt,
@@ -16,6 +16,7 @@ use crate::delivery::{
 use crate::model::account::{self, AccountContent, AccountMeta};
 use crate::rng::{RngStreams, SimRng};
 use crate::stream::{self, SubscribeFilter, SubscribeOptions, Subscriber, Subscription};
+use crate::stripe;
 use crate::{AccountApi, AccountKind, Config, Configuration, MockError, ObjectType, SimTime};
 
 pub(crate) use events::{EventStore, Projector};
@@ -101,11 +102,7 @@ impl Engine {
     pub(crate) fn new(start: SimTime, config: &Config, streams: &RngStreams) -> Self {
         // The platform application, present when `accounts.connect` is on.
         let application = config.accounts.connect.then(|| {
-            json!({
-                "id": streams.stream("platform.application").id("ca"),
-                "object": "application",
-                "name": "Ductkit Mock Platform",
-            })
+            account::platform_application(streams.stream("platform.application").id("ca"))
         });
         let mut projector = Projector::new(config, streams);
         projector.application = application;
@@ -155,14 +152,14 @@ impl Engine {
         content: AccountContent,
     ) -> String {
         let id = self.account_ids.id(ObjectType::Account.id_prefix());
-        let state = account::v1_state(&id, kind, self.now.unix_seconds(), &content);
+        let acct = account::v1_account(&id, kind, self.now.unix_seconds(), &content);
         let events: &[&str] = match api {
             AccountApi::V1 => &["account.application.authorized"],
             AccountApi::V2 => &["account.application.authorized", "v2.core.account.created"],
         };
         let cause = self.begin_action("connect_account");
         self.in_scope(None, |e| {
-            e.create(ObjectType::Account, id.clone(), state, cause, events);
+            e.create_obj(ObjectType::Account, id.clone(), &acct, cause, events);
         });
         self.accounts.push(AccountMeta {
             id: id.clone(),
@@ -182,10 +179,10 @@ impl Engine {
             AccountApi::V1 => &["account.application.deauthorized"],
             AccountApi::V2 => &["account.application.deauthorized", "v2.core.account.closed"],
         };
-        let tombstone = json!({"id": id, "object": "account", "deleted": true});
+        let tombstone = account::deleted_account(id);
         let cause = self.begin_action("disconnect_account");
         self.in_scope(None, |e| {
-            e.delete(ObjectType::Account, id, tombstone, cause, events)
+            e.delete(ObjectType::Account, id, &tombstone, cause, events)
         })?;
         if let Some(meta) = self.accounts.iter_mut().find(|a| a.id == id) {
             meta.connected = false;
@@ -206,10 +203,10 @@ impl Engine {
         };
         let cause = self.begin_action("account_update");
         self.in_scope(None, |e| {
-            e.update(
+            e.update_obj(
                 ObjectType::Account,
                 id,
-                |s| account::apply_content(s, &content),
+                |a: &mut stripe::Account| account::apply_content(a, &content),
                 cause,
                 ChangeKind::Updated,
                 events,
@@ -389,8 +386,10 @@ impl Engine {
         }
     }
 
-    /// Creates an object, announcing `events` (snapshot event types; may be empty).
-    pub(crate) fn create(
+    /// Creates an object from raw JSON, announcing `events` (snapshot event types; may be
+    /// empty). Private to `engine`: everything else writes through
+    /// [`create_obj`](Self::create_obj), so only generated types reach the store.
+    fn create_raw(
         &mut self,
         t: ObjectType,
         id: String,
@@ -406,10 +405,11 @@ impl Engine {
         update
     }
 
-    /// Applies `f` to the object's state; records nothing if the state is unchanged.
-    /// `kind` is `Updated`, `Archived` or `StateChanged`.
+    /// Applies `f` to the object's raw state; records nothing if the state is unchanged.
+    /// `kind` is `Updated`, `Archived` or `StateChanged`. Private to `engine`: everything else
+    /// writes through [`update_obj`](Self::update_obj).
     #[allow(clippy::too_many_arguments)] // every argument is part of the entry
-    pub(crate) fn update(
+    fn update_raw(
         &mut self,
         t: ObjectType,
         id: &str,
@@ -446,7 +446,8 @@ impl Engine {
         Ok(Some(update))
     }
 
-    /// [`create`](Self::create) for a typed object: the generated struct is the only way in.
+    /// Creates a typed object, announcing `events` (snapshot event types; may be empty): the
+    /// generated struct is the only way in.
     pub(crate) fn create_obj<T: Serialize>(
         &mut self,
         t: ObjectType,
@@ -457,11 +458,12 @@ impl Engine {
     ) -> StateUpdate {
         let state = serde_json::to_value(obj)
             .unwrap_or_else(|e| panic!("{t:?} {id}: object does not serialize: {e}"));
-        self.create(t, id, state, cause, events)
+        self.create_raw(t, id, state, cause, events)
     }
 
-    /// [`update`](Self::update) through the typed object: the latest state is deserialized
-    /// into `T`, `f` changes it, and the result is stored. A state that does not deserialize
+    /// Updates through the typed object: the latest state is deserialized into `T`, `f`
+    /// changes it, and the result is stored; records nothing if the state is unchanged.
+    /// `kind` is `Updated`, `Archived` or `StateChanged`. A state that does not deserialize
     /// is a bug in the mock, so it panics with the type, the ID and the path.
     #[allow(clippy::too_many_arguments)] // every argument is part of the entry
     pub(crate) fn update_obj<T: Serialize + DeserializeOwned>(
@@ -473,7 +475,7 @@ impl Engine {
         kind: ChangeKind,
         events: &[&str],
     ) -> Result<Option<StateUpdate>, MockError> {
-        self.update(
+        self.update_raw(
             t,
             id,
             |state| {
@@ -509,14 +511,18 @@ impl Engine {
         )
     }
 
+    /// Deletes an object; `tombstone` (a generated `Deleted*` struct, or the `{deleted, id,
+    /// object}` shape where the schema has none) becomes its last state.
     pub(crate) fn delete(
         &mut self,
         t: ObjectType,
         id: &str,
-        tombstone: Value,
+        tombstone: &impl Serialize,
         cause: Cause,
         events: &[&str],
     ) -> Result<StateUpdate, MockError> {
+        let tombstone = serde_json::to_value(tombstone)
+            .unwrap_or_else(|e| panic!("{t:?} {id}: tombstone does not serialize: {e}"));
         let latest = self.live(t, id)?;
         let version = latest.version + 1;
         let previous = latest.state.clone();
@@ -792,7 +798,7 @@ mod tests {
         let mut e = test_engine();
         let c = e.begin_action("t");
         e.set_now(SimTime(1_000));
-        e.create(
+        e.create_raw(
             ObjectType::Customer,
             "cus_a".into(),
             cust("cus_a", 1),
@@ -801,7 +807,7 @@ mod tests {
         );
         for (t, name) in [(11_000, "two"), (21_000, "three")] {
             e.set_now(SimTime(t));
-            e.update(
+            e.update_raw(
                 ObjectType::Customer,
                 "cus_a",
                 |v| v["name"] = json!(name),
@@ -830,7 +836,7 @@ mod tests {
     fn seq_and_versions() {
         let mut e = test_engine();
         let c = e.begin_action("t");
-        let a = e.create(
+        let a = e.create_raw(
             ObjectType::Customer,
             "cus_a".into(),
             cust("cus_a", 0),
@@ -838,7 +844,7 @@ mod tests {
             &["customer.created"],
         );
         let b = e
-            .update(
+            .update_raw(
                 ObjectType::Customer,
                 "cus_a",
                 |v| v["email"] = json!("x@example.com"),
@@ -852,7 +858,7 @@ mod tests {
             .delete(
                 ObjectType::Customer,
                 "cus_a",
-                json!({"id": "cus_a", "object": "customer", "deleted": true}),
+                &json!({"id": "cus_a", "object": "customer", "deleted": true}),
                 c,
                 &["customer.deleted"],
             )
@@ -881,7 +887,7 @@ mod tests {
     fn noop_update_records_nothing() {
         let mut e = test_engine();
         let c = e.begin_action("t");
-        e.create(
+        e.create_raw(
             ObjectType::Customer,
             "cus_a".into(),
             cust("cus_a", 0),
@@ -889,7 +895,7 @@ mod tests {
             &["customer.created"],
         );
         assert_eq!(
-            e.update(
+            e.update_raw(
                 ObjectType::Customer,
                 "cus_a",
                 |_| {},
@@ -908,7 +914,7 @@ mod tests {
         let mut e = test_engine();
         let c = e.begin_action("t");
         assert!(matches!(
-            e.update(
+            e.update_raw(
                 ObjectType::Customer,
                 "cus_x",
                 |_| {},
@@ -918,7 +924,7 @@ mod tests {
             ),
             Err(MockError::NoSuchObject { .. })
         ));
-        e.create(
+        e.create_raw(
             ObjectType::Customer,
             "cus_a".into(),
             cust("cus_a", 0),
@@ -928,7 +934,7 @@ mod tests {
         e.delete(
             ObjectType::Customer,
             "cus_a",
-            json!({}),
+            &json!({}),
             c.clone(),
             &["customer.deleted"],
         )
@@ -937,7 +943,7 @@ mod tests {
             e.delete(
                 ObjectType::Customer,
                 "cus_a",
-                json!({}),
+                &json!({}),
                 c,
                 &["customer.deleted"]
             ),
@@ -952,7 +958,7 @@ mod tests {
         let c = e.begin_action("t");
         // `created` never decreases in creation order (it is always "now").
         for (id, t) in [("cus_1", 5), ("cus_2", 5), ("cus_3", 6)] {
-            e.create(
+            e.create_raw(
                 ObjectType::Customer,
                 id.into(),
                 cust(id, t),
@@ -971,7 +977,7 @@ mod tests {
 
     fn make_customer(e: &mut Engine, id: &str) {
         let c = e.begin_action("t");
-        e.create(
+        e.create_raw(
             ObjectType::Customer,
             id.into(),
             cust(id, 0),
