@@ -617,18 +617,19 @@ impl Generator {
                 ActionKind::CancelSubscription,
             ],
             ObjectType::Invoice => &[ActionKind::OneOffInvoice, ActionKind::InvoiceUpdate],
-            ObjectType::SubscriptionItem
-            | ObjectType::InvoiceLineItem
-            | ObjectType::Account
-            | ObjectType::PaymentIntent
-            | ObjectType::Charge
-            | ObjectType::Refund
-            | ObjectType::Dispute
-            | ObjectType::BalanceTransaction
+            ObjectType::PaymentIntent | ObjectType::Charge | ObjectType::BalanceTransaction => {
+                &[ActionKind::OneOffPayment, ActionKind::Refund]
+            }
+            ObjectType::Refund => &[ActionKind::Refund],
+            ObjectType::InvoicePayment => &[ActionKind::OneOffInvoice],
+            ObjectType::SubscriptionItem | ObjectType::InvoiceLineItem | ObjectType::Account => {
+                return;
+            }
+            // No action creates these yet; tasks 11 and 12 add theirs.
+            ObjectType::Dispute
             | ObjectType::PaymentMethod
             | ObjectType::SetupIntent
-            | ObjectType::CheckoutSession
-            | ObjectType::InvoicePayment => {
+            | ObjectType::CheckoutSession => {
                 return;
             }
         };

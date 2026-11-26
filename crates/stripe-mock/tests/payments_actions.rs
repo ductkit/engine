@@ -419,3 +419,52 @@ async fn control_ops_run_payment_actions_and_replay() {
         m.get(ObjectType::Charge, &charge).unwrap().state
     );
 }
+
+#[tokio::test]
+async fn connected_refund_stays_in_scope() {
+    let m = mock_with("[accounts]\nconnect = true\n").await;
+    let acct = m
+        .connect_account(ductkit_stripe_mock::AccountApi::V1)
+        .unwrap();
+    let a = m.account(&acct);
+    let cause = a
+        .run_action(Action::OneOffPayment {
+            customer: None,
+            amount: Some(1000),
+            succeed: Some(true),
+        })
+        .unwrap();
+    let ch = only_id(&caused(&m, &cause), ObjectType::Charge);
+    let cause = a
+        .run_action(Action::Refund {
+            charge: Some(ch.clone()),
+            amount: Some(400),
+        })
+        .unwrap();
+    let mine = caused(&m, &cause);
+    assert!(mine.iter().all(|u| u.account.as_deref() == Some(&*acct)));
+    let re = only_id(&mine, ObjectType::Refund);
+    let txn = only_id(&mine, ObjectType::BalanceTransaction);
+    for path in [
+        format!("/v1/refunds/{re}"),
+        format!("/v1/balance_transactions/{txn}"),
+    ] {
+        let r = common::get_as(&m, &path, &acct).await;
+        assert_eq!(r.status(), 200, "{path}");
+        let r = get(&m, &path).await;
+        assert_eq!(r.status(), 404, "{path} leaked to the platform");
+    }
+    let r = common::get_as(&m, &format!("/v1/charges/{ch}"), &acct).await;
+    let charge: Value = r.json().await.unwrap();
+    assert_eq!(charge["amount_refunded"], 400);
+    assert!(m.get(ObjectType::Refund, &re).is_none());
+    let ids = [re.as_str(), ch.as_str()];
+    let events: Vec<_> = m
+        .event_timeline()
+        .into_iter()
+        .filter(|e| matches!(e.event_type.as_str(), "refund.created" | "charge.refunded"))
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|e| ids.contains(&e.object_id.as_str())));
+    assert!(events.iter().all(|e| e.account.as_deref() == Some(&*acct)));
+}

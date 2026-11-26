@@ -99,3 +99,35 @@ async fn pagination_writes_are_deterministic() {
     }
     assert_eq!(logs[0], logs[1]);
 }
+
+#[tokio::test]
+async fn writes_fire_on_payment_lists() {
+    let m = mock_with(WRITES).await;
+    for amount in [500, 600, 700, 800, 900] {
+        m.run_action(Action::OneOffPayment {
+            customer: None,
+            amount: Some(amount),
+            succeed: Some(true),
+        })
+        .unwrap();
+    }
+    let first = page(&m, "/v1/charges?limit=2").await;
+    let id = first["data"][1]["id"].as_str().unwrap().to_string();
+    let before = m.truth_log().len();
+    page(&m, &format!("/v1/charges?limit=2&starting_after={id}")).await;
+    let log = m.truth_log();
+    assert!(log.len() > before, "the later page follows a write");
+    let fresh = &log[before..];
+    assert!(
+        fresh.iter().all(|u| matches!(
+            u.cause.as_ref().map(|c| c.action.as_str()),
+            Some("one_off_payment" | "refund")
+        )),
+        "{fresh:?}"
+    );
+    assert!(
+        fresh
+            .iter()
+            .any(|u| matches!(u.object_type, ObjectType::Charge | ObjectType::Refund))
+    );
+}
