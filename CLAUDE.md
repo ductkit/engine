@@ -14,7 +14,7 @@ Packages are prefixed `ductkit-` because bare `core` clashes with Rust's built-i
 
 ## Design docs
 
-Specs live in `docs/`. The Stripe mock test fixture (planned crate `crates/stripe-mock`) is specified in `docs/stripe-mock-spec.md`; read it before working on the mock or on sync tests.
+Specs live in `docs/`. The Stripe mock test fixture (crate `crates/stripe-mock`) is specified in `docs/stripe-mock-spec.md`; read it before working on the mock or on sync tests.
 
 ## Commands
 
@@ -23,6 +23,12 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+```
+
+Regenerate the Stripe types in `crates/stripe-mock/src/stripe/generated/` from the vendored OpenAPI spec (`crates/stripe-mock/openapi/spec3.json`):
+
+```sh
+DUCTKIT_REGEN=1 cargo test -p ductkit-stripe-mock --test openapi_codegen
 ```
 
 Run the standalone Stripe mock (flags and control API: `docs/stripe-mock-spec.md` sections 3 and 11):

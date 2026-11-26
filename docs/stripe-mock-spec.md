@@ -264,7 +264,21 @@ Chosen to cover each deletion style and the main relationship shapes:
 
 Connected accounts themselves are covered in section 5.4.
 
-Later phases add payments, Connect money movement and billing extras (section 5.5).
+Phase 7 adds the payments core (behavior in sections 4, 5.5 and 6.1):
+
+| Type | ID prefix | Delete style | Notable relations |
+|------|-----------|--------------|-------------------|
+| `payment_intent` | `pi_` | State: `canceled` (an invoice voided or marked uncollectible after a failed attempt) | customer, payment_method, latest_charge |
+| `charge` | `ch_` | None; `refunded` and `disputed` flags | payment_intent, customer, balance_transaction; embedded list `refunds` |
+| `refund` | `re_` | None (refunds succeed at once) | charge, payment_intent, balance_transaction; embedded in `charge.refunds` |
+| `dispute` | `du_` | Closed statuses: `won`, `lost`, `warning_closed` | charge, payment_intent, balance_transactions |
+| `balance_transaction` | `txn_` | None; `pending → available` at `available_on`, no event | source (charge, refund or dispute) |
+| `payment_method` | `pm_` | Detach (`customer: null`, stays retrievable, leaves the customer's lists) | customer |
+| `setup_intent` | `seti_` | None (`succeeded`, or `requires_payment_method` after a decline) | customer, payment_method |
+| `checkout.session` | `cs_test_` | State: `expired` | customer; payment_intent, or subscription and invoice |
+| `invoice_payment` | `inpay_` | State: `canceled` (its invoice voided or marked uncollectible) | invoice, payment.payment_intent; embedded in `invoice.payments` |
+
+Later phases add Connect money movement and billing extras (section 5.5).
 
 ### 5.2 Lifecycle state machines
 
@@ -291,7 +305,7 @@ The mock models connected accounts created through **both** Accounts APIs, in th
 - **v2 accounts** (`/v2/core/accounts`): modelled with Accounts v2 configurations. Each of `merchant`, `customer` and `recipient` is applied with probability 0.5; an empty draw is rerolled to `["merchant"]`. They emit the thin `v2.core.account.created`, `.updated` and `.closed` events (platform scope, so no `context`, and no snapshot pair). They **also** emit the v1 events of the table below, including the v1 `account.updated` snapshot event, so a v1 consumer sees them too.
 - Both kinds use `acct_` IDs and are addressed with `Stripe-Account` (v1 endpoints) or `Stripe-Context` (v1 and v2 endpoints); see section 7.1.
 - **Both APIs read both kinds of account.** A v2-created account appears in `/v1/accounts` in the v1 shape with `type: "none"`; a v1-created account appears in `/v2/core/accounts` with `applied_configurations: ["merchant"]`. Sources: Stripe's Accounts v2 and Connect webhooks documentation (section 18).
-- **Shapes follow the pinned schema** (generated types, section 14). Every v1 account carries a `controller`: just `type: "account"` for Standard (the schema leaves `is_controller` and `requirement_collection` out when the platform does not control the account), and `type: "application"` with `is_controller: true` and its fee, loss, requirement-collection and dashboard split for Express, Custom and v2 accounts. `external_accounts` (an empty list) appears only where `controller.is_controller` is true, so not on Standard accounts. `capabilities` lists `card_payments` and `transfers`, both active. The v2 view serves no `include`s, so the includable-only `configuration`, `defaults`, `identity`, `requirements` and `future_requirements` are absent; `applied_configurations` names the configurations.
+- **Shapes follow the pinned schema** (generated types, section 14). Every v1 account carries a `controller`: just `type: "account"` for Standard (the schema leaves `is_controller` and `requirement_collection` out when the platform does not control the account), and `type: "application"` with `is_controller: true` and its fee, loss, requirement-collection and dashboard split for Express, Custom and v2 accounts. Every other v1 account field is present on every account, `null` where unset: `business_type`, `groups`, `requirements`, `future_requirements`, `settings` and `tos_acceptance` among them. `external_accounts` (an empty list) appears only where `controller.is_controller` is true, so not on Standard accounts. `company` and `individual` are absent, as no business details are collected. `capabilities` lists `card_payments` and `transfers`, both active. The v2 view serves no `include`s, so the includable-only `configuration`, `defaults`, `identity`, `requirements` and `future_requirements` are absent; `applied_configurations` names the configurations.
 - Accounts can be connected and disconnected during a run (`connect_rate`, `deauthorize_rate`, control API). The mock uses one "disconnect" for every account, although Stripe allows deauthorization only for Standard accounts.
 
 | Lifecycle step | Events | Event account label |
@@ -314,25 +328,25 @@ The `data.object` of `account.application.*` is the platform application (`{"id"
 
 **Event coverage is identical for platform and connected accounts.** Every action, entity type, lifecycle and event type the mock generates for a platform account is generated for each connected account too, with the same rates. Connected-account events reach snapshot destinations with `connect = true` (carrying `account`) and thin destinations with `@accounts` in `events_from` (carrying `context`). All faults apply to them in the same way.
 
-### 5.5 Planned entity types (phases 7–9)
+### 5.5 Entity types of phases 7–9
 
-Coverage follows what a Stripe Connect integration needs, most-used first. Each type is there for the sync situation it adds. The full design is in `docs/superpowers/specs/2026-11-25-stripe-mock-types-and-openapi-design.md`. ID prefixes are confirmed against Stripe's examples when each type is built.
+Coverage follows what a Stripe Connect integration needs, most-used first. Each type is there for the sync situation it adds. The full design is in `docs/superpowers/specs/2026-11-25-stripe-mock-types-and-openapi-design.md`. ID prefixes are confirmed against Stripe's examples when each type is built; phase 7's are in section 5.1.
 
-**Phase 7: payments core.**
+**Phase 7: payments core** (built).
 
 | Type | Removal style | Sync situation |
 |---|---|---|
 | `payment_intent` | `canceled` status | fast status churn |
 | `charge` | none (`refunded`, `disputed` flags) | updated by its children |
-| `refund` | `canceled` / `failed` status | appears standalone and embedded in `charge.refunds` |
-| `dispute` | closed statuses | lives for weeks of simulated time, with many updates |
+| `refund` | none: the mock's refunds succeed at once (Stripe's can end `canceled` / `failed`) | appears standalone and embedded in `charge.refunds` |
+| `dispute` | closed statuses (`won`, `lost`, `warning_closed`) | lives for weeks of simulated time, with many updates |
 | `balance_transaction` | none | no events of its own: found only by listing; `pending → available` changes silently at `available_on` |
 | `payment_method` | detach (`customer: null`, stays retrievable) | listing needs a customer |
-| `setup_intent` | `canceled` status | creates payment methods |
+| `setup_intent` | none: the mock's end `succeeded` or declined (Stripe's can be `canceled`) | creates payment methods |
 | `checkout.session` | expires | dotted object name; creates a payment or a subscription |
-| `invoice_payment` | none | links an invoice to its payments (`invoice.payments`) |
+| `invoice_payment` | `canceled` status | links an invoice to its payments (`invoice.payments`) |
 
-Paying an invoice creates, in one action: a payment intent, an invoice payment (`open` from the first attempt), a charge with its balance transaction, and the paid invoice. The customer's card payment method is created and attached first if it has none (`payment_method.attached`). Events: `payment_intent.created`, `charge.succeeded`, `payment_intent.succeeded`, `invoice_payment.paid`, `invoice.paid`, `invoice.payment_succeeded`. A failed attempt creates a failed charge instead. Finalizing stays a separate, earlier step. New actions: `one_off_payment`, `refund` and `dispute` (until now reserved keys), plus `save_payment_method`, `checkout` and `[churn.payment_method] detach`.
+Paying an invoice creates, in one action: a payment intent, an invoice payment (`open` from the first attempt), a charge with its balance transaction, and the paid invoice. The customer's card payment method is created and attached first if it has none (`payment_method.attached`). Events: `payment_intent.created`, `charge.succeeded`, `payment_intent.succeeded`, `invoice_payment.paid`, `invoice.paid`, `invoice.payment_succeeded`. A failed attempt creates a failed charge instead. A zero-amount invoice creates no payment objects. Finalizing stays a separate, earlier step. New actions: `one_off_payment`, `refund` and `dispute` (until now reserved keys), plus `save_payment_method`, `checkout` and `[churn.payment_method] detach`.
 
 **Phase 8: Connect money movement.**
 
@@ -422,6 +436,18 @@ History events are listed by the Events APIs while inside retention, but never d
   - `/v2/core/accounts` lists open accounts by default; `closed=true` lists only closed (disconnected) accounts. Retrieve renders a closed account with `closed: true`.
 - Read-only views of configured delivery targets: `GET /v1/webhook_endpoints` (snapshot targets) and `GET /v2/core/event_destinations` (thin targets), so the sync engine can check its setup.
 - Phases 7–9 add retrieve and list for each of their types, plus their sub-lists (section 5.5). Some lists need a parent, the way `/v1/subscription_items` needs `subscription`: `/v1/payment_methods` needs `customer`, and is also served at `/v1/customers/{id}/payment_methods`.
+- Phase 7 endpoints, each with retrieve `/{id}`; filters beyond `limit`, the cursors, `created` and `expand[]`:
+  - `GET /v1/payment_intents`: `customer`.
+  - `GET /v1/charges`: `customer`, `payment_intent`.
+  - `GET /v1/refunds`: `charge`, `payment_intent`.
+  - `GET /v1/disputes`: `charge`, `payment_intent`.
+  - `GET /v1/balance_transactions`: `type`, `source`, `payout` (payouts are not modelled yet, so `payout` matches nothing).
+  - `GET /v1/payment_methods`: `customer` (required), `type`. Sub-list `GET /v1/customers/{id}/payment_methods`: `type`.
+  - `GET /v1/setup_intents`: `customer`, `payment_method`.
+  - `GET /v1/checkout/sessions`: `customer`, `payment_intent`, `subscription`, `status`.
+  - `GET /v1/invoice_payments`: `invoice`, `payment` (the paid payment intent's ID).
+  - Embedded lists: `charge.refunds` and `invoice.payments`.
+  - A list's `url` is its bare path, without the query string.
 
 ### 7.3 List semantics
 
@@ -466,7 +492,7 @@ Stripe made thin events for API v1 resources generally available in `2026-09-30.
 
 ## 9. Webhooks
 
-- Delivery targets come from `[[destinations]]` in the config or from the control API. Each is either a **snapshot** target (v1 webhook endpoint semantics) or a **thin** target (v2 event destination semantics), with its own `enabled_events` and its own signing secret. Snapshot targets can be account or Connect endpoints; Connect events carry `account` (snapshot) or `context` (thin).
+- Delivery targets come from `[[destinations]]` in the config or from the control API. Each is either a **snapshot** target (v1 webhook endpoint semantics) or a **thin** target (v2 event destination semantics), with its own `enabled_events` and its own signing secret. Snapshot targets can be account or Connect endpoints; Connect events carry `account` and `context` (snapshot) or `context` (thin).
 - All delivery behaviour below applies equally to both payload formats.
 - **At-least-once delivery**: duplicates are a baseline behaviour (`duplicate_probability`), not only a fault.
 - **Ordering**: deliveries inside `reorder_window` may be reordered; delivery delay comes from a distribution with a long tail.
@@ -661,7 +687,7 @@ The mock supports all of these through the latest-state subscription, per-object
 - **OpenAPI conformance is part of the regular test suite.** It runs on every full test run (`cargo test --workspace`), locally or in CI, with no extra command, flag or credentials, and offline. Three checks:
   - the freshness test above;
   - a round-trip check that deserializes every payload the tests receive into its generated type, with unknown fields denied;
-  - a coverage test that runs a busy Connect run and checks everything it serves.
+  - a coverage test (`tests/openapi_conformance.rs`) that runs a busy Connect run (30 days of history, every action and churn rate on, three initial connected accounts) and checks everything it serves: every list fully paginated, every object by ID, every allowed expand path, every event page of both formats and every delivered webhook. It requires each of the 17 object types and the documented status values to appear. The same file holds the field-presence test above, a cross-object consistency check of the payment objects, and payment lists paginated under stale reads and pagination writes.
 
   Updating the pinned version means replacing the vendored file and regenerating.
 - Stripe's official `stripe-mock` is stateless and doesn't fit this purpose, but its OpenAPI-based fixtures can seed realistic example values.
