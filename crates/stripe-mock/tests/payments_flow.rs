@@ -121,7 +121,7 @@ async fn paid_invoice_creates_payment_objects() {
     assert!(created < finalized);
 
     let inv_id = only_id(&mine, ObjectType::Invoice);
-    let inv = json(&m, &format!("/v1/invoices/{inv_id}")).await;
+    let inv = json(&m, &format!("/v1/invoices/{inv_id}?expand[]=payments")).await;
     assert_eq!(inv["status"], "paid");
     let payments = &inv["payments"];
     assert_eq!(payments["data"].as_array().unwrap().len(), 1, "{payments}");
@@ -234,15 +234,17 @@ async fn failed_payment_creates_failed_charge() {
     assert_eq!(ip_created.state["status"], "open");
     assert!(ip_created.events.snapshot.is_empty());
     let inv_id = only_id(&mine, ObjectType::Invoice);
-    let failed_inv = mine
-        .iter()
-        .find(|u| u.object_id == inv_id && u.state["attempt_count"] == 1)
-        .unwrap();
-    let payments = &failed_inv.state["payments"];
-    assert_eq!(payments["total_count"], 1);
-    assert_eq!(payments["data"][0]["id"], ip_id.as_str());
-    assert_eq!(payments["data"][0]["status"], "open");
-    assert_eq!(payments["data"][0]["amount_paid"], Value::Null);
+    assert!(
+        mine.iter()
+            .any(|u| u.object_id == inv_id && u.state["attempt_count"] == 1)
+    );
+    // The invoice may since have been voided (canceling its payment), so the open
+    // payment is checked as the failed attempt left it.
+    assert_eq!(ip_created.state["invoice"], inv_id.as_str());
+    assert_eq!(ip_created.state["amount_paid"], Value::Null);
+    let ips = json(&m, &format!("/v1/invoice_payments?invoice={inv_id}")).await;
+    assert_eq!(ips["data"].as_array().unwrap().len(), 1, "{ips}");
+    assert_eq!(ips["data"][0]["id"], ip_id.as_str());
     let ch_id = only_id(&mine, ObjectType::Charge);
     let ch = json(&m, &format!("/v1/charges/{ch_id}")).await;
     assert_eq!(ch["status"], "failed");
@@ -295,7 +297,7 @@ async fn retry_reuses_payment_intent() {
     m.update_actions_config(|a| a.payment_failure_probability = 0.0)
         .unwrap();
     m.step(Duration::from_secs(3 * DAY)).await.unwrap();
-    let inv = json(&m, &format!("/v1/invoices/{renewal}")).await;
+    let inv = json(&m, &format!("/v1/invoices/{renewal}?expand[]=payments")).await;
     assert_eq!(inv["status"], "paid");
     assert_eq!(inv["attempt_count"], 2);
     let pi_id = inv["payments"]["data"][0]["payment"]["payment_intent"]
@@ -357,7 +359,7 @@ async fn voided_after_failure_cancels_payment_intent() {
     assert_eq!(ip["status_transitions"]["canceled_at"], pi["canceled_at"]);
     assert_eq!(ip["status_transitions"]["paid_at"], Value::Null);
     let inv_id = only_id(&mine, ObjectType::Invoice);
-    let inv = json(&m, &format!("/v1/invoices/{inv_id}")).await;
+    let inv = json(&m, &format!("/v1/invoices/{inv_id}?expand[]=payments")).await;
     assert_eq!(inv["status"], "void");
     assert_eq!(inv["payments"]["data"][0]["status"], "canceled");
 }
@@ -386,7 +388,8 @@ async fn uncollectible_after_failure_keeps_payment_intent() {
     let inv = m.get(ObjectType::Invoice, &renewal).unwrap();
     assert_eq!(inv.state["status"], "uncollectible");
     // Stripe keeps an uncollectible invoice payable: its payment and intent stay open.
-    let ip = &inv.state["payments"]["data"][0];
+    let expanded = json(&m, &format!("/v1/invoices/{renewal}?expand[]=payments")).await;
+    let ip = &expanded["payments"]["data"][0];
     assert_eq!(ip["status"], "open");
     let pi = ip["payment"]["payment_intent"].as_str().unwrap();
     let pi = m.get(ObjectType::PaymentIntent, pi).unwrap();
@@ -560,7 +563,7 @@ async fn zero_amount_invoice_is_paid_without_payment_objects() {
         ]
     );
     let inv_id = only_id(&mine, ObjectType::Invoice);
-    let inv = json(&m, &format!("/v1/invoices/{inv_id}")).await;
+    let inv = json(&m, &format!("/v1/invoices/{inv_id}?expand[]=payments")).await;
     assert_eq!(
         (inv["status"].clone(), inv["total"].clone()),
         ("paid".into(), 0.into())
@@ -605,4 +608,53 @@ async fn disconnected_account_balance_still_settles() {
             .iter()
             .all(|e| e.object_id != txn)
     );
+}
+
+/// `invoice.payments` is includable: absent from the invoice (in responses, events and
+/// truth) unless `expand[]` asks for it, as live Stripe serves it.
+#[tokio::test]
+async fn invoice_payments_only_on_expand() {
+    let m = mock_with("").await;
+    let cause = charged(&m, |retry| {
+        if retry {
+            m.run_action(Action::CatalogChange).unwrap();
+        }
+        m.run_action(paid_one_off()).unwrap()
+    });
+    let mine = caused(&m, &cause);
+    let inv_id = only_id(&mine, ObjectType::Invoice);
+    let ip_id = only_id(&mine, ObjectType::InvoicePayment);
+
+    let plain = json(&m, &format!("/v1/invoices/{inv_id}")).await;
+    assert!(plain.get("payments").is_none(), "{plain}");
+    for u in mine.iter().filter(|u| u.object_type == ObjectType::Invoice) {
+        assert!(u.state.get("payments").is_none(), "{}", u.state);
+    }
+    for e in m.event_timeline() {
+        if e.event_type.starts_with("invoice.") {
+            let ev = json(&m, &format!("/v1/events/{}", e.id)).await;
+            assert!(ev["data"]["object"].get("payments").is_none(), "{ev}");
+        }
+    }
+
+    let expanded = json(&m, &format!("/v1/invoices/{inv_id}?expand[]=payments")).await;
+    let payments = &expanded["payments"];
+    assert_eq!(payments["object"], "list");
+    assert_eq!(
+        payments["url"],
+        format!("/v1/invoice_payments?invoice={inv_id}")
+    );
+    assert_eq!(payments["total_count"], 1);
+    assert_eq!(payments["has_more"], false);
+    assert_eq!(payments["data"][0]["id"], ip_id.as_str());
+    assert_eq!(payments["data"][0]["status"], "paid");
+
+    let listed = json(&m, "/v1/invoices?expand[]=data.payments").await;
+    let item = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == inv_id.as_str())
+        .unwrap();
+    assert_eq!(item["payments"]["data"][0]["id"], ip_id.as_str());
 }

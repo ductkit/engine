@@ -32,6 +32,11 @@ pub(crate) struct Generators {
 }
 
 impl Generators {
+    /// `payloads.nested_list_page_size`.
+    pub(crate) fn nested_list_page_size(&self) -> usize {
+        self.config.payloads.nested_list_page_size
+    }
+
     pub(crate) fn new(config: &Config, streams: &RngStreams, start: SimTime) -> Generators {
         Generators {
             platform: Generator::new(config, streams, start),

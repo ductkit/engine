@@ -12,7 +12,7 @@ use crate::model::invoice::{
     new_line,
 };
 use crate::rng::SimRng;
-use crate::stripe::{Customer, Invoice, InvoicePayment, InvoiceStatus, Price};
+use crate::stripe::{Customer, Invoice, InvoiceStatus, Price};
 use crate::{MockError, ObjectType};
 
 /// How a one-off invoice ends.
@@ -171,34 +171,8 @@ pub(crate) fn finalize(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     done
 }
 
-/// Puts the latest state of `payment` into the embedded `invoice.payments`: replaces its
-/// entry, or, for a payment not yet listed and when `page_size` is given, counts it and
-/// appends it while the page has room.
-fn sync_payment(i: &mut Invoice, payment: &InvoicePayment, page_size: Option<usize>) {
-    let Some(list) = i.payments.as_mut() else {
-        return;
-    };
-    if let Some(entry) = list.data.iter_mut().find(|p| p.id == payment.id) {
-        *entry = payment.clone();
-    } else if let Some(page_size) = page_size {
-        let count = list.total_count.unwrap_or(list.data.len() as i64) + 1;
-        if list.data.len() < page_size {
-            list.data.push(payment.clone());
-        } else {
-            list.has_more = true;
-        }
-        list.total_count = Some(count);
-    }
-}
-
-/// `open → paid`, with `payment` (none for a zero-amount invoice) in `invoice.payments`.
-pub(crate) fn pay(
-    engine: &mut Engine,
-    id: &str,
-    payment: Option<&InvoicePayment>,
-    page_size: usize,
-    cause: &Cause,
-) -> bool {
+/// `open → paid`.
+pub(crate) fn pay(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     let now = engine.now().unix_seconds();
     transition(
         engine,
@@ -211,9 +185,6 @@ pub(crate) fn pay(
             i.attempted = true;
             i.attempt_count += 1;
             i.status_transitions.paid_at = Some(Some(now));
-            if let Some(p) = payment {
-                sync_payment(i, p, Some(page_size));
-            }
         },
         ChangeKind::StateChanged,
         &["invoice.paid", "invoice.payment_succeeded"],
@@ -221,15 +192,8 @@ pub(crate) fn pay(
     )
 }
 
-/// A failed payment attempt on an open invoice, with its open `payment` in
-/// `invoice.payments`.
-pub(crate) fn fail_payment(
-    engine: &mut Engine,
-    id: &str,
-    payment: &InvoicePayment,
-    page_size: usize,
-    cause: &Cause,
-) -> bool {
+/// A failed payment attempt on an open invoice (its invoice payment stays `open`).
+pub(crate) fn fail_payment(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     transition(
         engine,
         id,
@@ -237,7 +201,6 @@ pub(crate) fn fail_payment(
         |i| {
             i.attempted = true;
             i.attempt_count += 1;
-            sync_payment(i, payment, Some(page_size));
         },
         ChangeKind::Updated,
         &["invoice.payment_failed"],
@@ -260,9 +223,6 @@ pub(crate) fn void(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
         |i| {
             i.status = Some(Some(InvoiceStatus::Void));
             i.status_transitions.voided_at = Some(Some(now));
-            if let Some(p) = &payment {
-                sync_payment(i, p, None);
-            }
         },
         ChangeKind::StateChanged,
         &["invoice.voided"],

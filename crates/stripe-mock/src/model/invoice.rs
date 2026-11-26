@@ -276,11 +276,8 @@ pub(crate) fn new_invoice(i: &NewInvoice) -> stripe::Invoice {
             payment_method_options: Some(None),
             payment_method_types: Some(None),
         },
-        payments: Some(embedded_list::<stripe::InvoicePayment>(
-            &[],
-            i.page_size,
-            &payments_url(i.id),
-        )),
+        // Includable, so absent: `expand[]` builds it from the store.
+        payments: None,
         period_end: i.period.1,
         period_start: i.period.0,
         post_payment_credit_notes_amount: 0,
@@ -373,8 +370,8 @@ mod tests {
         stripe::check_payload(&v).unwrap();
         assert_eq!(v["total"], 1000);
         assert_eq!(v["customer_email"], "a@example.com");
-        assert_eq!(v["payments"]["data"], serde_json::json!([]));
-        assert_eq!(v["payments"]["url"], "/v1/invoice_payments?invoice=in_1");
+        // Includable: absent unless expanded.
+        assert!(v.get("payments").is_none());
         assert!(v.get("confirmation_secret").is_none());
     }
 

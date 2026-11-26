@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::stripe::{self, Expandable, List, ListObject};
+use crate::stripe::{self, Expandable};
 
 /// Seconds from a charge to its balance becoming available.
 pub(crate) const AVAILABLE_AFTER_SECS: i64 = 2 * 86_400;
@@ -514,7 +514,7 @@ pub(crate) fn refunds_url(charge: &str) -> String {
 }
 
 /// A captured `succeeded` charge, or a `failed` one (`card_declined`, no balance
-/// transaction). `refunds` is an empty embedded list.
+/// transaction). `refunds` is includable, so absent: `expand[]` builds it from the store.
 pub(crate) fn new_charge(c: &NewCharge) -> stripe::Charge {
     let (status, failure_code, failure_message) = if c.succeeded {
         (stripe::ChargeStatus::Succeeded, None, None)
@@ -564,13 +564,7 @@ pub(crate) fn new_charge(c: &NewCharge) -> stripe::Charge {
         receipt_number: Some(None),
         receipt_url: Some(None),
         refunded: false,
-        refunds: Some(Some(List {
-            object: ListObject::List,
-            data: Vec::new(),
-            has_more: false,
-            url: refunds_url(c.id),
-            total_count: Some(0),
-        })),
+        refunds: None,
         review: Some(None),
         shipping: Some(None),
         source_transfer: Some(None),
@@ -753,26 +747,6 @@ pub(crate) fn new_refund_balance_transaction(
         status: "available".to_string(),
         type_: stripe::BalanceTransactionType::Refund,
     }
-}
-
-/// Puts `refund` first in the charge's embedded `refunds` (newest first, as Stripe lists
-/// them), keeping at most `page_size` entries.
-pub(crate) fn push_refund(c: &mut stripe::Charge, refund: stripe::Refund, page_size: usize) {
-    let list = c
-        .refunds
-        .get_or_insert_with(|| None)
-        .get_or_insert_with(|| List {
-            object: ListObject::List,
-            data: Vec::new(),
-            has_more: false,
-            url: refunds_url(&c.id),
-            total_count: Some(0),
-        });
-    let count = list.total_count.unwrap_or(list.data.len() as i64) + 1;
-    list.data.insert(0, refund);
-    list.data.truncate(page_size);
-    list.total_count = Some(count);
-    list.has_more = count > list.data.len() as i64;
 }
 
 /// Stripe's dispute fee, in the minor unit, withdrawn with a chargeback and returned
@@ -1183,7 +1157,7 @@ mod tests {
             });
             let v = conforms(&ch);
             assert_eq!(v["paid"], succeeded);
-            assert_eq!(v["refunds"]["url"], "/v1/charges/ch_1/refunds");
+            assert!(v.get("refunds").is_none());
         }
         let mut pi = pi;
         pi.last_payment_error = Some(Some(Box::new(decline_error("ch_1", &pm))));
@@ -1201,7 +1175,7 @@ mod tests {
         ));
         assert_eq!(zero["fee_details"], serde_json::json!([]));
 
-        let mut ch = new_charge(&NewCharge {
+        let ch = new_charge(&NewCharge {
             id: "ch_1",
             created: 1,
             amount: 1000,
@@ -1226,16 +1200,6 @@ mod tests {
         assert_eq!(v["customer"], Value::Null);
         assert_eq!(v["payment_method"], "pm_1");
         assert_eq!(v["destination_details"]["card"]["type"], "refund");
-        for i in 0..3 {
-            let mut r = re.clone();
-            r.id = format!("re_{i}");
-            push_refund(&mut ch, r, 2);
-        }
-        let v = conforms(&ch);
-        assert_eq!(v["refunds"]["total_count"], 3);
-        assert_eq!(v["refunds"]["has_more"], true);
-        assert_eq!(v["refunds"]["data"][0]["id"], "re_2");
-        assert_eq!(v["refunds"]["data"].as_array().unwrap().len(), 2);
         let txn = conforms(&new_refund_balance_transaction(
             "txn_3", 2, 400, "usd", "re_1",
         ));

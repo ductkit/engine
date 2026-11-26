@@ -40,13 +40,12 @@ fn parent_fields(t: ObjectType) -> &'static [&'static str] {
         ObjectType::Price => &["product"],
         ObjectType::PaymentMethod => &["customer"],
         ObjectType::InvoicePayment => &["invoice"],
-        ObjectType::Dispute => &["charge"],
+        ObjectType::Dispute | ObjectType::Refund => &["charge"],
         ObjectType::Customer
         | ObjectType::Product
         | ObjectType::Account
         | ObjectType::PaymentIntent
         | ObjectType::Charge
-        | ObjectType::Refund
         | ObjectType::BalanceTransaction
         | ObjectType::SetupIntent
         | ObjectType::CheckoutSession => &[],

@@ -313,7 +313,7 @@ async fn check_scope(
             continue;
         }
         for path in expand_paths(*t) {
-            if !names_an_id(&u.state, path) || expanded.contains(&(*t, *path)) {
+            if !expands(*t, &u.state, path) || expanded.contains(&(*t, *path)) {
                 continue;
             }
             let base = t.api_path(id).unwrap();
@@ -346,6 +346,18 @@ async fn check_scope(
     expanded
 }
 
+/// Includable lists: absent unless expanded, and expandable on every such object.
+const INCLUDABLE: [(ObjectType, &str); 2] = [
+    (ObjectType::Charge, "refunds"),
+    (ObjectType::Invoice, "payments"),
+];
+
+/// Whether expanding `path` on a `t` in `state` serves an object: an includable list, or
+/// a field holding an ID.
+fn expands(t: ObjectType, state: &Value, path: &str) -> bool {
+    INCLUDABLE.contains(&(t, path)) || names_an_id(state, path)
+}
+
 /// Whether the field `path` names in `state` holds an ID, so expanding it serves an object.
 fn names_an_id(state: &Value, path: &str) -> bool {
     let (parent, target) = path.rsplit_once('.').unwrap_or(("", path));
@@ -368,7 +380,7 @@ fn expandable_in(
         .flat_map(|((_, t, _), u)| {
             expand_paths(*t)
                 .iter()
-                .filter(|p| names_an_id(&u.state, p))
+                .filter(|p| expands(*t, &u.state, p))
                 .map(|p| (*t, *p))
         })
         .collect()
@@ -533,6 +545,8 @@ fn excluded(t: ObjectType, o: &Value) -> Vec<&'static str> {
             "presentment_details",
             // Only when a Radar session was supplied with the payment: not modelled.
             "radar_options",
+            // Includable-only: served with `expand[]=refunds`.
+            "refunds",
             // Destination charges only (the field's own description): phase 8.
             "transfer",
         ],
@@ -563,8 +577,9 @@ fn excluded(t: ObjectType, o: &Value) -> Vec<&'static str> {
             "tax_ids",
         ],
         ObjectType::Invoice => vec![
-            // Includable-only: served with `expand[]=confirmation_secret`.
+            // Includable-only: served with `expand[]=confirmation_secret` / `payments`.
             "confirmation_secret",
+            "payments",
             // Only with details for the current status (blocked/paused): not modelled.
             "status_details",
             // Only for `billing_reason: subscription_threshold`: not modelled.

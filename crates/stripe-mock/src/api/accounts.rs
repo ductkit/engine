@@ -165,6 +165,7 @@ pub(crate) async fn list_v2(
         engine: &sim.engine,
         at,
         scope,
+        page_size: sim.generators.nested_list_page_size(),
     };
     // Every account in list order; `item` is set for those this view shows and the
     // filters keep. The cursor is located among all accounts, so it survives the
@@ -241,6 +242,7 @@ pub(crate) async fn retrieve_v2(
         engine: &sim.engine,
         at,
         scope,
+        page_size: sim.generators.nested_list_page_size(),
     };
     let (u, closed) = view
         .store()

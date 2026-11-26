@@ -174,6 +174,8 @@ pub(crate) struct View<'a> {
     pub engine: &'a Engine,
     pub at: Option<SimTime>,
     pub scope: Scope,
+    /// `payloads.nested_list_page_size`, for lists `expand[]` builds.
+    pub page_size: usize,
 }
 
 impl<'a> View<'a> {
@@ -355,6 +357,7 @@ async fn list(
         engine: &sim.engine,
         at,
         scope,
+        page_size: sim.generators.nested_list_page_size(),
     };
     // A required filter is always a parent field, so its children index serves it.
     let all = match r.required {
@@ -462,6 +465,7 @@ async fn retrieve(
         engine: &sim.engine,
         at,
         scope,
+        page_size: sim.generators.nested_list_page_size(),
     };
     let mut obj = view.visible(r.t, &id).ok_or_else(|| no_such(r.t, &id))?;
     expand(&view, r.t, &mut obj, &paths)?;
@@ -483,6 +487,7 @@ pub(crate) async fn invoice_lines(
         engine: &sim.engine,
         at,
         scope,
+        page_size: sim.generators.nested_list_page_size(),
     };
     if view.visible(ObjectType::Invoice, &id).is_none() {
         return Err(no_such(ObjectType::Invoice, &id));
@@ -522,6 +527,7 @@ pub(crate) async fn customer_payment_methods(
         engine: &sim.engine,
         at,
         scope,
+        page_size: sim.generators.nested_list_page_size(),
     };
     if view.visible(ObjectType::Customer, &id).is_none() {
         return Err(no_such(ObjectType::Customer, &id));

@@ -203,7 +203,7 @@ async fn partial_then_full_refund() {
     );
     let second = refund(&m, &ch, Some(700)).unwrap();
     let re2 = only_id(&caused(&m, &second), ObjectType::Refund);
-    let charge = json(&m, &format!("/v1/charges/{ch}")).await;
+    let charge = json(&m, &format!("/v1/charges/{ch}?expand[]=refunds")).await;
     assert_eq!(charge["amount_refunded"], 1000);
     assert_eq!(charge["amount"], 1000);
     assert_eq!(charge["refunded"], true);
@@ -303,7 +303,10 @@ async fn refund_events_in_order() {
     let ev = json(&m, &format!("/v1/events/{}", refunded.id)).await;
     let obj = &ev["data"]["object"];
     assert_eq!(obj["id"], ch.as_str());
-    assert_eq!(obj["refunds"]["data"][0]["id"], re_id.as_str());
+    // `refunds` is includable, so events never carry it.
+    assert!(obj.get("refunds").is_none(), "{obj}");
+    let refunds = json(&m, &format!("/v1/refunds?charge={ch}")).await;
+    assert_eq!(refunds["data"][0]["id"], re_id.as_str());
     assert!(obj["amount_refunded"].as_i64().unwrap() > 0);
     assert!(ev["data"]["previous_attributes"]["amount_refunded"] == 0);
     let created = timeline
@@ -533,4 +536,77 @@ async fn generated_charges_stay_within_stripe_maximum() {
         succeed: Some(true),
     });
     assert!(matches!(over, Err(MockError::InvalidAction(_))), "{over:?}");
+}
+
+/// `charge.refunds` is includable: absent from the charge (in responses, events and truth)
+/// unless `expand[]` asks for it, as live Stripe serves it.
+#[tokio::test]
+async fn charge_refunds_only_on_expand() {
+    let m = mock_with("").await;
+    let ch = paid_charge(&m, 1000);
+    let first = refund(&m, &ch, Some(300)).unwrap();
+    let re1 = only_id(&caused(&m, &first), ObjectType::Refund);
+    let second = refund(&m, &ch, Some(200)).unwrap();
+    let re2 = only_id(&caused(&m, &second), ObjectType::Refund);
+
+    let plain = json(&m, &format!("/v1/charges/{ch}")).await;
+    assert!(plain.get("refunds").is_none(), "{plain}");
+    assert!(
+        m.get(ObjectType::Charge, &ch)
+            .unwrap()
+            .state
+            .get("refunds")
+            .is_none()
+    );
+    for e in m.event_timeline() {
+        if e.event_type == "charge.refunded" {
+            let ev = json(&m, &format!("/v1/events/{}", e.id)).await;
+            assert!(ev["data"]["object"].get("refunds").is_none(), "{ev}");
+            assert!(
+                ev["data"]["previous_attributes"].get("refunds").is_none(),
+                "{ev}"
+            );
+        }
+    }
+
+    let expanded = json(&m, &format!("/v1/charges/{ch}?expand[]=refunds")).await;
+    let refunds = &expanded["refunds"];
+    assert_eq!(refunds["object"], "list");
+    assert_eq!(refunds["url"], format!("/v1/charges/{ch}/refunds"));
+    assert_eq!(refunds["total_count"], 2);
+    assert_eq!(refunds["has_more"], false);
+    let ids: Vec<&str> = refunds["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [re2.as_str(), re1.as_str()]);
+    assert_eq!(refunds["data"][0]["amount"], 200);
+
+    let listed = json(&m, "/v1/charges?expand[]=data.refunds").await;
+    let item = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == ch.as_str())
+        .unwrap();
+    assert_eq!(item["refunds"]["total_count"], 2);
+    let unexpanded = json(&m, "/v1/charges").await;
+    assert!(unexpanded["data"][0].get("refunds").is_none());
+}
+
+#[tokio::test]
+async fn expanded_refunds_follow_nested_list_page_size() {
+    let m = mock_with("[payloads]\nnested_list_page_size = 1").await;
+    let ch = paid_charge(&m, 1000);
+    refund(&m, &ch, Some(300)).unwrap();
+    let second = refund(&m, &ch, Some(200)).unwrap();
+    let re2 = only_id(&caused(&m, &second), ObjectType::Refund);
+    let expanded = json(&m, &format!("/v1/charges/{ch}?expand[]=refunds")).await;
+    let refunds = &expanded["refunds"];
+    assert_eq!(refunds["data"].as_array().unwrap().len(), 1);
+    assert_eq!(refunds["data"][0]["id"], re2.as_str());
+    assert_eq!(refunds["has_more"], true);
+    assert_eq!(refunds["total_count"], 2);
 }

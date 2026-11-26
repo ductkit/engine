@@ -4,6 +4,9 @@ use serde_json::Value;
 
 use crate::api::ApiError;
 use crate::api::resources::View;
+use crate::model::embedded::embedded_list;
+use crate::model::invoice::payments_url;
+use crate::model::payments::refunds_url;
 use crate::{ChangeKind, ObjectType};
 
 /// Deepest expansion, counting the segments other than `data`.
@@ -22,6 +25,7 @@ pub(crate) fn allowed(t: ObjectType) -> &'static [&'static str] {
             "customer",
             "default_payment_method",
             "parent.subscription_details.subscription",
+            "payments",
         ],
         ObjectType::Customer => &["invoice_settings.default_payment_method"],
         ObjectType::Price => &["product"],
@@ -34,6 +38,7 @@ pub(crate) fn allowed(t: ObjectType) -> &'static [&'static str] {
             "customer",
             "failure_balance_transaction",
             "payment_intent",
+            "refunds",
         ],
         ObjectType::Refund => &[
             "balance_transaction",
@@ -108,6 +113,37 @@ fn lookup(view: &View, id: &str) -> Option<Value> {
     Some(u.state.clone())
 }
 
+/// An includable list field of `parent` (absent unless expanded, as Stripe serves
+/// `charge.refunds` and `invoice.payments`), built from the store: refunds newest first,
+/// invoice payments in creation order, the first `nested_list_page_size` of them.
+fn includable(view: &View, parent: &Value, field: &str) -> Option<Value> {
+    let id = parent["id"].as_str()?;
+    let (t, key, newest_first, url) = match (parent["object"].as_str()?, field) {
+        ("charge", "refunds") => (ObjectType::Refund, "charge", true, refunds_url(id)),
+        ("invoice", "payments") => (
+            ObjectType::InvoicePayment,
+            "invoice",
+            false,
+            payments_url(id),
+        ),
+        _ => return None,
+    };
+    let mut items: Vec<Value> = view
+        .store()
+        .children(t, key, id)
+        .into_iter()
+        .filter_map(|o| view.listed(o))
+        .map(|u| u.state.clone())
+        .collect();
+    if newest_first {
+        items.reverse();
+    }
+    Some(
+        serde_json::to_value(embedded_list(&items, view.page_size, &url))
+            .expect("a list serializes"),
+    )
+}
+
 fn apply(view: &View, v: &mut Value, segs: &[&str]) {
     let Some((first, rest)) = segs.split_first() else {
         return;
@@ -119,6 +155,11 @@ fn apply(view: &View, v: &mut Value, segs: &[&str]) {
             apply(view, item, rest);
         }
         return;
+    }
+    if v.get(*first).is_none()
+        && let Some(list) = includable(view, v, first)
+    {
+        v[*first] = list;
     }
     let Some(child) = v.get_mut(*first) else {
         return;

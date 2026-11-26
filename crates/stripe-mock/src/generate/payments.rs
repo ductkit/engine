@@ -14,8 +14,7 @@ use crate::model::payments::{
     BRAND, CardDraw, LAST4, NewCharge, NewDispute, NewPaymentIntent, NewRefund, decline_error,
     new_card_payment_method, new_charge, new_charge_balance_transaction, new_dispute,
     new_dispute_balance_transaction, new_invoice_payment, new_payment_intent, new_refund,
-    new_refund_balance_transaction, new_setup_intent, push_refund, setup_decline_error,
-    submit_evidence,
+    new_refund_balance_transaction, new_setup_intent, setup_decline_error, submit_evidence,
 };
 use crate::rng::SimRng;
 use crate::stripe::{
@@ -326,7 +325,7 @@ pub(crate) fn pay_invoice(
         .expect("open invoice exists");
     let amount = inv.amount_remaining;
     if amount == 0 {
-        billing::pay(engine, invoice, None, ctx.page_size, cause);
+        billing::pay(engine, invoice, cause);
         return None;
     }
     let customer = inv.customer.id().to_string();
@@ -379,15 +378,9 @@ pub(crate) fn pay_invoice(
                 &["invoice_payment.paid"],
             )
             .expect("live invoice payment");
-        let ip: InvoicePayment = engine
-            .latest_obj(ObjectType::InvoicePayment, &ip_id)
-            .expect("invoice payment");
-        billing::pay(engine, invoice, Some(&ip), ctx.page_size, cause);
+        billing::pay(engine, invoice, cause);
     } else {
-        let ip: InvoicePayment = engine
-            .latest_obj(ObjectType::InvoicePayment, &ip_id)
-            .expect("invoice payment");
-        billing::fail_payment(engine, invoice, &ip, ctx.page_size, cause);
+        billing::fail_payment(engine, invoice, cause);
     }
     outcome.invoice_payment = Some(ip_id);
     Some(outcome)
@@ -530,7 +523,6 @@ pub(crate) fn refund(
         cause.clone(),
         &["refund.created"],
     );
-    let page_size = ctx.page_size;
     engine
         .update_obj::<Charge>(
             ObjectType::Charge,
@@ -538,7 +530,6 @@ pub(crate) fn refund(
             |c| {
                 c.amount_refunded += amount;
                 c.refunded = c.amount_refunded == c.amount;
-                push_refund(c, re, page_size);
             },
             cause.clone(),
             ChangeKind::Updated,
