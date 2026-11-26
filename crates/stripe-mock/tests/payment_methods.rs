@@ -330,3 +330,47 @@ async fn writes_fire_on_payment_method_lists() {
         &log[before..]
     );
 }
+
+#[tokio::test]
+async fn deleting_a_customer_detaches_its_payment_methods() {
+    // Regression (Task 13): a deleted customer's card kept `customer`, so expanding
+    // `payment_method.customer` served the deleted stub, which the schema does not allow.
+    let m = mock_with("seed = 7").await;
+    let cus = m.create_customer(NewCustomer::default()).unwrap();
+    let pm = only_id(
+        &caused(&m, &save(&m, &cus).unwrap()),
+        ObjectType::PaymentMethod,
+    );
+    m.delete_customer(&cus).unwrap();
+    let detached: Vec<String> = m
+        .event_timeline()
+        .into_iter()
+        .filter(|e| e.object_id == pm)
+        .map(|e| e.event_type)
+        .collect();
+    assert!(
+        detached.iter().any(|t| t == "payment_method.detached"),
+        "{detached:?}"
+    );
+    let deleted_at = m
+        .truth_log()
+        .into_iter()
+        .rfind(|u| u.object_type == ObjectType::Customer && u.object_id == cus)
+        .unwrap()
+        .seq;
+    let detached_at = m
+        .truth_log()
+        .into_iter()
+        .rfind(|u| u.object_type == ObjectType::PaymentMethod && u.object_id == pm)
+        .unwrap()
+        .seq;
+    assert!(
+        detached_at < deleted_at,
+        "detached before the customer is deleted"
+    );
+    // `get` checks the body against the schema.
+    let p = json(&m, &format!("/v1/payment_methods/{pm}?expand[]=customer")).await;
+    assert_eq!(p["customer"], Value::Null);
+    let sub = json(&m, &format!("/v1/customers/{cus}/payment_methods")).await;
+    assert!(listed_ids(&sub).is_empty());
+}

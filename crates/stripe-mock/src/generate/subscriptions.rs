@@ -607,7 +607,7 @@ pub(crate) fn cancel_subscription(
 }
 
 /// Deletes a customer after canceling its live subscriptions (incomplete ones
-/// expire) and voiding its open invoices, all under `cause`.
+/// expire), voiding its open invoices and detaching its payment methods, all under `cause`.
 pub(crate) fn delete_customer_cascade(
     engine: &mut Engine,
     id: &str,
@@ -663,6 +663,9 @@ pub(crate) fn delete_customer_cascade(
             void(engine, &invoice, cause);
         }
     }
+    // Its cards are detached, as the schema's `payment_method.customer` cannot name a
+    // deleted customer.
+    super::payments::detach_all(engine, id, cause);
     engine.delete(
         ObjectType::Customer,
         id,

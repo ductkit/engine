@@ -45,3 +45,10 @@ pub use model::account::{AccountApi, AccountKind, Configuration};
 pub use model::customer::{CustomerUpdate, NewCustomer};
 pub use stream::{SubscribeFilter, SubscribeOptions, Subscription, SubscriptionItem};
 pub use time::SimTime;
+
+/// The `expand[]` paths a retrieve of `t` allows (lists take them after `data.`). For tests
+/// that cover every path; not a stable API.
+#[doc(hidden)]
+pub fn expand_paths(t: ObjectType) -> &'static [&'static str] {
+    api::expand::allowed(t)
+}

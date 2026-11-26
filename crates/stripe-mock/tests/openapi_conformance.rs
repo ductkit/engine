@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::{Receiver, assert_conforms, mock_with};
 use ductkit_stripe_mock::stripe::{check_payload, schema_fields};
-use ductkit_stripe_mock::{ChangeKind, MockStripe, ObjectType, StateUpdate};
+use ductkit_stripe_mock::{ChangeKind, MockStripe, ObjectType, StateUpdate, expand_paths};
 use serde_json::Value;
 
 /// Every action and churn rate above zero, the new phase-7 ones included. Rates are low so
@@ -222,54 +222,6 @@ const LISTS: &[&str] = &[
     "/v1/invoice_payments",
 ];
 
-/// The expand paths each retrieve allows (`src/api/expand.rs`), for one level of expansion.
-fn expand_paths(t: ObjectType) -> &'static [&'static str] {
-    match t {
-        ObjectType::Subscription => &[
-            "customer",
-            "default_payment_method",
-            "latest_invoice",
-            "items.data.price.product",
-        ],
-        ObjectType::Invoice => &[
-            "customer",
-            "default_payment_method",
-            "parent.subscription_details.subscription",
-        ],
-        ObjectType::Customer => &["invoice_settings.default_payment_method"],
-        ObjectType::Price => &["product"],
-        ObjectType::SubscriptionItem => &["price.product"],
-        ObjectType::PaymentIntent => &["customer", "latest_charge", "payment_method"],
-        ObjectType::Charge => &[
-            "balance_transaction",
-            "customer",
-            "failure_balance_transaction",
-            "payment_intent",
-        ],
-        ObjectType::Refund => &[
-            "balance_transaction",
-            "charge",
-            "customer",
-            "failure_balance_transaction",
-            "payment_intent",
-            "payment_method",
-        ],
-        ObjectType::Dispute => &["charge", "payment_intent"],
-        ObjectType::BalanceTransaction => &["source"],
-        ObjectType::PaymentMethod => &["customer"],
-        ObjectType::SetupIntent => &["customer", "payment_method"],
-        ObjectType::CheckoutSession => &[
-            "customer",
-            "invoice",
-            "payment_intent",
-            "setup_intent",
-            "subscription",
-        ],
-        ObjectType::InvoicePayment => &["invoice"],
-        ObjectType::Product | ObjectType::InvoiceLineItem | ObjectType::Account => &[],
-    }
-}
-
 /// The value at a dotted `path` of `v`, stepping into the first item of a `data` array.
 fn at_path<'a>(v: &'a Value, path: &str) -> &'a Value {
     let mut cur = v;
@@ -290,8 +242,8 @@ async fn check_scope(
     served: &mut Served,
     truth: &BTreeMap<(Option<String>, ObjectType, String), StateUpdate>,
     scope: Option<&str>,
-    expanded: &mut BTreeSet<(ObjectType, &'static str)>,
-) {
+) -> BTreeSet<(ObjectType, &'static str)> {
+    let mut expanded = BTreeSet::new();
     let mut listed: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
     for path in LISTS {
         listed.insert(path, walk_v1(m, served, path, scope).await);
@@ -361,14 +313,7 @@ async fn check_scope(
             continue;
         }
         for path in expand_paths(*t) {
-            let target = path.rsplit_once('.').map_or(*path, |(_, last)| last);
-            let parent = path.rsplit_once('.').map_or("", |(p, _)| p);
-            let holder = if parent.is_empty() {
-                &u.state
-            } else {
-                at_path(&u.state, parent)
-            };
-            if !holder[target].is_string() || expanded.contains(&(*t, *path)) {
+            if !names_an_id(&u.state, path) || expanded.contains(&(*t, *path)) {
                 continue;
             }
             let base = t.api_path(id).unwrap();
@@ -398,6 +343,35 @@ async fn check_scope(
     // Every event page, both formats (a retrieve by ID serves the same payload).
     walk_v1(m, served, "/v1/events", scope).await;
     walk_v2(m, served, "/v2/core/events?limit=100", scope).await;
+    expanded
+}
+
+/// Whether the field `path` names in `state` holds an ID, so expanding it serves an object.
+fn names_an_id(state: &Value, path: &str) -> bool {
+    let (parent, target) = path.rsplit_once('.').unwrap_or(("", path));
+    let holder = if parent.is_empty() {
+        state
+    } else {
+        at_path(state, parent)
+    };
+    holder[target].is_string()
+}
+
+/// The `(type, path)` pairs of `scope` that some live object can expand.
+fn expandable_in(
+    truth: &BTreeMap<(Option<String>, ObjectType, String), StateUpdate>,
+    scope: &Option<String>,
+) -> BTreeSet<(ObjectType, &'static str)> {
+    truth
+        .iter()
+        .filter(|((acct, _, _), u)| acct == scope && u.kind != ChangeKind::Deleted)
+        .flat_map(|((_, t, _), u)| {
+            expand_paths(*t)
+                .iter()
+                .filter(|p| names_an_id(&u.state, p))
+                .map(|p| (*t, *p))
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -446,9 +420,10 @@ async fn busy_connect_run_conforms() {
             .filter(|a| a.connected)
             .map(|a| Some(a.id.clone())),
     );
-    let mut expanded = BTreeSet::new();
+    let mut expanded = BTreeMap::new();
     for scope in &scopes {
-        check_scope(&m, &mut served, &truth, scope.as_deref(), &mut expanded).await;
+        let done = check_scope(&m, &mut served, &truth, scope.as_deref()).await;
+        expanded.insert(scope.clone(), done);
     }
 
     // Every delivered webhook body, both formats.
@@ -501,7 +476,13 @@ async fn busy_connect_run_conforms() {
         "no closed dispute served: {:?}",
         served.statuses
     );
-    // Every allowed path was expanded, except those whose field the mock never sets.
+    // Each scope expanded every path it holds an object for. On the platform that is every
+    // allowed path, except those whose field the mock never sets.
+    for scope in &scopes {
+        assert_eq!(expanded[scope], expandable_in(&truth, scope), "{scope:?}");
+        assert!(!expanded[scope].is_empty(), "{scope:?} expanded nothing");
+    }
+    let platform = &expanded[&None];
     let never_set = [
         // The mock sets no default payment method on subscriptions, invoices or customers:
         // payments use the customer's newest attached card.
@@ -520,7 +501,7 @@ async fn busy_connect_run_conforms() {
     for t in ObjectType::ALL {
         for path in expand_paths(t) {
             assert_eq!(
-                expanded.contains(&(t, *path)),
+                platform.contains(&(t, *path)),
                 !never_set.contains(&(t, *path)),
                 "{t:?} expand {path}"
             );
@@ -533,7 +514,7 @@ async fn busy_connect_run_conforms() {
         scopes.len(),
         served.objects.values().sum::<usize>(),
         snap_bodies.len() + thin_bodies.len(),
-        expanded.len()
+        expanded.values().map(BTreeSet::len).sum::<usize>()
     );
 }
 
@@ -890,17 +871,39 @@ async fn payment_objects_are_consistent() {
     }
 }
 
-/// The IDs of one full pagination of `path`, 10 per page.
-async fn paginate_ids(m: &MockStripe, path: &str) -> Vec<String> {
+/// One full pagination of `path` (listing `t`), 10 per page: the IDs in order, and how
+/// many served objects differed from the live state the moment their page was served (a
+/// stale read: an older version, or an object missing from the live view's newest page).
+async fn paginate_ids(m: &MockStripe, path: &str, t: ObjectType) -> (Vec<String>, usize) {
     let mut ids = Vec::new();
+    let mut stale = 0;
     let mut after = String::new();
     loop {
         let (status, v) = get_json(m, &format!("{path}?limit=10{after}"), &[]).await;
         assert_eq!(status, 200, "{path}: {v}");
         let data = v["data"].as_array().unwrap();
+        for o in data {
+            let live = m.get(t, o["id"].as_str().unwrap()).unwrap().state;
+            stale += usize::from(*o != live);
+        }
+        if after.is_empty() {
+            // The first page shows the newest objects: a live one newer than the page's
+            // first object but missing from it was created after the stale view's time.
+            let first = data.first().map_or(0, |o| o["created"].as_i64().unwrap());
+            let shown: BTreeSet<&str> = data.iter().map(|o| o["id"].as_str().unwrap()).collect();
+            stale += latest(m)
+                .into_values()
+                .filter(|u| {
+                    u.account.is_none()
+                        && u.object_type == t
+                        && u.state["created"].as_i64().unwrap() > first
+                        && !shown.contains(u.object_id.as_str())
+                })
+                .count();
+        }
         ids.extend(data.iter().map(id_of));
         if v["has_more"] != true || data.is_empty() {
-            return ids;
+            return (ids, stale);
         }
         after = format!("&starting_after={}", ids.last().unwrap());
     }
@@ -909,36 +912,43 @@ async fn paginate_ids(m: &MockStripe, path: &str) -> Vec<String> {
 #[tokio::test]
 async fn payment_lists_survive_faults() {
     let m = mock_with(
-        "seed = 7\n\
-         [actions]\nnew_customer = 4.0\none_off_payment = 60.0\nrefund = 4.0\n\
-         payment_failure_probability = 0.3\n\
-         [churn.customer]\ndelete = 1.0\n\
-         [api]\nstale_read = { probability = 0.5, max_lag = \"5s\" }\n\
-         pagination_writes = { probability = 1.0 }\n",
+        "seed = 7
+         [actions]
+new_customer = 4.0
+one_off_payment = 60.0
+refund = 4.0
+         payment_failure_probability = 0.3
+         [api]
+stale_read = { probability = 0.5, max_lag = \"5s\" }
+         pagination_writes = { probability = 1.0 }
+",
     )
     .await;
     m.step(Duration::from_secs(3600)).await.unwrap();
+    let mut stale = 0;
     for round in 0..10 {
         assert!(m.generation_enabled());
-        for path in ["/v1/charges", "/v1/payment_intents"] {
-            let ids = paginate_ids(&m, path).await;
+        for (path, t) in [
+            ("/v1/charges", ObjectType::Charge),
+            ("/v1/payment_intents", ObjectType::PaymentIntent),
+        ] {
+            let before = m.truth_log().len();
+            let (ids, s) = paginate_ids(&m, path, t).await;
+            stale += s;
             assert!(ids.len() > 20, "{path}: {} ids", ids.len());
+            // Every cursor page ran a pagination write first.
+            assert!(
+                m.truth_log().len() > before,
+                "{path} round {round}: no pagination write"
+            );
             let unique: BTreeSet<&String> = ids.iter().collect();
             assert_eq!(
                 unique.len(),
                 ids.len(),
                 "{path} round {round}: an ID listed twice"
             );
-            let deleted: BTreeSet<String> = latest(&m)
-                .into_values()
-                .filter(|u| u.kind == ChangeKind::Deleted)
-                .map(|u| u.object_id)
-                .collect();
-            assert!(
-                ids.iter().all(|id| !deleted.contains(id)),
-                "{path} round {round}: a deleted ID listed"
-            );
         }
         m.step(Duration::from_secs(60)).await.unwrap();
     }
+    assert!(stale > 0, "no stale read observed");
 }

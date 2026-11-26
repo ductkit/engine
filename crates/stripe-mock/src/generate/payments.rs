@@ -1066,15 +1066,39 @@ pub(crate) fn detach_action(
         }
     };
     let cause = engine.begin_action("payment_method_detach");
+    detach(engine, &id, &cause);
+    Ok(Some(cause))
+}
+
+/// Sets `customer: null` on an attached payment method (`payment_method.detached`).
+fn detach(engine: &mut Engine, id: &str, cause: &Cause) {
     engine
         .update_obj::<PaymentMethod>(
             ObjectType::PaymentMethod,
-            &id,
+            id,
             |p| p.customer = Some(None),
             cause.clone(),
             ChangeKind::Updated,
             &["payment_method.detached"],
         )
         .expect("live payment method");
-    Ok(Some(cause))
+}
+
+/// Detaches every payment method still attached to `customer`, before the customer is
+/// deleted: the schema's `payment_method.customer` cannot name a deleted customer.
+pub(crate) fn detach_all(engine: &mut Engine, customer: &str, cause: &Cause) {
+    let ids: Vec<String> = engine
+        .store()
+        .children(ObjectType::PaymentMethod, "customer", customer)
+        .into_iter()
+        .map(|o| o.latest.object_id.clone())
+        .collect();
+    for id in ids {
+        if engine
+            .latest(ObjectType::PaymentMethod, &id)
+            .is_some_and(|u| u.state["customer"].as_str() == Some(customer))
+        {
+            detach(engine, &id, cause);
+        }
+    }
 }

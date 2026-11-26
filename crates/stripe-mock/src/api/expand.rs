@@ -10,7 +10,7 @@ use crate::{ChangeKind, ObjectType};
 const MAX_DEPTH: usize = 4;
 
 /// Paths a retrieve of `t` may expand; lists take the same paths after `data.`.
-fn allowed(t: ObjectType) -> &'static [&'static str] {
+pub(crate) fn allowed(t: ObjectType) -> &'static [&'static str] {
     match t {
         ObjectType::Subscription => &[
             "customer",
