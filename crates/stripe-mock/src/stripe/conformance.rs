@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde_json::Value;
 
-use super::{Error, SCHEMA_OBJECTS, V2Error, V2List, check, check_by_object, schema_fields};
+use super::{Error, List, SCHEMA_OBJECTS, V2Error, V2List, check, check_by_object, schema_fields};
 
 /// Why a payload does not match the schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +148,11 @@ fn check_at(v: &Value, base: &str) -> Result<(), ConformanceError> {
         return Err(fail("", base, "payload is not a JSON object"));
     };
     match map.get("object").and_then(Value::as_str) {
-        Some("list") => return check_items(v, base),
+        Some("list") => {
+            check::<List<Value>>(v)
+                .map_err(|text| parse("list", base, &format!("list: {text}")))?;
+            return check_items(v, base);
+        }
         Some("event") => return check_event(v, base),
         Some(o) => return check_object(o, base, v),
         None => {}
@@ -169,8 +173,9 @@ fn check_at(v: &Value, base: &str) -> Result<(), ConformanceError> {
 
 /// Checks `v` against the pinned schema. Lists and v2 lists check every `data` item. An
 /// event checks its envelope, its `data.object`, and that every `previous_attributes` key is
-/// a field of that object. A v2 list envelope must have exactly `data`, `next_page_url` and
-/// `previous_page_url`. `{"error": {...}}` checks as the v1 or the v2 error envelope. Everything else
+/// a field of that object. A v1 list envelope must have exactly `object`, `data`, `has_more`
+/// and `url` (plus an optional `total_count`); a v2 list envelope exactly `data`,
+/// `next_page_url` and `previous_page_url`. `{"error": {...}}` checks as the v1 or the v2 error envelope. Everything else
 /// is checked by its `object` (a `deleted: true` payload against the `deleted_*` schema); an
 /// unknown `object` is an error.
 pub fn check_payload(v: &Value) -> Result<(), ConformanceError> {

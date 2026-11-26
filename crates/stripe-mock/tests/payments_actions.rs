@@ -468,3 +468,69 @@ async fn connected_refund_stays_in_scope() {
     assert!(events.iter().all(|e| ids.contains(&e.object_id.as_str())));
     assert!(events.iter().all(|e| e.account.as_deref() == Some(&*acct)));
 }
+
+/// Stripe's largest amount for one charge, in the minor unit.
+const MAX_CHARGE: i64 = 99_999_999;
+
+/// Generated one-off payments, one-off invoices, subscriptions and Checkout sessions
+/// never charge more than Stripe's per-charge maximum, although the catalog has prices
+/// of exactly that amount and quantities up to 5.
+#[tokio::test]
+async fn generated_charges_stay_within_stripe_maximum() {
+    use ductkit_stripe_mock::InvoiceOutcome;
+    let m = mock_with("seed = 3").await;
+    for i in 0..200 {
+        m.run_action(Action::CatalogChange).unwrap();
+        m.run_action(Action::OneOffPayment {
+            customer: None,
+            amount: None,
+            succeed: Some(true),
+        })
+        .unwrap();
+        m.run_action(Action::OneOffInvoice {
+            customer: None,
+            outcome: Some(InvoiceOutcome::Paid),
+        })
+        .unwrap();
+        if i % 10 == 0 {
+            m.run_action(Action::StartSubscription {
+                customer: None,
+                prices: None,
+            })
+            .unwrap();
+            m.run_action(Action::Checkout {
+                customer: None,
+                mode: None,
+                complete: Some(true),
+            })
+            .unwrap();
+        }
+    }
+    m.step(Duration::from_secs(40 * 86_400)).await.unwrap();
+    let amounts: Vec<i64> = m
+        .truth_log()
+        .iter()
+        .filter(|u| u.object_type == ObjectType::Charge)
+        .filter_map(|u| u.state["amount"].as_i64())
+        .collect();
+    assert!(
+        amounts.contains(&MAX_CHARGE),
+        "the run never used a maximum-amount price"
+    );
+    let over: Vec<&i64> = amounts.iter().filter(|a| **a > MAX_CHARGE).collect();
+    assert!(over.is_empty(), "over the maximum: {over:?}");
+    let totals: Vec<i64> = m
+        .truth_log()
+        .iter()
+        .filter(|u| u.object_type == ObjectType::Invoice)
+        .filter_map(|u| u.state["amount_due"].as_i64())
+        .filter(|a| *a > MAX_CHARGE)
+        .collect();
+    assert!(totals.is_empty(), "invoices over the maximum: {totals:?}");
+    let over = m.run_action(Action::OneOffPayment {
+        customer: None,
+        amount: Some(MAX_CHARGE + 1),
+        succeed: Some(true),
+    });
+    assert!(matches!(over, Err(MockError::InvalidAction(_))), "{over:?}");
+}

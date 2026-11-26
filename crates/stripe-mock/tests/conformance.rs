@@ -106,6 +106,23 @@ fn v2_list_envelope_rejects_unknown_and_missing_keys() {
 }
 
 #[test]
+fn v1_list_envelope_rejects_unknown_and_missing_keys() {
+    let ok = json!({ "object": "list", "url": "/v1/customers", "has_more": false,
+        "data": [customer()] });
+    check_payload(&ok).unwrap();
+    let mut extra = ok.clone();
+    extra["next_page_url"] = json!(null);
+    let err = check_payload(&extra).unwrap_err();
+    assert!(err.path.contains("next_page_url"), "{err}");
+    for key in ["url", "has_more"] {
+        let mut missing = ok.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        let err = check_payload(&missing).unwrap_err();
+        assert!(err.message.contains(key), "{key}: {err}");
+    }
+}
+
+#[test]
 fn v2_error_envelope_conforms() {
     let ok = json!({ "error": { "type": "not_found", "code": "not_found", "message": "no" } });
     check_payload(&ok).unwrap();

@@ -393,7 +393,7 @@ pub(crate) fn pay_invoice(
     Some(outcome)
 }
 
-/// Before an open invoice is voided or marked uncollectible: its open invoice payment
+/// Before an open invoice is voided: its open invoice payment
 /// becomes `canceled` (no event; the pinned API has no `invoice_payment.canceled`).
 /// Returns the canceled payment, for the invoice mutation to carry.
 pub(crate) fn cancel_invoice_payment(
@@ -419,7 +419,7 @@ pub(crate) fn cancel_invoice_payment(
     engine.latest_obj(ObjectType::InvoicePayment, &ip.id)
 }
 
-/// After the invoice was voided or marked uncollectible: cancels the payment intent of
+/// After the invoice was voided: cancels the payment intent of
 /// its canceled invoice payment (`payment_intent.canceled`, `cancellation_reason:
 /// void_invoice`) when it waits for a payment method (after a failed attempt).
 pub(crate) fn cancel_intent(engine: &mut Engine, ip: &InvoicePayment, cause: &Cause) {
@@ -551,6 +551,30 @@ pub(crate) fn refund(
 /// The amount and currency of a one-off payment, drawn like a one-off invoice line: an
 /// active price with a non-zero amount (one-time prices first) times a quantity of 1–5.
 /// With no such price, a non-zero catalog amount in a random currency.
+/// Stripe's largest amount for one charge, in the minor unit.
+pub(crate) const MAX_CHARGE_AMOUNT: i64 = 99_999_999;
+
+/// Lowers drawn `quantities` (line by line, in order) so that the sum of `unit ×
+/// quantity` stays within [`MAX_CHARGE_AMOUNT`]. A line that no longer fits gets quantity
+/// 0. Draws nothing: the quantities are drawn before and only capped here.
+pub(crate) fn fit_quantities(units: &[i64], quantities: &mut [u64]) {
+    let mut total = 0;
+    for (unit, q) in units.iter().zip(quantities.iter_mut()) {
+        if *unit > 0 {
+            *q = (*q).min(((MAX_CHARGE_AMOUNT - total) / unit) as u64);
+            total += unit * *q as i64;
+        }
+    }
+}
+
+/// The `unit_amount` of `price` (0 when it has none).
+pub(crate) fn unit_amount(engine: &Engine, price: &str) -> i64 {
+    engine
+        .latest(ObjectType::Price, price)
+        .and_then(|u| u.state["unit_amount"].as_i64())
+        .unwrap_or(0)
+}
+
 pub(super) fn draw_amount(rng: &mut SimRng, engine: &Engine) -> (i64, String) {
     let priced: Vec<(String, i64, bool)> = active_ids(engine, ObjectType::Price)
         .into_iter()
@@ -572,7 +596,8 @@ pub(super) fn draw_amount(rng: &mut SimRng, engine: &Engine) -> (i64, String) {
         return (amount, random_currency(rng).to_string());
     }
     let (currency, unit, _) = *pick(rng, &pool);
-    let quantity = 1 + rng.below(5) as i64;
+    // Capped so the charge stays within Stripe's maximum (a unit never exceeds it).
+    let quantity = (1 + rng.below(5) as i64).min(MAX_CHARGE_AMOUNT / unit);
     (unit * quantity, currency.clone())
 }
 
@@ -608,6 +633,13 @@ pub(crate) fn one_off_payment(
     {
         return Err(MockError::InvalidAction(format!(
             "one_off_payment amount must be at least 1, got {a}"
+        )));
+    }
+    if let Some(a) = amount
+        && a > MAX_CHARGE_AMOUNT
+    {
+        return Err(MockError::InvalidAction(format!(
+            "one_off_payment amount must be at most {MAX_CHARGE_AMOUNT}, got {a}"
         )));
     }
     let customer = match customer {
@@ -824,7 +856,8 @@ pub(crate) fn dispute_update(engine: &mut Engine, id: &str, cause: &Cause) {
 
 /// Closes the dispute with `outcome` (`charge.dispute.closed`). A won dispute first gets
 /// its reinstating balance transaction (`+amount`, the fee returned, `available` at once,
-/// no event) and announces `charge.dispute.funds_reinstated` too.
+/// no event), announces `charge.dispute.funds_reinstated` too, and becomes
+/// `is_charge_refundable: true`, so the charge can be refunded again.
 pub(crate) fn dispute_close(
     engine: &mut Engine,
     ctx: &mut Ctx,
@@ -864,6 +897,10 @@ pub(crate) fn dispute_close(
             |d| {
                 d.status = status;
                 d.balance_transactions.extend(reinstated);
+                // A won chargeback no longer blocks refunds of what is left.
+                if status == DisputeStatus::Won {
+                    d.is_charge_refundable = true;
+                }
             },
             cause.clone(),
             ChangeKind::StateChanged,

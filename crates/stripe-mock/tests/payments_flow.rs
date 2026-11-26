@@ -363,7 +363,7 @@ async fn voided_after_failure_cancels_payment_intent() {
 }
 
 #[tokio::test]
-async fn uncollectible_after_failure_cancels_payment_intent() {
+async fn uncollectible_after_failure_keeps_payment_intent() {
     let m = mock_with("").await;
     m.run_action(Action::StartSubscription {
         customer: None,
@@ -385,13 +385,27 @@ async fn uncollectible_after_failure_cancels_payment_intent() {
         .object_id;
     let inv = m.get(ObjectType::Invoice, &renewal).unwrap();
     assert_eq!(inv.state["status"], "uncollectible");
-    let pis: Vec<StateUpdate> = m
-        .truth_log()
-        .into_iter()
-        .filter(|u| u.object_type == ObjectType::PaymentIntent && u.state["status"] == "canceled")
-        .collect();
-    assert_eq!(pis.len(), 1);
-    assert_eq!(pis[0].state["cancellation_reason"], "void_invoice");
+    // Stripe keeps an uncollectible invoice payable: its payment and intent stay open.
+    let ip = &inv.state["payments"]["data"][0];
+    assert_eq!(ip["status"], "open");
+    let pi = ip["payment"]["payment_intent"].as_str().unwrap();
+    let pi = m.get(ObjectType::PaymentIntent, pi).unwrap();
+    assert_eq!(pi.state["status"], "requires_payment_method");
+    let ip_id = ip["id"].as_str().unwrap();
+    assert_eq!(
+        m.get(ObjectType::InvoicePayment, ip_id).unwrap().state["status"],
+        "open"
+    );
+    assert!(
+        m.truth_log()
+            .iter()
+            .all(|u| u.object_type != ObjectType::PaymentIntent || u.state["status"] != "canceled")
+    );
+    assert!(
+        m.event_timeline()
+            .iter()
+            .all(|e| e.event_type != "payment_intent.canceled")
+    );
 }
 
 #[tokio::test]
@@ -553,4 +567,42 @@ async fn zero_amount_invoice_is_paid_without_payment_objects() {
     );
     assert_eq!(inv["payments"]["data"], serde_json::json!([]));
     assert_eq!(inv["payments"]["total_count"], 0);
+}
+
+#[tokio::test]
+async fn disconnected_account_balance_still_settles() {
+    let m = mock_with("[accounts]\nconnect = true\n").await;
+    let acct = m.connect_account(AccountApi::V1).unwrap();
+    let cause = charged(&m, |retry| {
+        let a = m.account(&acct);
+        if retry {
+            a.run_action(Action::CatalogChange).unwrap();
+        }
+        a.run_action(paid_one_off()).unwrap()
+    });
+    let mine: Vec<StateUpdate> = caused(&m, &cause)
+        .into_iter()
+        .filter(|u| u.account.as_deref() == Some(&*acct))
+        .collect();
+    let txn = only_id(&mine, ObjectType::BalanceTransaction);
+    m.disconnect_account(&acct).unwrap();
+    let events_before = m.event_timeline().len();
+    m.step(Duration::from_secs(2 * DAY + 2)).await.unwrap();
+    let settled = m
+        .truth_log()
+        .into_iter()
+        .rfind(|u| u.object_type == ObjectType::BalanceTransaction && u.object_id == txn)
+        .unwrap();
+    assert_eq!(settled.state["status"], "available");
+    assert_eq!(settled.account.as_deref(), Some(&*acct));
+    assert_eq!(
+        settled.at.to_datetime().timestamp(),
+        settled.state["available_on"].as_i64().unwrap()
+    );
+    assert!(settled.events.snapshot.is_empty() && settled.events.thin.is_empty());
+    assert!(
+        m.event_timeline()[events_before..]
+            .iter()
+            .all(|e| e.object_id != txn)
+    );
 }

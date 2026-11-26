@@ -131,3 +131,30 @@ async fn writes_fire_on_payment_lists() {
             .any(|u| matches!(u.object_type, ObjectType::Charge | ObjectType::Refund))
     );
 }
+
+#[tokio::test]
+async fn writes_fire_on_customer_payment_methods() {
+    let m = mock_with(WRITES).await;
+    let cus = m.create_customer(NewCustomer::default()).unwrap();
+    for _ in 0..3 {
+        m.run_action(Action::SavePaymentMethod {
+            customer: Some(cus.clone()),
+        })
+        .unwrap();
+    }
+    let base = format!("/v1/customers/{cus}/payment_methods?limit=1");
+    let first = page(&m, &base).await;
+    let id = first["data"][0]["id"].as_str().unwrap().to_string();
+    let before = m.truth_log().len();
+    page(&m, &format!("{base}&starting_after={id}")).await;
+    let log = m.truth_log();
+    assert!(log.len() > before, "the later page follows a write");
+    let fresh = &log[before..];
+    assert!(
+        fresh.iter().all(|u| matches!(
+            u.cause.as_ref().map(|c| c.action.as_str()),
+            Some("save_payment_method" | "payment_method_detach")
+        )),
+        "{fresh:?}"
+    );
+}

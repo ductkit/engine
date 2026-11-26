@@ -176,10 +176,16 @@ pub(crate) struct SubscriptionDraw {
     pub items: Vec<(String, String, u64)>,
 }
 
-/// Draws the subscription and item IDs and the item quantities (1-5) for `prices`.
-pub(crate) fn draw_subscription(rng: &mut SimRng, prices: Vec<String>) -> SubscriptionDraw {
+/// Draws the subscription and item IDs and the item quantities (1-5) for `prices`. The
+/// quantities are then capped so one period's charge stays within Stripe's maximum
+/// (see [`payments::fit_quantities`]).
+pub(crate) fn draw_subscription(
+    rng: &mut SimRng,
+    engine: &Engine,
+    prices: Vec<String>,
+) -> SubscriptionDraw {
     let id = rng.id(ObjectType::Subscription.id_prefix());
-    let items = prices
+    let mut items: Vec<(String, String, u64)> = prices
         .into_iter()
         .map(|price| {
             let item = rng.id(ObjectType::SubscriptionItem.id_prefix());
@@ -187,6 +193,15 @@ pub(crate) fn draw_subscription(rng: &mut SimRng, prices: Vec<String>) -> Subscr
             (price, item, quantity)
         })
         .collect();
+    let units: Vec<i64> = items
+        .iter()
+        .map(|(p, _, _)| payments::unit_amount(engine, p))
+        .collect();
+    let mut quantities: Vec<u64> = items.iter().map(|(_, _, q)| *q).collect();
+    payments::fit_quantities(&units, &mut quantities);
+    for (item, q) in items.iter_mut().zip(quantities) {
+        item.2 = q;
+    }
     SubscriptionDraw { id, items }
 }
 
@@ -279,7 +294,7 @@ pub(crate) fn start_subscription(
         Some(p) => p,
         None => choose_prices(rng, engine, &cause),
     };
-    let draw = draw_subscription(rng, prices);
+    let draw = draw_subscription(rng, engine, prices);
     create_subscription(engine, ctx, &customer, &draw, &cause);
     ctx.then(
         engine,

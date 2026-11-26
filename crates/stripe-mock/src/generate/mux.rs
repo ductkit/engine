@@ -3,7 +3,11 @@
 //!
 //! A connected account's generator is built from the platform's current `[actions]`
 //! and `[churn]` config, with every stream name prefixed `account/{acct}/`, and runs
-//! inside that account's scope. Dropping it discards its pending continuations.
+//! inside that account's scope. Dropping it discards its pending continuations; its
+//! queued settlements move to a queue held here, which still runs them at
+//! `available_on` in that account's scope.
+
+use std::collections::BTreeMap;
 
 use crate::engine::{Cause, Engine, Scope};
 use crate::generate::{AccountChange, AccountsGenerator, Action, Generator};
@@ -16,6 +20,10 @@ pub(crate) struct Generators {
     accounts: AccountsGenerator,
     /// In connection order.
     connected: Vec<(String, Generator)>,
+    /// Settlements of disconnected accounts: `(available_on, seq)` to `(account,
+    /// balance transaction, cause)`. Ties run in hand-over order.
+    orphaned: BTreeMap<(SimTime, u64), (String, String, Cause)>,
+    orphaned_seq: u64,
     /// Builds the generators of accounts connected later.
     config: Config,
     streams: RngStreams,
@@ -34,6 +42,8 @@ impl Generators {
                 start,
             ),
             connected: Vec::new(),
+            orphaned: BTreeMap::new(),
+            orphaned_seq: 0,
             config: config.clone(),
             streams: streams.clone(),
             scale: 1.0,
@@ -88,7 +98,17 @@ impl Generators {
                     }
                     self.connected.push((id.clone(), g));
                 }
-                AccountChange::Disconnected(id) => self.connected.retain(|(a, _)| a != id),
+                AccountChange::Disconnected(id) => {
+                    let Some(i) = self.connected.iter().position(|(a, _)| a == id) else {
+                        continue;
+                    };
+                    let (_, mut g) = self.connected.remove(i);
+                    for (at, txn, cause) in g.take_settlements() {
+                        self.orphaned
+                            .insert((at, self.orphaned_seq), (id.clone(), txn, cause));
+                        self.orphaned_seq += 1;
+                    }
+                }
             }
         }
     }
@@ -100,12 +120,13 @@ impl Generators {
             .into_iter()
             .chain(self.accounts.next_due())
             .chain(self.connected.iter().filter_map(|(_, g)| g.next_due()))
+            .chain(self.orphaned.keys().next().map(|(t, _)| *t))
             .min()
     }
 
     /// Runs every due action up to `target` in time order, then sets the time to
     /// `target`. Ties go to the platform, then the accounts generator, then connected
-    /// accounts in connection order.
+    /// accounts in connection order, then disconnected accounts' settlements.
     pub(crate) fn run_until(&mut self, engine: &mut Engine, target: SimTime) {
         loop {
             // Candidates in tie-break order; `min_by_key` keeps the first on ties.
@@ -116,10 +137,12 @@ impl Generators {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, (_, g))| g.next_due().map(|d| (2 + i, d)));
+            let orphaned = self.orphaned.keys().next().map(|(t, _)| (usize::MAX, *t));
             let Some((who, due)) = platform
                 .into_iter()
                 .chain(accounts)
                 .chain(connected)
+                .chain(orphaned)
                 .filter(|(_, d)| *d <= target)
                 .min_by_key(|(_, d)| *d)
             else {
@@ -130,6 +153,15 @@ impl Generators {
                 1 => {
                     let changes = self.accounts.run_due(engine, due);
                     self.apply(engine, &changes);
+                }
+                usize::MAX => {
+                    let Some((_, (acct, txn, cause))) = self.orphaned.pop_first() else {
+                        unreachable!("an orphaned settlement is due");
+                    };
+                    engine.set_now(due);
+                    engine.in_scope(Some(acct), |e| {
+                        super::payments::make_available(e, &txn, &cause)
+                    });
                 }
                 i => {
                     let (id, g) = &mut self.connected[i - 2];

@@ -8,7 +8,7 @@ use axum::Extension;
 use axum::extract::{Path, RawQuery, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::api::expand::expand;
 use crate::api::list::{ListParams, array_base, decode, paginate, parse_list_params};
@@ -17,7 +17,7 @@ use crate::control::ControlOp;
 use crate::engine::store::{ObjectStore, StoredObject};
 use crate::engine::{Engine, Scope, StateUpdate};
 use crate::handle::{Shared, Sim};
-use crate::{ChangeKind, ObjectType, SimTime};
+use crate::{ChangeKind, ObjectType, SimTime, stripe};
 
 /// List order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,18 +349,7 @@ async fn list(
     };
     let mut sim = shared.lock();
     ensure_connected(&sim.engine, &scope)?;
-    // A write during pagination runs before the view is taken, so this page sees it.
-    if (p.starting_after.is_some() || p.ending_before.is_some()) && sim.api.pagination_write() {
-        // Journalled first, so a replay runs the same write at the same time.
-        sim.record(ControlOp::PaginationWrite {
-            account: scope.clone(),
-            object_type: r.t,
-        });
-        let Sim {
-            engine, generators, ..
-        } = &mut *sim;
-        generators.pagination_write(&scope, r.t, engine);
-    }
+    pagination_write(&mut sim, &scope, &p, r.t);
     let at = stale_at(&mut sim);
     let view = View {
         engine: &sim.engine,
@@ -388,14 +377,37 @@ async fn list(
         },
         &p,
     )?;
-    let mut out = json!({
-        "object": "list",
-        "url": r.path,
-        "has_more": has_more,
-        "data": states(&view, &page),
-    });
+    let mut out = v1_list(r.path, has_more, states(&view, &page));
     expand(&view, r.t, &mut out, expand_paths(&p))?;
     Ok(Json(out))
+}
+
+/// A write during pagination of a `t` list: on a page after the first, when drawn. It
+/// runs before the view is taken, so this page sees it.
+fn pagination_write(sim: &mut Sim, scope: &Scope, p: &ListParams, t: ObjectType) {
+    if (p.starting_after.is_some() || p.ending_before.is_some()) && sim.api.pagination_write() {
+        // Journalled first, so a replay runs the same write at the same time.
+        sim.record(ControlOp::PaginationWrite {
+            account: scope.clone(),
+            object_type: t,
+        });
+        let Sim {
+            engine, generators, ..
+        } = sim;
+        generators.pagination_write(scope, t, engine);
+    }
+}
+
+/// A v1 list page, serialized from the typed envelope.
+pub(crate) fn v1_list(url: impl Into<String>, has_more: bool, data: Vec<Value>) -> Value {
+    serde_json::to_value(stripe::List {
+        object: stripe::ListObject::List,
+        data,
+        has_more,
+        url: url.into(),
+        total_count: None,
+    })
+    .expect("a list serializes")
 }
 
 /// Draws whether this object read is stale, and if so the time it shows.
@@ -479,12 +491,11 @@ pub(crate) async fn invoice_lines(
         .store()
         .children(ObjectType::InvoiceLineItem, "invoice", &id);
     let (page, has_more) = paginate(&lines, |o| view.listed(o).is_some(), &p)?;
-    let mut out = json!({
-        "object": "list",
-        "url": format!("/v1/invoices/{id}/lines"),
-        "has_more": has_more,
-        "data": states(&view, &page),
-    });
+    let mut out = v1_list(
+        format!("/v1/invoices/{id}/lines"),
+        has_more,
+        states(&view, &page),
+    );
     expand(
         &view,
         ObjectType::InvoiceLineItem,
@@ -505,6 +516,7 @@ pub(crate) async fn customer_payment_methods(
     let p = parse_list_params(decode(query), &["type"], &["expand"])?;
     let mut sim = shared.lock();
     ensure_connected(&sim.engine, &scope)?;
+    pagination_write(&mut sim, &scope, &p, r.t);
     let at = stale_at(&mut sim);
     let view = View {
         engine: &sim.engine,
@@ -528,12 +540,11 @@ pub(crate) async fn customer_payment_methods(
         },
         &p,
     )?;
-    let mut out = json!({
-        "object": "list",
-        "url": format!("/v1/customers/{id}/payment_methods"),
-        "has_more": has_more,
-        "data": states(&view, &page),
-    });
+    let mut out = v1_list(
+        format!("/v1/customers/{id}/payment_methods"),
+        has_more,
+        states(&view, &page),
+    );
     expand(&view, r.t, &mut out, expand_paths(&p))?;
     Ok(Json(out))
 }

@@ -76,7 +76,7 @@ pub(crate) fn checkout_action(
             let recurring = active_recurring_prices(engine);
             (!recurring.is_empty()).then(|| {
                 let prices = pick_prices(rng, engine, recurring);
-                draw_subscription(rng, prices)
+                draw_subscription(rng, engine, prices)
             })
         }
         CheckoutMode::Payment => None,

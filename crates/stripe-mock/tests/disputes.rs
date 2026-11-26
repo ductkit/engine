@@ -453,3 +453,45 @@ async fn dispute_events_reach_connect_destinations() {
         ]
     );
 }
+
+fn refund(m: &MockStripe, charge: &str) -> Result<Cause, MockError> {
+    m.run_action(Action::Refund {
+        charge: Some(charge.to_string()),
+        amount: None,
+    })
+}
+
+#[tokio::test]
+async fn won_dispute_makes_charge_refundable_again() {
+    let m = mock_with("seed = 5").await;
+    let ch = paid_charge(&m, |a| m.run_action(a), 2500);
+    let cause = dispute(&m, &ch, DisputeOutcome::Won).unwrap();
+    let du = only_id(&caused(&m, &cause), ObjectType::Dispute);
+    assert!(
+        refund(&m, &ch).is_err(),
+        "an open chargeback blocks refunds"
+    );
+    m.step(Duration::from_secs(70 * 86_400)).await.unwrap();
+    let d = json(&m, &format!("/v1/disputes/{du}")).await;
+    assert_eq!(d["status"], "won");
+    assert_eq!(d["is_charge_refundable"], true);
+    let cause = refund(&m, &ch).unwrap();
+    let re = only_id(&caused(&m, &cause), ObjectType::Refund);
+    assert_eq!(
+        m.get(ObjectType::Refund, &re).unwrap().state["amount"],
+        2500
+    );
+}
+
+#[tokio::test]
+async fn lost_dispute_keeps_charge_unrefundable() {
+    let m = mock_with("seed = 5").await;
+    let ch = paid_charge(&m, |a| m.run_action(a), 2500);
+    let cause = dispute(&m, &ch, DisputeOutcome::Lost).unwrap();
+    let du = only_id(&caused(&m, &cause), ObjectType::Dispute);
+    m.step(Duration::from_secs(70 * 86_400)).await.unwrap();
+    let d = json(&m, &format!("/v1/disputes/{du}")).await;
+    assert_eq!(d["status"], "lost");
+    assert_eq!(d["is_charge_refundable"], false);
+    assert!(refund(&m, &ch).is_err());
+}

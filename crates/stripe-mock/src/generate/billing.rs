@@ -274,33 +274,25 @@ pub(crate) fn void(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     done
 }
 
-/// `open → uncollectible`, canceling an open invoice payment and its intent like
-/// [`void`].
+/// `open → uncollectible`. Unlike [`void`], the invoice stays payable, so an open invoice
+/// payment (left by a failed attempt) and its payment intent are left as they are.
 pub(crate) fn mark_uncollectible(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     if status(engine, id).as_deref() != Some("open") {
         return false;
     }
     let now = engine.now().unix_seconds();
-    let payment = payments::cancel_invoice_payment(engine, id, cause);
-    let done = transition(
+    transition(
         engine,
         id,
         &["open"],
         |i| {
             i.status = Some(Some(InvoiceStatus::Uncollectible));
             i.status_transitions.marked_uncollectible_at = Some(Some(now));
-            if let Some(p) = &payment {
-                sync_payment(i, p, None);
-            }
         },
         ChangeKind::StateChanged,
         &["invoice.marked_uncollectible"],
         cause,
-    );
-    if let Some(p) = &payment {
-        payments::cancel_intent(engine, p, cause);
-    }
-    done
+    )
 }
 
 /// Deletes a draft: its lines first (unannounced), then the invoice (`invoice.deleted`).
@@ -429,7 +421,7 @@ pub(crate) fn one_off_invoice(
     let pool = if one_time.is_empty() { same } else { one_time };
     let now = engine.now().unix_seconds();
     let n = 1 + rng.below(3);
-    let lines: Vec<LineSpec> = (0..n)
+    let mut lines: Vec<LineSpec> = (0..n)
         .map(|_| LineSpec {
             price: pick(rng, &pool).clone(),
             quantity: 1 + rng.below(5),
@@ -437,6 +429,15 @@ pub(crate) fn one_off_invoice(
             period: (now, now),
         })
         .collect();
+    let units: Vec<i64> = lines
+        .iter()
+        .map(|l| payments::unit_amount(engine, &l.price))
+        .collect();
+    let mut quantities: Vec<u64> = lines.iter().map(|l| l.quantity).collect();
+    payments::fit_quantities(&units, &mut quantities);
+    for (l, q) in lines.iter_mut().zip(quantities) {
+        l.quantity = q;
+    }
     let id = create_draft_invoice(
         engine,
         ctx,

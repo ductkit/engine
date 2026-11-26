@@ -414,6 +414,16 @@ impl Generator {
         }
     }
 
+    /// Removes the queued settlements, in due order: `(available_on, balance
+    /// transaction, cause)`. A disconnected account's generator hands them on so they
+    /// still settle.
+    pub(crate) fn take_settlements(&mut self) -> Vec<(SimTime, String, Cause)> {
+        std::mem::take(&mut self.ctx.settlements)
+            .into_iter()
+            .map(|((at, _), (id, cause))| (at, id, cause))
+            .collect()
+    }
+
     /// The earliest due action, continuation or settlement (only settlements while
     /// disabled).
     pub(crate) fn next_due(&self) -> Option<SimTime> {

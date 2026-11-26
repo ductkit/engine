@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, RawQuery, State};
 use axum::{Extension, Json};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::api::list::decode;
 use crate::api::list::{paginate, parse_list_params};
@@ -12,6 +12,7 @@ use crate::api::{ApiError, RequestScope, ensure_connected};
 use crate::engine::Engine;
 use crate::engine::events::{EventFormat, EventRecord, with_pending_webhooks};
 use crate::handle::Shared;
+use crate::stripe;
 
 /// `pattern` matches `event_type` exactly, as `*`, or as a `prefix.*` wildcard.
 pub(crate) fn type_matches(pattern: &str, event_type: &str) -> bool {
@@ -38,7 +39,7 @@ pub(crate) async fn list(
     State(shared): State<Arc<Shared>>,
     Extension(RequestScope(scope)): Extension<RequestScope>,
     RawQuery(query): RawQuery,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<stripe::List<Value>>, ApiError> {
     let p = parse_list_params(decode(query), &["type", "delivery_success"], &["types"])?;
     let single = p.extra.get("type").cloned();
     let types = p.extra_multi.get("types").cloned();
@@ -106,12 +107,13 @@ pub(crate) async fn list(
         &p,
     )?;
     let data: Vec<Value> = page.iter().map(|r| served(engine, r)).collect();
-    Ok(Json(json!({
-        "object": "list",
-        "url": "/v1/events",
-        "has_more": has_more,
-        "data": data,
-    })))
+    Ok(Json(stripe::List {
+        object: stripe::ListObject::List,
+        data,
+        has_more,
+        url: "/v1/events".to_string(),
+        total_count: None,
+    }))
 }
 
 pub(crate) async fn retrieve(
