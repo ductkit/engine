@@ -145,7 +145,7 @@ The sync situation each type adds is the reason it is there. ID prefixes below a
 | `payment_intent` | `pi_` | `canceled` status | fast status churn (`requires_payment_method → processing → succeeded`, failures) |
 | `charge` | `ch_` (`py_` on connected accounts for destination charges) | none (`refunded`, `disputed` flags) | updated by children (refunds, disputes) |
 | `refund` | `re_` | `canceled` / `failed` status | appears standalone (`/v1/refunds`) and nested (`charge.refunds`, embedded in the pinned schema); `refund.created/updated/failed` events |
-| `dispute` | `dp_` | `closed` statuses (`won`, `lost`, …) | lives for weeks of simulated time, with many updates; `charge.dispute.*` events |
+| `dispute` | `du_` | `closed` statuses (`won`, `lost`, …) | lives for weeks of simulated time, with many updates; `charge.dispute.*` events |
 | `balance_transaction` | `txn_` | none | **no events of its own**: found only by listing; `status` changes `pending → available` silently on `available_on` |
 | `payment_method` | `pm_` | **detach** (`customer` becomes null, stays retrievable) | listing needs a customer (`/v1/payment_methods?customer=`, `/v1/customers/{id}/payment_methods`) |
 | `setup_intent` | `seti_` | `canceled` status | creates payment methods |

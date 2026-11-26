@@ -386,13 +386,9 @@ async fn list(
         },
         &p,
     )?;
-    let url = match r.required {
-        Some(name) => format!("{}?{name}={}", r.path, p.extra[name]),
-        None => r.path.to_string(),
-    };
     let mut out = json!({
         "object": "list",
-        "url": url,
+        "url": r.path,
         "has_more": has_more,
         "data": states(&view, &page),
     });

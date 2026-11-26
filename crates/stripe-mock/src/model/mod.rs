@@ -102,7 +102,7 @@ impl ObjectType {
             ObjectType::PaymentIntent => "pi",
             ObjectType::Charge => "ch",
             ObjectType::Refund => "re",
-            ObjectType::Dispute => "dp",
+            ObjectType::Dispute => "du",
             ObjectType::BalanceTransaction => "txn",
             ObjectType::PaymentMethod => "pm",
             ObjectType::SetupIntent => "seti",

@@ -32,7 +32,7 @@ async fn new_lists_are_empty_and_well_formed() {
         assert_eq!(v["object"], "list", "{path}");
         assert_eq!(v["data"].as_array().unwrap().len(), 0, "{path}");
         assert_eq!(v["has_more"], false, "{path}");
-        assert_eq!(v["url"], format!("{path}{query}"), "{path}");
+        assert_eq!(v["url"], path, "{path}");
     }
 }
 
@@ -96,7 +96,11 @@ async fn unknown_payment_ids_404() {
 #[tokio::test]
 async fn new_endpoints_are_read_only() {
     let m = mock_with("").await;
-    for (path, _) in LISTS {
+    let mut paths: Vec<String> = LISTS.iter().map(|(p, _)| p.to_string()).collect();
+    paths.extend(LISTS.iter().map(|(p, _)| format!("{p}/x_1")));
+    paths.push("/v1/charges/ch_1".to_string());
+    paths.push("/v1/customers/cus_1/payment_methods".to_string());
+    for path in paths {
         let r = reqwest::Client::new()
             .post(format!("{}{path}", m.api_url()))
             .bearer_auth("sk_test_mock")
@@ -120,7 +124,7 @@ fn new_types_have_the_documented_names() {
         ),
         (ObjectType::Charge, "charge", "charge", "ch"),
         (ObjectType::Refund, "refund", "refund", "re"),
-        (ObjectType::Dispute, "dispute", "dispute", "dp"),
+        (ObjectType::Dispute, "dispute", "dispute", "du"),
         (
             ObjectType::BalanceTransaction,
             "balance_transaction",
