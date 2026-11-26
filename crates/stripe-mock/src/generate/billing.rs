@@ -6,13 +6,13 @@
 
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::generate::catalog::{active_ids, create_product_now, draw_new_product};
-use crate::generate::{Continuation, Ctx, create_random_customer, pick};
+use crate::generate::{Continuation, Ctx, create_random_customer, payments, pick};
 use crate::model::invoice::{
     BillingReason, LineSpec, NewInvoice, NewLine, deleted_invoice, deleted_line, new_invoice,
     new_line,
 };
 use crate::rng::SimRng;
-use crate::stripe::{Customer, Invoice, InvoiceStatus, Price};
+use crate::stripe::{Customer, Invoice, InvoicePayment, InvoiceStatus, Price};
 use crate::{MockError, ObjectType};
 
 /// How a one-off invoice ends.
@@ -171,8 +171,15 @@ pub(crate) fn finalize(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     done
 }
 
-/// `open → paid`.
-pub(crate) fn pay(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
+/// `open → paid`, with `payment` appended to `invoice.payments` (the embedded list keeps
+/// its first `page_size` entries).
+pub(crate) fn pay(
+    engine: &mut Engine,
+    id: &str,
+    payment: &InvoicePayment,
+    page_size: usize,
+    cause: &Cause,
+) -> bool {
     let now = engine.now().unix_seconds();
     transition(
         engine,
@@ -185,6 +192,15 @@ pub(crate) fn pay(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
             i.attempted = true;
             i.attempt_count += 1;
             i.status_transitions.paid_at = Some(Some(now));
+            if let Some(list) = i.payments.as_mut() {
+                let count = list.total_count.unwrap_or(list.data.len() as i64) + 1;
+                if list.data.len() < page_size {
+                    list.data.push(payment.clone());
+                } else {
+                    list.has_more = true;
+                }
+                list.total_count = Some(count);
+            }
         },
         ChangeKind::StateChanged,
         &["invoice.paid", "invoice.payment_succeeded"],
@@ -208,10 +224,10 @@ pub(crate) fn fail_payment(engine: &mut Engine, id: &str, cause: &Cause) -> bool
     )
 }
 
-/// `open → void`.
+/// `open → void`, then the cancel of a payment intent left by a failed attempt.
 pub(crate) fn void(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     let now = engine.now().unix_seconds();
-    transition(
+    let done = transition(
         engine,
         id,
         &["open"],
@@ -222,13 +238,17 @@ pub(crate) fn void(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
         ChangeKind::StateChanged,
         &["invoice.voided"],
         cause,
-    )
+    );
+    if done {
+        payments::cancel_invoice_intent(engine, id, cause);
+    }
+    done
 }
 
-/// `open → uncollectible`.
+/// `open → uncollectible`, then the cancel of a payment intent left by a failed attempt.
 pub(crate) fn mark_uncollectible(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     let now = engine.now().unix_seconds();
-    transition(
+    let done = transition(
         engine,
         id,
         &["open"],
@@ -239,7 +259,11 @@ pub(crate) fn mark_uncollectible(engine: &mut Engine, id: &str, cause: &Cause) -
         ChangeKind::StateChanged,
         &["invoice.marked_uncollectible"],
         cause,
-    )
+    );
+    if done {
+        payments::cancel_invoice_intent(engine, id, cause);
+    }
+    done
 }
 
 /// Deletes a draft: its lines first (unannounced), then the invoice (`invoice.deleted`).
@@ -277,15 +301,18 @@ pub(crate) fn delete_draft(engine: &mut Engine, id: &str, cause: &Cause) -> bool
     true
 }
 
-/// One payment attempt: fails with `actions.payment_failure_probability`
-/// (drawn from `"generate.billing"`). Returns whether it was paid.
+/// One payment attempt on an open invoice: fails with
+/// `actions.payment_failure_probability` (drawn from `"generate.billing"`, as before
+/// payment objects existed), and creates its payment objects (see
+/// [`payments::pay_invoice`]). Returns whether it was paid; an invoice that is no longer
+/// open is left alone.
 pub(crate) fn attempt_payment(engine: &mut Engine, ctx: &mut Ctx, id: &str, cause: &Cause) -> bool {
-    if ctx.billing.chance(ctx.config.payment_failure_probability) {
-        fail_payment(engine, id, cause);
-        false
-    } else {
-        pay(engine, id, cause)
+    let succeed = !ctx.billing.chance(ctx.config.payment_failure_probability);
+    if status(engine, id).as_deref() != Some("open") {
+        return false;
     }
+    payments::pay_invoice(engine, ctx, id, succeed, cause);
+    succeed
 }
 
 /// A live customer: the named one, or a random one, or a new one.

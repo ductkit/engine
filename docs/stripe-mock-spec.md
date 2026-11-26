@@ -309,7 +309,7 @@ Coverage follows what a Stripe Connect integration needs, most-used first. Each 
 | `checkout.session` | expires | dotted object name; creates a payment or a subscription |
 | `invoice_payment` | none | links an invoice to its payments (`invoice.payments`) |
 
-Paying an invoice creates, in one action: a payment intent, a charge with its balance transaction, an invoice payment, and the paid invoice. Events: `payment_intent.created`, `charge.succeeded`, `payment_intent.succeeded`, `invoice_payment.paid`, `invoice.paid`, `invoice.payment_succeeded`. A failed attempt creates a failed charge instead. Finalizing stays a separate, earlier step. New actions: `one_off_payment`, `refund` and `dispute` (until now reserved keys), plus `save_payment_method`, `checkout` and `[churn.payment_method] detach`.
+Paying an invoice creates, in one action: a payment intent, a charge with its balance transaction, an invoice payment, and the paid invoice. The customer's card payment method is created and attached first if it has none (`payment_method.attached`). Events: `payment_intent.created`, `charge.succeeded`, `payment_intent.succeeded`, `invoice_payment.paid`, `invoice.paid`, `invoice.payment_succeeded`. A failed attempt creates a failed charge instead. Finalizing stays a separate, earlier step. New actions: `one_off_payment`, `refund` and `dispute` (until now reserved keys), plus `save_payment_method`, `checkout` and `[churn.payment_method] detach`.
 
 **Phase 8: Connect money movement.**
 
@@ -341,11 +341,11 @@ In Stripe, one action produces many events across objects. The generator models 
 
 1. `customer.subscription.created`
 2. `invoice.created` → `invoice.finalized`
-3. `payment_intent.created` → `payment_intent.succeeded`, `charge.succeeded`
+3. `payment_method.attached` (the customer's first payment only), `payment_intent.created`, `charge.succeeded`, `payment_intent.succeeded`, `invoice_payment.paid`
 4. `invoice.paid`, `invoice.payment_succeeded`
 5. `customer.subscription.updated` (status `incomplete → active`)
 
-Until payment objects exist (phase 7), paying an invoice is one mutation announcing `invoice.paid` and `invoice.payment_succeeded`. Phase 7 replaces it with the payment sequence in section 5.5.
+Paying an invoice runs the payment sequence of section 5.5, one mutation per step, all in the same simulated instant: the customer's card (created and attached only if it has none, `payment_method.attached`), the payment intent (`requires_confirmation`, `payment_intent.created`), the charge's `pending` balance transaction (no event; fee 2.9% + 30 in the minor unit, `available_on` two days later), the charge (`charge.succeeded`), the intent `succeeded` (`payment_intent.succeeded`), the invoice payment (`invoice_payment.paid`), and the paid invoice with the payment in `invoice.payments` (`invoice.paid`, `invoice.payment_succeeded`). A failed attempt creates a `failed` charge (`card_declined`, `charge.failed`), returns the intent to `requires_payment_method` (`payment_intent.payment_failed`), then announces `invoice.payment_failed`. A retry of the invoice reuses its payment intent with a new charge. Voiding the invoice or marking it uncollectible after a failure cancels the intent (`payment_intent.canceled`, `cancellation_reason: void_invoice`). At `available_on` the balance transaction becomes `available` without an event. Payment draws come from the stream `generate.payments`; whether an attempt fails is still drawn from `generate.billing`.
 
 Mutations inside one action are spaced over a short, configurable span (often the same second), which produces the cross-object races that matter. Per-type `churn` rates add independent updates and deletes on top.
 

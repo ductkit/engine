@@ -13,6 +13,7 @@ mod accounts;
 mod billing;
 mod catalog;
 mod mux;
+mod payments;
 mod subscriptions;
 
 pub(crate) use accounts::{AccountChange, AccountsGenerator};
@@ -141,6 +142,10 @@ pub(crate) enum Continuation {
         sub: String,
         invoice: String,
     },
+    /// A charge's balance transaction becomes `available` (silently) at `available_on`.
+    BalanceAvailable {
+        id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -166,6 +171,9 @@ pub(crate) struct Ctx {
     /// Draws made inside billing flows and continuations: invoice and line IDs,
     /// payment outcomes.
     pub billing: SimRng,
+    /// Draws for payment objects (stream `"generate.payments"`): their IDs and card
+    /// details. Whether a payment succeeds stays a `billing` draw.
+    pub payments: SimRng,
 }
 
 impl Ctx {
@@ -311,6 +319,7 @@ impl Generator {
                 next_seq: 0,
                 lifecycle: stream("generate.lifecycle"),
                 billing: stream("generate.billing"),
+                payments: stream("generate.payments"),
             },
             control: stream("control.actions"),
             pagination_rng: stream("api.pagination_writes.content"),
@@ -581,6 +590,7 @@ fn run_continuation(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mu
         Continuation::SetDefaultPrice { product, price } => {
             catalog::set_default_price(engine, &product, &price, &cause);
         }
+        Continuation::BalanceAvailable { id } => payments::make_available(engine, &id, &cause),
         c @ (Continuation::SubscriptionInvoice { .. }
         | Continuation::FinalizeFirstInvoice { .. }
         | Continuation::PayFirstInvoice { .. }
