@@ -61,6 +61,19 @@ pub enum Action {
         id: Option<String>,
         at_period_end: Option<bool>,
     },
+    /// A payment with no invoice for the named customer, or a random one or none (drawn
+    /// when `None`). `amount` and the outcome (`succeed`) are drawn when `None`.
+    OneOffPayment {
+        customer: Option<String>,
+        amount: Option<i64>,
+        succeed: Option<bool>,
+    },
+    /// Refund `amount` (drawn when `None`) of the named or a random refundable charge.
+    /// A named charge that cannot be refunded is an error naming it.
+    Refund {
+        charge: Option<String>,
+        amount: Option<i64>,
+    },
 }
 
 /// Generated actions, in tie-break order. New kinds are appended, so existing
@@ -80,6 +93,8 @@ enum ActionKind {
     StartSubscription,
     CancelSubscription,
     SubscriptionUpdate,
+    OneOffPayment,
+    Refund,
 }
 
 /// A follow-up step of an action.
@@ -303,6 +318,12 @@ impl Generator {
                 c.subscription.update,
                 "generate.subscription.update",
             ),
+            (
+                ActionKind::OneOffPayment,
+                a.one_off_payment,
+                "generate.one_off_payment",
+            ),
+            (ActionKind::Refund, a.refund, "generate.refund"),
         ];
         let actions = specs
             .into_iter()
@@ -387,6 +408,8 @@ impl Generator {
                 ActionKind::OneOffInvoice => config.one_off_invoice,
                 ActionKind::StartSubscription => config.start_subscription,
                 ActionKind::CancelSubscription => config.cancel_subscription,
+                ActionKind::OneOffPayment => config.one_off_payment,
+                ActionKind::Refund => config.refund,
                 _ => continue,
             };
             a.base_rate = rate;
@@ -531,6 +554,24 @@ impl Generator {
                             "no active or past_due subscription to cancel".to_string(),
                         )
                     })?
+            }
+            Action::OneOffPayment {
+                customer,
+                amount,
+                succeed,
+            } => payments::one_off_payment(
+                &mut self.control,
+                engine,
+                &mut self.ctx,
+                customer,
+                amount,
+                succeed,
+            )?,
+            Action::Refund { charge, amount } => {
+                payments::refund_action(&mut self.control, engine, &mut self.ctx, charge, amount)?
+                    .ok_or_else(|| {
+                    MockError::InvalidAction("no succeeded charge to refund".to_string())
+                })?
             }
         };
         self.run_due_now(engine);
@@ -716,6 +757,14 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
                 .expect("random targets are valid");
         }
         ActionKind::SubscriptionUpdate => subscriptions::churn_update(rng, engine),
+        ActionKind::OneOffPayment => {
+            payments::one_off_payment(rng, engine, ctx, None, None, None)
+                .expect("random targets are valid");
+        }
+        ActionKind::Refund => {
+            payments::refund_action(rng, engine, ctx, None, None)
+                .expect("random targets are valid");
+        }
     }
 }
 

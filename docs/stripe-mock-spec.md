@@ -135,13 +135,13 @@ new_customer = 10.0
 start_subscription = 4.0
 cancel_subscription = 0.5
 renew_subscription_cycle = "natural"   # driven by billing periods
-one_off_payment = 6.0
-refund = 0.4
-dispute = 0.05
+one_off_payment = 6.0                  # a payment with no invoice
+refund = 0.4                           # a full or partial refund of a random succeeded charge
+dispute = 0.05                         # reserved until disputes land: rejected as not implemented
 catalog_change = 0.2                   # products/prices created, archived
 one_off_invoice = 2.0                  # a manual invoice, with a drawn outcome
 step_delay = { distribution = "lognormal", median_ms = 200, p99_ms = 2000 }   # gap between an action's steps
-payment_failure_probability = 0.1      # per invoice payment attempt
+payment_failure_probability = 0.1      # per payment attempt (invoice or one-off)
 
 # Extra per-type churn on top of actions.
 [churn.customer]
@@ -220,6 +220,12 @@ Destination rules:
 - `@organization_members…` values are rejected as not implemented (organizations are out of scope).
 
 Limits (config files and the runtime `set_*_config` ops alike; a violation is a config error, 400 `config` on the control API): Every duration must be at most 100 years; `clock.speed` at most 1e6. That covers each duration string, each retry-schedule entry, the `ms` and `p99_ms` of every distribution, `api.stale_read.max_lag`, `history.duration` and `event_retention.window`. The error names the key and the limit. `POST /control/speed` applies the same speed cap.
+
+`[actions]` payment rules:
+
+- Every rate defaults to 0. `actions.dispute` is still reserved: any value is rejected as not implemented (phase 7), so the example above fails on that key alone.
+- `one_off_payment` runs a payment with no invoice and no invoice payment: the payment method (the customer's card, or a new unattached card without a customer), a payment intent and one confirmation, with the events of section 6.1 from `payment_method.attached` to `payment_intent.succeeded` (or `charge.failed`, `payment_intent.payment_failed`). The customer is a random live one, or none with probability 0.2 (or when there is no live customer). The amount is drawn like a one-off invoice line: an active price with a non-zero unit amount (one-time prices first) times a quantity of 1–5, or a non-zero catalog amount in a random currency when there is no such price. The outcome fails with `payment_failure_probability`. Draws come from the stream `generate.one_off_payment`, the payment objects' from `generate.payments`.
+- `refund` refunds a random charge with `status: succeeded` and something left to refund (none: nothing happens). It refunds everything left with probability 0.7, otherwise a uniform amount in `[1, left]`. One mutation each, in order: the refund's balance transaction (`type: refund`, `-amount`, no fee, `available` at once, no event), the refund (`succeeded`, `refund.created`), and the charge (`amount_refunded` increased, `refunded` once fully refunded, the refund first in the embedded `charge.refunds`; `charge.refunded`; no `charge.refund.updated`). Draws come from the stream `generate.refund`, the IDs from `generate.payments`.
 
 Configuration can be changed at runtime through the control API (section 11). Changes are recorded in the truth log, so replays reproduce them.
 
@@ -556,6 +562,8 @@ All routes are under `/control` on the control port. Bodies are JSON. `{d}` is a
 | `POST /shutdown` | – | 202, then a graceful shutdown of the whole server |
 
 Mutating calls other than `step`, `advance_to`, `quiesce`, pause, resume and speed go through `POST /control/ops`. That gives one route, one schema and the same shape as scripts and the journal. `ControlOp` covers customer create, update and delete (with an optional `account`), `run_action`, connect and disconnect account, config updates (`set_api_config`, `set_events_config`, `set_webhooks_config`, `set_actions_config`), and destination add, remove, enable, outage start and end, and secret rotation.
+
+`run_action` takes an `Action`, tagged by `type` in snake case: `new_customer`, `catalog_change`, `archive {id}`, `one_off_invoice {customer, outcome}`, `start_subscription {customer, prices}`, `cancel_subscription {id, at_period_end}`, `one_off_payment {customer, amount, succeed}` and `refund {charge, amount}`. Fields left out or `null` are drawn as the generated action draws them, for example `{"op": "run_action", "action": {"type": "refund", "charge": "ch_…", "amount": 500}}`. `refund` with a named charge that has not succeeded or has less than `amount` (or nothing) left to refund is a 409 `invalid_action` naming the charge, and so is a `refund` with no charge when no charge is refundable; a `one_off_payment` `amount` below 1 is a 409 `invalid_action` too.
 
 **Errors** use one JSON envelope: `{"error": {"code": "<snake_case error name>", "message": "<text>"}}`. Status by error:
 

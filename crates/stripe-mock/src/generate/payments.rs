@@ -1,20 +1,30 @@
-//! Payments (spec sections 5.5 and 6.1): the objects an invoice payment creates.
+//! Payments (spec sections 5.5 and 6.1): the objects an invoice payment creates, and the
+//! `one_off_payment` and `refund` actions.
 //!
-//! Every draw here (IDs, card details, risk scores) comes from `ctx.payments`
-//! (stream `"generate.payments"`); whether a payment succeeds is decided by the caller.
+//! Every object draw here (IDs, card details, risk scores) comes from `ctx.payments`
+//! (stream `"generate.payments"`); whether a payment succeeds, and an action's targets and
+//! amounts, are decided by the caller or drawn from the action's own stream.
 
 use crate::engine::{Cause, ChangeKind, Engine};
-use crate::generate::{Ctx, billing};
+use crate::generate::catalog::active_ids;
+use crate::generate::{Ctx, billing, pick};
+use crate::model::catalog::{random_currency, random_nonzero_amount};
 use crate::model::payments::{
-    CardDraw, NewCharge, NewPaymentIntent, decline_error, new_card_payment_method, new_charge,
-    new_charge_balance_transaction, new_invoice_payment, new_payment_intent,
+    CardDraw, NewCharge, NewPaymentIntent, NewRefund, decline_error, new_card_payment_method,
+    new_charge, new_charge_balance_transaction, new_invoice_payment, new_payment_intent,
+    new_refund, new_refund_balance_transaction, push_refund,
 };
 use crate::rng::SimRng;
 use crate::stripe::{
-    BalanceTransaction, Expandable, Invoice, InvoicePayment, PaymentIntent,
+    BalanceTransaction, Charge, Expandable, Invoice, InvoicePayment, PaymentIntent,
     PaymentIntentCancellationReason, PaymentIntentStatus, PaymentMethod,
 };
-use crate::{ObjectType, SimTime};
+use crate::{MockError, ObjectType, SimTime};
+
+/// Chance that a generated one-off payment has no customer.
+const NO_CUSTOMER_PROBABILITY: f64 = 0.2;
+/// Chance that a refund with no given amount refunds everything left.
+const FULL_REFUND_PROBABILITY: f64 = 0.7;
 
 /// The objects one payment attempt created or used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,7 +241,6 @@ fn confirm(
 /// The shared core of a payment: the payment method (the customer's card, or a new
 /// unattached one without a customer), a new payment intent, and one confirmation.
 #[allow(clippy::too_many_arguments)] // each argument is part of the payment
-#[allow(dead_code)] // used by `one_off_payment` (phase 7, task 10)
 pub(crate) fn charge_once(
     engine: &mut Engine,
     ctx: &mut Ctx,
@@ -429,4 +438,220 @@ pub(crate) fn make_available(engine: &mut Engine, id: &str, cause: &Cause) {
             )
             .expect("live balance transaction");
     }
+}
+
+/// What is left to refund on `charge`: `None` unless it `succeeded` with something left.
+fn refundable(engine: &Engine, charge: &str) -> Option<i64> {
+    let c = engine.latest(ObjectType::Charge, charge)?;
+    if c.state["status"] != "succeeded" {
+        return None;
+    }
+    let amount = c.state["amount"].as_i64()?;
+    let refunded = c.state["amount_refunded"].as_i64()?;
+    (refunded < amount).then_some(amount - refunded)
+}
+
+/// Refunds `amount` of `charge`: the refund's balance transaction (`type: refund`,
+/// `-amount`, `available` at once, no event), the refund, `succeeded`
+/// (`refund.created`), then the charge with `amount_refunded`, `refunded` and the refund
+/// first in `charge.refunds` (`charge.refunded`). Returns the refund, or `None` if the
+/// charge has not succeeded or has less than `amount` (or nothing) left to refund.
+pub(crate) fn refund(
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    charge: &str,
+    amount: i64,
+    cause: &Cause,
+) -> Option<String> {
+    let left = refundable(engine, charge)?;
+    if amount < 1 || amount > left {
+        return None;
+    }
+    let ch: Charge = engine.latest_obj(ObjectType::Charge, charge)?;
+    let created = engine.now().unix_seconds();
+    let id = ctx.payments.id(ObjectType::Refund.id_prefix());
+    let txn = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
+    let bt = new_refund_balance_transaction(&txn, created, amount, &ch.currency, &id);
+    engine.create_obj(
+        ObjectType::BalanceTransaction,
+        txn.clone(),
+        &bt,
+        cause.clone(),
+        &[],
+    );
+    let re = new_refund(&NewRefund {
+        id: &id,
+        created,
+        amount,
+        balance_transaction: &txn,
+        charge: &ch,
+    });
+    engine.create_obj(
+        ObjectType::Refund,
+        id.clone(),
+        &re,
+        cause.clone(),
+        &["refund.created"],
+    );
+    let page_size = ctx.page_size;
+    engine
+        .update_obj::<Charge>(
+            ObjectType::Charge,
+            charge,
+            |c| {
+                c.amount_refunded += amount;
+                c.refunded = c.amount_refunded == c.amount;
+                push_refund(c, re, page_size);
+            },
+            cause.clone(),
+            ChangeKind::Updated,
+            &["charge.refunded"],
+        )
+        .expect("live charge");
+    Some(id)
+}
+
+/// The amount and currency of a one-off payment, drawn like a one-off invoice line: an
+/// active price with a non-zero amount (one-time prices first) times a quantity of 1–5.
+/// With no such price, a non-zero catalog amount in a random currency.
+fn draw_amount(rng: &mut SimRng, engine: &Engine) -> (i64, String) {
+    let priced: Vec<(String, i64, bool)> = active_ids(engine, ObjectType::Price)
+        .into_iter()
+        .filter_map(|id| {
+            let p = &engine.latest(ObjectType::Price, &id)?.state;
+            let amount = p["unit_amount"].as_i64().filter(|a| *a > 0)?;
+            let currency = p["currency"].as_str()?.to_string();
+            Some((currency, amount, p["type"] == "one_time"))
+        })
+        .collect();
+    let one_time: Vec<&(String, i64, bool)> = priced.iter().filter(|p| p.2).collect();
+    let pool: Vec<&(String, i64, bool)> = if one_time.is_empty() {
+        priced.iter().collect()
+    } else {
+        one_time
+    };
+    if pool.is_empty() {
+        let amount = random_nonzero_amount(rng);
+        return (amount, random_currency(rng).to_string());
+    }
+    let (currency, unit, _) = *pick(rng, &pool);
+    let quantity = 1 + rng.below(5) as i64;
+    (unit * quantity, currency.clone())
+}
+
+fn live_customer(engine: &Engine, id: String) -> Result<String, MockError> {
+    match engine.latest(ObjectType::Customer, &id) {
+        None => Err(MockError::NoSuchObject {
+            object_type: ObjectType::Customer,
+            id,
+        }),
+        Some(u) if u.kind == ChangeKind::Deleted => Err(MockError::Deleted {
+            object_type: ObjectType::Customer,
+            id,
+        }),
+        Some(_) => Ok(id),
+    }
+}
+
+/// `one_off_payment`: a payment with no invoice (see [`charge_once`]), for the named
+/// customer, or a random live one, or none (probability 0.2, or when there is no live
+/// customer). `amount` and `succeed` are drawn when `None`; a drawn outcome fails with
+/// `actions.payment_failure_probability`. Every draw but the payment objects' comes from
+/// `rng`.
+pub(crate) fn one_off_payment(
+    rng: &mut SimRng,
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    customer: Option<String>,
+    amount: Option<i64>,
+    succeed: Option<bool>,
+) -> Result<Cause, MockError> {
+    if let Some(a) = amount
+        && a < 1
+    {
+        return Err(MockError::InvalidAction(format!(
+            "one_off_payment amount must be at least 1, got {a}"
+        )));
+    }
+    let customer = match customer {
+        Some(id) => Some(live_customer(engine, id)?),
+        None => {
+            let live = engine.store().live_ids(ObjectType::Customer);
+            if rng.chance(NO_CUSTOMER_PROBABILITY) || live.is_empty() {
+                None
+            } else {
+                Some(pick(rng, live).clone())
+            }
+        }
+    };
+    let (drawn, currency) = draw_amount(rng, engine);
+    let amount = amount.unwrap_or(drawn);
+    let succeed = succeed.unwrap_or_else(|| !rng.chance(ctx.config.payment_failure_probability));
+    let cause = engine.begin_action("one_off_payment");
+    charge_once(
+        engine,
+        ctx,
+        customer.as_deref(),
+        amount,
+        &currency,
+        succeed,
+        &cause,
+    );
+    Ok(cause)
+}
+
+/// `refund`: refunds the named charge, or a random `succeeded` one with something left
+/// to refund. With no `amount`, everything left is refunded with probability 0.7, else a
+/// uniform amount in `[1, left]`. Returns `None` when no charge was named and none is
+/// refundable; a named charge that cannot be refunded, or an `amount` outside
+/// `[1, left]`, is an `InvalidAction` error naming the charge.
+pub(crate) fn refund_action(
+    rng: &mut SimRng,
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    charge: Option<String>,
+    amount: Option<i64>,
+) -> Result<Option<Cause>, MockError> {
+    let (charge, left) = match charge {
+        Some(id) => {
+            if engine.latest(ObjectType::Charge, &id).is_none() {
+                return Err(MockError::NoSuchObject {
+                    object_type: ObjectType::Charge,
+                    id,
+                });
+            }
+            let Some(left) = refundable(engine, &id) else {
+                return Err(MockError::InvalidAction(format!(
+                    "charge {id} cannot be refunded: it did not succeed or is fully refunded"
+                )));
+            };
+            (id, left)
+        }
+        None => {
+            let candidates: Vec<(&String, i64)> = engine
+                .store()
+                .live_ids(ObjectType::Charge)
+                .iter()
+                .filter_map(|id| refundable(engine, id).map(|left| (id, left)))
+                .collect();
+            if candidates.is_empty() {
+                return Ok(None);
+            }
+            let (id, left) = *pick(rng, &candidates);
+            (id.clone(), left)
+        }
+    };
+    let amount = match amount {
+        Some(a) if (1..=left).contains(&a) => a,
+        Some(a) => {
+            return Err(MockError::InvalidAction(format!(
+                "cannot refund {a} of charge {charge}: {left} left to refund"
+            )));
+        }
+        None if rng.chance(FULL_REFUND_PROBABILITY) => left,
+        None => 1 + rng.below(left as u64) as i64,
+    };
+    let cause = engine.begin_action("refund");
+    refund(engine, ctx, &charge, amount, &cause).expect("the charge is refundable");
+    Ok(Some(cause))
 }

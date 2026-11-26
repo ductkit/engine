@@ -613,6 +613,157 @@ pub(crate) fn new_charge_balance_transaction(
     }
 }
 
+/// Inputs for a refund.
+pub(crate) struct NewRefund<'a> {
+    pub id: &'a str,
+    pub created: i64,
+    pub amount: i64,
+    pub balance_transaction: &'a str,
+    /// The refunded charge.
+    pub charge: &'a stripe::Charge,
+}
+
+/// A `succeeded` card refund of `charge`; its card reference is still `pending`, so it
+/// has no `reference` yet.
+pub(crate) fn new_refund(r: &NewRefund) -> stripe::Refund {
+    let c = r.charge;
+    stripe::Refund {
+        amount: r.amount,
+        application: Some(None),
+        balance_transaction: Some(Some(Expandable::Id(r.balance_transaction.to_string()))),
+        charge: Some(Some(Expandable::Id(c.id.clone()))),
+        created: r.created,
+        currency: c.currency.clone(),
+        customer: Some(
+            c.customer
+                .clone()
+                .flatten()
+                .map(|cu| Expandable::Id(cu.id().to_string())),
+        ),
+        customer_account: Some(None),
+        description: None,
+        destination_details: Some(refund_destination_details()),
+        failure_balance_transaction: None,
+        failure_reason: None,
+        id: r.id.to_string(),
+        instructions_email: None,
+        metadata: Some(Some(BTreeMap::new())),
+        next_action: None,
+        object: stripe::RefundObject::Refund,
+        payment_intent: Some(
+            c.payment_intent
+                .clone()
+                .flatten()
+                .map(|p| Expandable::Id(p.id().to_string())),
+        ),
+        payment_method: Some(c.payment_method.clone().flatten().map(Expandable::Id)),
+        pending_reason: None,
+        presentment_details: None,
+        reason: Some(None),
+        receipt_number: Some(None),
+        source_transfer_reversal: Some(None),
+        status: Some(Some("succeeded".to_string())),
+        transfer_reversal: Some(None),
+    }
+}
+
+fn refund_destination_details() -> stripe::RefundDestinationDetails {
+    stripe::RefundDestinationDetails {
+        affirm: None,
+        afterpay_clearpay: None,
+        alipay: None,
+        alma: None,
+        amazon_pay: None,
+        au_bank_transfer: None,
+        bizum: None,
+        blik: None,
+        br_bank_transfer: None,
+        card: Some(stripe::RefundDestinationDetailsCard {
+            reference: None,
+            reference_status: Some("pending".to_string()),
+            reference_type: Some("acquirer_reference_number".to_string()),
+            type_: stripe::RefundDestinationDetailsCardType::Refund,
+        }),
+        cashapp: None,
+        crypto: None,
+        customer_cash_balance: None,
+        eps: None,
+        eu_bank_transfer: None,
+        gb_bank_transfer: None,
+        giropay: None,
+        grabpay: None,
+        jp_bank_transfer: None,
+        klarna: None,
+        mb_way: None,
+        multibanco: None,
+        mx_bank_transfer: None,
+        nz_bank_transfer: None,
+        p24: None,
+        paynow: None,
+        paypal: None,
+        pix: None,
+        revolut: None,
+        scalapay: None,
+        sofort: None,
+        swish: None,
+        th_bank_transfer: None,
+        twint: None,
+        type_: "card".to_string(),
+        upi: None,
+        us_bank_transfer: None,
+        wechat_pay: None,
+        zip: None,
+    }
+}
+
+/// The balance transaction of a refund: `-amount`, no fee, `available` at once.
+pub(crate) fn new_refund_balance_transaction(
+    id: &str,
+    created: i64,
+    amount: i64,
+    currency: &str,
+    refund: &str,
+) -> stripe::BalanceTransaction {
+    stripe::BalanceTransaction {
+        amount: -amount,
+        available_on: created,
+        balance_type: stripe::BalanceTransactionBalanceType::Payments,
+        created,
+        currency: currency.to_string(),
+        description: Some(None),
+        exchange_rate: Some(None),
+        fee: 0,
+        fee_details: Vec::new(),
+        id: id.to_string(),
+        net: -amount,
+        object: stripe::BalanceTransactionObject::BalanceTransaction,
+        reporting_category: "refund".to_string(),
+        source: Some(Some(Expandable::Id(refund.to_string()))),
+        status: "available".to_string(),
+        type_: stripe::BalanceTransactionType::Refund,
+    }
+}
+
+/// Puts `refund` first in the charge's embedded `refunds` (newest first, as Stripe lists
+/// them), keeping at most `page_size` entries.
+pub(crate) fn push_refund(c: &mut stripe::Charge, refund: stripe::Refund, page_size: usize) {
+    let list = c
+        .refunds
+        .get_or_insert_with(|| None)
+        .get_or_insert_with(|| List {
+            object: ListObject::List,
+            data: Vec::new(),
+            has_more: false,
+            url: refunds_url(&c.id),
+            total_count: Some(0),
+        });
+    let count = list.total_count.unwrap_or(list.data.len() as i64) + 1;
+    list.data.insert(0, refund);
+    list.data.truncate(page_size);
+    list.total_count = Some(count);
+    list.has_more = count > list.data.len() as i64;
+}
+
 /// An `open` invoice payment through a payment intent, created at the invoice's first
 /// payment attempt; `amount_paid` is null until it is paid.
 pub(crate) fn new_invoice_payment(
@@ -730,6 +881,50 @@ mod tests {
             "txn_2", 10, 0, "usd", "ch_1",
         ));
         assert_eq!(zero["fee_details"], serde_json::json!([]));
+
+        let mut ch = new_charge(&NewCharge {
+            id: "ch_1",
+            created: 1,
+            amount: 1000,
+            currency: "usd",
+            customer: None,
+            payment_intent: "pi_1",
+            payment_method: &pm,
+            succeeded: true,
+            balance_transaction: Some("txn_1"),
+            risk_score: 20,
+            network_transaction_id: "123456789012345",
+        });
+        let re = new_refund(&NewRefund {
+            id: "re_1",
+            created: 2,
+            amount: 400,
+            balance_transaction: "txn_3",
+            charge: &ch,
+        });
+        let v = conforms(&re);
+        assert_eq!(v["status"], "succeeded");
+        assert_eq!(v["customer"], Value::Null);
+        assert_eq!(v["payment_method"], "pm_1");
+        assert_eq!(v["destination_details"]["card"]["type"], "refund");
+        for i in 0..3 {
+            let mut r = re.clone();
+            r.id = format!("re_{i}");
+            push_refund(&mut ch, r, 2);
+        }
+        let v = conforms(&ch);
+        assert_eq!(v["refunds"]["total_count"], 3);
+        assert_eq!(v["refunds"]["has_more"], true);
+        assert_eq!(v["refunds"]["data"][0]["id"], "re_2");
+        assert_eq!(v["refunds"]["data"].as_array().unwrap().len(), 2);
+        let txn = conforms(&new_refund_balance_transaction(
+            "txn_3", 2, 400, "usd", "re_1",
+        ));
+        assert_eq!(
+            (txn["amount"].clone(), txn["net"].clone()),
+            ((-400).into(), (-400).into())
+        );
+        assert_eq!(txn["type"], "refund");
 
         let ip = conforms(&new_invoice_payment(
             "inpay_1", 1, "in_1", 1000, "usd", "pi_1",

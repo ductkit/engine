@@ -137,6 +137,11 @@ pub(crate) fn random_currency(rng: &mut SimRng) -> &'static str {
     unreachable!("weights sum to 100")
 }
 
+/// A non-zero price amount, for a payment billed without a price.
+pub(crate) fn random_nonzero_amount(rng: &mut SimRng) -> i64 {
+    *rng.choose(&AMOUNTS[1..])
+}
+
 /// `Some(interval)` with `recurring`, else a one-time price.
 pub(crate) fn random_price(
     rng: &mut SimRng,

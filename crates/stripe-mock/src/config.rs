@@ -20,11 +20,8 @@ pub const MAX_SPEED: f64 = 1e6;
 
 /// Spec keys inside supported sections that are not implemented yet, with an
 /// optional reason appended to the error.
-const UNIMPLEMENTED_KEYS: [(&str, &[&str], &str); 1] = [(
-    "actions",
-    &["one_off_payment", "refund", "dispute"],
-    " (needs payment objects, phase 7)",
-)];
+const UNIMPLEMENTED_KEYS: [(&str, &[&str], &str); 1] =
+    [("actions", &["dispute"], " (needs disputes, phase 7)")];
 
 /// The first spec section or key that is not implemented, e.g. `[history]` or
 /// `api.latency`, with its reason.
@@ -338,10 +335,14 @@ pub struct ActionsConfig {
     pub cancel_subscription: f64,
     pub catalog_change: f64,
     pub one_off_invoice: f64,
+    /// A payment with no invoice, for a random customer or none.
+    pub one_off_payment: f64,
+    /// A full or partial refund of a random refundable charge.
+    pub refund: f64,
     pub renew_subscription_cycle: RenewMode,
     /// Gap between consecutive steps of one action.
     pub step_delay: Distribution,
-    /// Chance that an invoice payment attempt fails.
+    /// Chance that a payment attempt (an invoice's or a one-off payment) fails.
     pub payment_failure_probability: f64,
 }
 
@@ -353,6 +354,8 @@ impl ActionsConfig {
             ("actions.cancel_subscription", self.cancel_subscription),
             ("actions.catalog_change", self.catalog_change),
             ("actions.one_off_invoice", self.one_off_invoice),
+            ("actions.one_off_payment", self.one_off_payment),
+            ("actions.refund", self.refund),
         ] {
             check_rate(name, rate)?;
         }
@@ -1057,17 +1060,23 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_section_is_named() {
-        let e = Config::from_toml_str("[actions]\none_off_payment = 1").unwrap_err();
-        let msg = e.to_string();
-        assert!(
-            msg.contains("`actions.one_off_payment`") && msg.contains("not implemented"),
-            "{msg}"
-        );
+    fn config_accepts_one_off_payment_and_refund_rates() {
+        let c = Config::from_toml_str("[actions]\none_off_payment = 6.0\nrefund = 0.4").unwrap();
+        assert_eq!((c.actions.one_off_payment, c.actions.refund), (6.0, 0.4));
+        let d = Config::default().actions;
+        assert_eq!((d.one_off_payment, d.refund), (0.0, 0.0));
+        for key in ["one_off_payment", "refund"] {
+            let msg = Config::from_toml_str(&format!("[actions]\n{key} = -1.0"))
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains(&format!("actions.{key}")), "{msg}");
+        }
     }
 
+    /// The spec's example config uses every action key; `dispute` is the only one still
+    /// reserved, so the example fails on it alone.
     #[test]
-    fn spec_example_config_fails_clearly() {
+    fn spec_example_config_fails_only_on_dispute() {
         let spec = include_str!("../../../docs/stripe-mock-spec.md");
         let toml = spec
             .split("```toml\n")
@@ -1078,9 +1087,16 @@ mod tests {
             .unwrap();
         let msg = Config::from_toml_str(toml).unwrap_err().to_string();
         assert!(
-            msg.contains("`actions.one_off_payment`") && msg.contains("not implemented"),
+            msg.contains("`actions.dispute`") && msg.contains("not implemented"),
             "{msg}"
         );
+        let without_dispute: String = toml
+            .lines()
+            .filter(|l| !l.starts_with("dispute ="))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let c = Config::from_toml_str(&without_dispute).unwrap();
+        assert_eq!((c.actions.one_off_payment, c.actions.refund), (6.0, 0.4));
     }
 
     #[test]
@@ -1130,7 +1146,7 @@ scale = 0.5",
     fn not_implemented_message_is_tidy() {
         let msg = Config::from_toml_str(
             "[actions]
-one_off_payment = 1",
+dispute = 1",
         )
         .unwrap_err()
         .to_string();
@@ -1358,12 +1374,12 @@ enabled_events = [\"{events}\"]
     }
 
     #[test]
-    fn payment_objects_not_implemented() {
-        let msg = Config::from_toml_str("[actions]\nrefund = 0.4")
+    fn dispute_not_implemented() {
+        let msg = Config::from_toml_str("[actions]\ndispute = 0.05")
             .unwrap_err()
             .to_string();
         assert!(
-            msg.contains("`actions.refund`") && msg.contains("phase 7"),
+            msg.contains("`actions.dispute`") && msg.contains("phase 7"),
             "{msg}"
         );
     }
