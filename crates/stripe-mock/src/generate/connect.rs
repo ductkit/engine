@@ -6,16 +6,17 @@
 
 use chrono::Datelike;
 
-use super::ExternalAccountKind;
+use super::{Ctx, ExternalAccountKind, pick};
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::model::connect::{
-    BankAccountDraw, DebitCardDraw, PersonDraw, apply_person_contact, deleted_bank_account,
-    deleted_card, deleted_person, is_representative, new_bank_account, new_debit_card, new_person,
-    representative_due,
+    BankAccountDraw, DebitCardDraw, NewApplicationFee, PersonDraw, apply_person_contact,
+    deleted_bank_account, deleted_card, deleted_person, fee_refunds_url, is_representative,
+    new_application_fee, new_application_fee_balance_transaction, new_bank_account, new_debit_card,
+    new_fee_refund, new_fee_refund_balance_transaction, new_person, representative_due,
 };
 use crate::rng::SimRng;
 use crate::stripe;
-use crate::{AccountKind, MockError, ObjectType};
+use crate::{AccountKind, MockError, ObjectType, SimTime};
 
 const BANKS: [&str; 4] = [
     "STRIPE TEST BANK",
@@ -385,5 +386,255 @@ pub(super) fn delete_person(
             .update_account_with(&acct, representative_due, &["account.updated"])
             .expect("the account is connected");
     }
+    Ok(Some(cause))
+}
+
+/// Chance that an application fee refund with no given amount refunds everything left.
+const FULL_FEE_REFUND_PROBABILITY: f64 = 0.7;
+
+/// Whether the payment intent about to be created in the engine's scope carries an
+/// application fee, and how much. Only a connected account's scope can: the platform's own
+/// payments never do. With `accounts.application_fee.probability` at 0 nothing is drawn.
+pub(super) fn draw_application_fee(engine: &Engine, ctx: &mut Ctx, amount: i64) -> Option<i64> {
+    let (probability, percent) = (ctx.application_fee.probability, ctx.application_fee.percent);
+    if engine.scope().is_none() || probability <= 0.0 || !ctx.fee_rng.chance(probability) {
+        return None;
+    }
+    // Rounded half up; no fee when that is 0.
+    let fee = (amount as f64 * percent / 100.0 + 0.5).floor() as i64;
+    (fee > 0).then_some(fee)
+}
+
+/// What the platform needs to record the fee of one succeeded direct charge.
+pub(super) struct FeeCollection<'a> {
+    /// The fee's ID, drawn before the charge was built.
+    pub fee: &'a str,
+    pub charge: &'a str,
+    pub amount: i64,
+    pub currency: &'a str,
+    /// The platform's application (`ca_...`).
+    pub application: &'a str,
+    /// The charge's `available_on`, which the fee's balance transaction shares.
+    pub available_on: i64,
+}
+
+/// Collects the application fee of a succeeded direct charge, run in the connected
+/// account's scope after `payment_intent.succeeded`. In the platform scope, under the same
+/// cause: the fee's `pending` balance transaction, then the fee (`application_fee.created`).
+/// The settlement of the balance transaction is queued with the platform as its scope.
+pub(super) fn collect_application_fee(
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    f: &FeeCollection,
+    cause: &Cause,
+) {
+    let account = engine
+        .scope()
+        .clone()
+        .expect("a direct charge is made in a connected account scope");
+    let created = engine.now().unix_seconds();
+    let bt_id = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
+    let bt = new_application_fee_balance_transaction(
+        &bt_id,
+        created,
+        f.available_on,
+        f.amount,
+        f.currency,
+        f.fee,
+    );
+    let fee = new_application_fee(&NewApplicationFee {
+        id: f.fee,
+        created,
+        account: &account,
+        application: f.application,
+        charge: f.charge,
+        amount: f.amount,
+        currency: f.currency,
+        balance_transaction: &bt_id,
+    });
+    engine.in_scope(None, |e| {
+        e.create_obj(
+            ObjectType::BalanceTransaction,
+            bt_id.clone(),
+            &bt,
+            cause.clone(),
+            &[],
+        );
+        e.create_obj(
+            ObjectType::ApplicationFee,
+            f.fee.to_string(),
+            &fee,
+            cause.clone(),
+            &["application_fee.created"],
+        );
+    });
+    ctx.schedule_settlement(
+        SimTime(f.available_on * 1000),
+        Some(None),
+        bt_id,
+        cause.clone(),
+    );
+}
+
+/// What is left to refund of an application fee: `None` when it is fully refunded or its
+/// account has disconnected.
+fn refundable_fee(engine: &Engine, fee: &str) -> Option<i64> {
+    let state = &engine.latest(ObjectType::ApplicationFee, fee)?.state;
+    let account = state["account"].as_str()?;
+    if !engine.account_meta(account).is_some_and(|m| m.connected) {
+        return None;
+    }
+    let left = state["amount"].as_i64()? - state["amount_refunded"].as_i64()?;
+    (left > 0).then_some(left)
+}
+
+/// Refunds `amount` (all of what is left with p = 0.7, else a uniform amount in
+/// `[1, left]`, when `None`) of the named or a random application fee with something left.
+/// Platform scope only. `None` when no fee was named and none can be refunded; a named fee
+/// that cannot be refunded, or an `amount` outside `[1, left]`, is an error naming it.
+///
+/// Under one cause: the platform's balance transaction (`type: application_fee_refund`,
+/// `-amount`, `available` at once), the `fee_refund` (no event), the fee with
+/// `amount_refunded`, `refunded` and the refund first in `refunds`
+/// (`application_fee.refunded`), then the account's balance transaction in its own scope
+/// (`+amount`, `available` at once, no event).
+pub(super) fn application_fee_refund(
+    rng: &mut SimRng,
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    fee: Option<String>,
+    amount: Option<i64>,
+) -> Result<Option<Cause>, MockError> {
+    if engine.scope().is_some() {
+        return Err(MockError::InvalidAction(format!(
+            "application_fee_refund runs in the platform scope, not {}",
+            scope_name(engine)
+        )));
+    }
+    let (fee, left) = match fee {
+        Some(id) => {
+            if engine.latest(ObjectType::ApplicationFee, &id).is_none() {
+                return Err(MockError::NoSuchObject {
+                    object_type: ObjectType::ApplicationFee,
+                    id,
+                });
+            }
+            let Some(left) = refundable_fee(engine, &id) else {
+                return Err(MockError::InvalidAction(format!(
+                    "application fee {id} cannot be refunded: it is fully refunded or its \
+                     account has disconnected"
+                )));
+            };
+            (id, left)
+        }
+        None => {
+            let candidates: Vec<(&String, i64)> = engine
+                .store()
+                .live_ids(ObjectType::ApplicationFee)
+                .iter()
+                .filter_map(|id| refundable_fee(engine, id).map(|left| (id, left)))
+                .collect();
+            if candidates.is_empty() {
+                return Ok(None);
+            }
+            let (id, left) = *pick(rng, &candidates);
+            (id.clone(), left)
+        }
+    };
+    let amount = match amount {
+        Some(a) if (1..=left).contains(&a) => a,
+        Some(a) => {
+            return Err(MockError::InvalidAction(format!(
+                "cannot refund {a} of application fee {fee}: {left} left to refund"
+            )));
+        }
+        None if rng.chance(FULL_FEE_REFUND_PROBABILITY) => left,
+        None => 1 + rng.below(left as u64) as i64,
+    };
+    let state = engine
+        .latest(ObjectType::ApplicationFee, &fee)
+        .expect("the fee exists")
+        .state
+        .clone();
+    let account = state["account"]
+        .as_str()
+        .expect("a fee names its account")
+        .to_string();
+    let currency = state["currency"]
+        .as_str()
+        .expect("a fee has a currency")
+        .to_string();
+    let created = engine.now().unix_seconds();
+    let refund_id = ctx.payments.id(ObjectType::FeeRefund.id_prefix());
+    let bt_id = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
+    let account_bt_id = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
+    let cause = engine.begin_action("application_fee_refund");
+
+    let bt = new_fee_refund_balance_transaction(&bt_id, created, -amount, &currency, &refund_id);
+    engine.create_obj(
+        ObjectType::BalanceTransaction,
+        bt_id.clone(),
+        &bt,
+        cause.clone(),
+        &[],
+    );
+    let refund = new_fee_refund(&refund_id, created, &fee, amount, &currency, &bt_id);
+    engine.create_obj(
+        ObjectType::FeeRefund,
+        refund_id.clone(),
+        &refund,
+        cause.clone(),
+        &[],
+    );
+    // Newest first, cut to the page size.
+    let ids: Vec<String> = engine
+        .store()
+        .children(ObjectType::FeeRefund, "fee", &fee)
+        .into_iter()
+        .rev()
+        .filter(|o| !o.deleted)
+        .map(|o| o.latest.object_id.clone())
+        .collect();
+    let data: Vec<stripe::FeeRefund> = ids
+        .iter()
+        .take(ctx.page_size)
+        .map(|id| {
+            engine
+                .latest_obj(ObjectType::FeeRefund, id)
+                .expect("live fee refund")
+        })
+        .collect();
+    let list = stripe::List {
+        object: stripe::ListObject::List,
+        data,
+        has_more: ids.len() > ctx.page_size,
+        url: fee_refunds_url(&fee),
+        total_count: None,
+    };
+    engine
+        .update_obj::<stripe::ApplicationFee>(
+            ObjectType::ApplicationFee,
+            &fee,
+            |f| {
+                f.amount_refunded += amount;
+                f.refunded = f.amount_refunded == f.amount;
+                f.refunds = list;
+            },
+            cause.clone(),
+            ChangeKind::Updated,
+            &["application_fee.refunded"],
+        )
+        .expect("live application fee");
+    let account_bt =
+        new_fee_refund_balance_transaction(&account_bt_id, created, amount, &currency, &refund_id);
+    engine.in_scope(Some(account), |e| {
+        e.create_obj(
+            ObjectType::BalanceTransaction,
+            account_bt_id,
+            &account_bt,
+            cause.clone(),
+            &[],
+        );
+    });
     Ok(Some(cause))
 }

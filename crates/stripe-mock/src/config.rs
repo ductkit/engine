@@ -52,6 +52,28 @@ pub struct AccountsConfig {
     pub account_api: AccountApiMix,
     /// Type mix of v1 accounts.
     pub account_types: AccountTypeMix,
+    /// Application fees on connected accounts' direct charges (needs `connect`).
+    pub application_fee: ApplicationFeeConfig,
+}
+
+/// Which direct charges of connected accounts carry an application fee, and how big it is.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApplicationFeeConfig {
+    /// Chance that a payment created in a connected account's scope carries a fee. At 0
+    /// (the default) nothing is drawn.
+    pub probability: f64,
+    /// The fee as a percentage of the amount, in `(0, 100]`.
+    pub percent: f64,
+}
+
+impl Default for ApplicationFeeConfig {
+    fn default() -> Self {
+        ApplicationFeeConfig {
+            probability: 0.0,
+            percent: 10.0,
+        }
+    }
 }
 
 /// How many connected accounts exist and how often they come and go.
@@ -91,6 +113,7 @@ impl Default for AccountsConfig {
             connected_accounts: ConnectedAccounts::default(),
             account_api: AccountApiMix::default(),
             account_types: AccountTypeMix::default(),
+            application_fee: ApplicationFeeConfig::default(),
         }
     }
 }
@@ -124,6 +147,19 @@ impl AccountsConfig {
         )?;
         if !self.connect && (c.initial != 0 || c.connect_rate != 0.0 || c.deauthorize_rate != 0.0) {
             return config_err("`accounts.connected_accounts` needs `accounts.connect = true`");
+        }
+        let fee = &self.application_fee;
+        check_probability("accounts.application_fee.probability", fee.probability)?;
+        if !(fee.percent > 0.0 && fee.percent <= 100.0) {
+            return config_err(format!(
+                "accounts.application_fee.percent must be in (0, 100], got {}",
+                fee.percent
+            ));
+        }
+        if !self.connect && fee.probability != 0.0 {
+            return config_err(
+                "`accounts.application_fee` with a probability above 0 needs `accounts.connect = true`",
+            );
         }
         check_mix(
             "accounts.account_api",
@@ -327,6 +363,9 @@ pub struct ActionsConfig {
     pub save_payment_method: f64,
     /// A Checkout session for a random customer, in payment or subscription mode.
     pub checkout: f64,
+    /// A full or partial refund of a random application fee with something left (the
+    /// platform scope only).
+    pub application_fee_refund: f64,
     pub renew_subscription_cycle: RenewMode,
     /// Gap between consecutive steps of one action.
     pub step_delay: Distribution,
@@ -347,6 +386,10 @@ impl ActionsConfig {
             ("actions.dispute", self.dispute),
             ("actions.save_payment_method", self.save_payment_method),
             ("actions.checkout", self.checkout),
+            (
+                "actions.application_fee_refund",
+                self.application_fee_refund,
+            ),
         ] {
             check_rate(name, rate)?;
         }
@@ -1629,6 +1672,90 @@ update = 0.0"
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn application_fee_needs_connect() {
+        let d = Config::default().accounts.application_fee;
+        assert_eq!((d.probability, d.percent), (0.0, 10.0));
+        let msg = Config::from_toml_str(
+            "[accounts]
+application_fee = { probability = 0.5 }",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.contains("accounts.application_fee") && msg.contains("accounts.connect = true"),
+            "{msg}"
+        );
+        let c = Config::from_toml_str(
+            "[accounts]
+connect = true
+application_fee = { probability = 0.5 }",
+        )
+        .unwrap()
+        .accounts
+        .application_fee;
+        assert_eq!((c.probability, c.percent), (0.5, 10.0));
+        // A probability of 0 needs nothing.
+        assert!(
+            Config::from_toml_str(
+                "[accounts]
+application_fee = { probability = 0.0, percent = 20.0 }"
+            )
+            .is_ok()
+        );
+        let msg = Config::from_toml_str(
+            "[accounts]
+connect = true
+application_fee = { probability = 1.5 }",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.contains("accounts.application_fee.probability"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn application_fee_percent_bounds() {
+        for bad in ["0.0", "-1.0", "100.5", "nan"] {
+            let msg = Config::from_toml_str(&format!(
+                "[accounts]
+connect = true
+application_fee = {{ probability = 0.5, percent = {bad} }}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                msg.contains("accounts.application_fee.percent"),
+                "{bad}: {msg}"
+            );
+        }
+        for ok in ["0.01", "10.0", "100.0"] {
+            assert!(
+                Config::from_toml_str(&format!(
+                    "[accounts]
+connect = true
+application_fee = {{ probability = 0.5, percent = {ok} }}"
+                ))
+                .is_ok(),
+                "{ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn application_fee_refund_rate_is_a_rate() {
+        assert_eq!(Config::default().actions.application_fee_refund, 0.0);
+        let msg = Config::from_toml_str(
+            "[actions]
+application_fee_refund = -1.0",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("actions.application_fee_refund"), "{msg}");
     }
 
     #[test]

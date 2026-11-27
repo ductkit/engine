@@ -182,6 +182,8 @@ pub(crate) struct NewPaymentIntent<'a> {
     pub customer: Option<&'a str>,
     pub payment_method: &'a str,
     pub client_secret: &'a str,
+    /// The fee a connected account's direct charge pays the platform.
+    pub application_fee_amount: Option<i64>,
 }
 
 fn card_options() -> stripe::PaymentIntentPaymentMethodOptions {
@@ -289,7 +291,7 @@ pub(crate) fn new_payment_intent(p: &NewPaymentIntent) -> stripe::PaymentIntent 
         ),
         amount_received: Some(0),
         application: Some(None),
-        application_fee_amount: Some(None),
+        application_fee_amount: Some(p.application_fee_amount),
         automatic_payment_methods: Some(None),
         canceled_at: Some(None),
         cancellation_reason: Some(None),
@@ -368,6 +370,8 @@ pub(crate) struct NewCharge<'a> {
     pub balance_transaction: Option<&'a str>,
     pub risk_score: i64,
     pub network_transaction_id: &'a str,
+    /// The platform's application fee on a succeeded direct charge: its ID and amount.
+    pub application_fee: Option<(&'a str, i64)>,
 }
 
 fn outcome(succeeded: bool, risk_score: i64) -> stripe::ChargeOutcome {
@@ -530,8 +534,11 @@ pub(crate) fn new_charge(c: &NewCharge) -> stripe::Charge {
         amount_captured: if c.succeeded { c.amount } else { 0 },
         amount_refunded: 0,
         application: Some(None),
-        application_fee: Some(None),
-        application_fee_amount: Some(None),
+        application_fee: Some(
+            c.application_fee
+                .map(|(id, _)| Expandable::Id(id.to_string())),
+        ),
+        application_fee_amount: Some(c.application_fee.map(|(_, amount)| amount)),
         balance_transaction: Some(c.balance_transaction.map(|t| Expandable::Id(t.to_string()))),
         billing_details: c.payment_method.billing_details.clone(),
         calculated_statement_descriptor: Some(Some("DUCTKIT MOCK".to_string())),
@@ -719,6 +726,25 @@ fn refund_destination_details() -> stripe::RefundDestinationDetails {
         wechat_pay: None,
         zip: None,
     }
+}
+
+/// Adds the platform's application fee to a charge's balance transaction, before it is
+/// created: `fee` grows by `fee`, a second `fee_details` entry names the platform's
+/// application (`ca_…`), and `net` follows.
+pub(crate) fn add_application_fee(
+    txn: &mut stripe::BalanceTransaction,
+    fee: i64,
+    application: &str,
+) {
+    txn.fee += fee;
+    txn.net -= fee;
+    txn.fee_details.push(stripe::Fee {
+        amount: fee,
+        application: Some(Some(application.to_string())),
+        currency: txn.currency.clone(),
+        description: Some(Some("Application fee".to_string())),
+        type_: "application_fee".to_string(),
+    });
 }
 
 /// The balance transaction of a refund: `-amount`, no fee, `available` at once.
@@ -1135,6 +1161,7 @@ mod tests {
             customer: Some("cus_1"),
             payment_method: "pm_1",
             client_secret: "pi_1_secret_x",
+            application_fee_amount: None,
         });
         let v = conforms(&pi);
         assert_eq!(v["status"], "requires_confirmation");
@@ -1154,6 +1181,7 @@ mod tests {
                 balance_transaction: succeeded.then_some("txn_1"),
                 risk_score: 20,
                 network_transaction_id: "123456789012345",
+                application_fee: None,
             });
             let v = conforms(&ch);
             assert_eq!(v["paid"], succeeded);
@@ -1170,6 +1198,15 @@ mod tests {
             (59.into(), 941.into())
         );
         assert_eq!(v["available_on"], 10 + AVAILABLE_AFTER_SECS);
+        let mut with_fee = txn.clone();
+        add_application_fee(&mut with_fee, 100, "ca_1");
+        let v = conforms(&with_fee);
+        assert_eq!(
+            (v["fee"].clone(), v["net"].clone()),
+            (159.into(), 841.into())
+        );
+        assert_eq!(v["fee_details"][1]["type"], "application_fee");
+        assert_eq!(v["fee_details"][1]["application"], "ca_1");
         let zero = conforms(&new_charge_balance_transaction(
             "txn_2", 10, 0, "usd", "ch_1",
         ));
@@ -1187,6 +1224,7 @@ mod tests {
             balance_transaction: Some("txn_1"),
             risk_score: 20,
             network_transaction_id: "123456789012345",
+            application_fee: None,
         });
         let re = new_refund(&NewRefund {
             id: "re_1",

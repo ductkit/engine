@@ -700,7 +700,10 @@ async fn sub_list(
     if view.visible(sub.parent, id).is_none() {
         return Err(no_such(sub.parent, id));
     }
-    let all = view.store().children(sub.child, sub.field, id);
+    // Stripe lists a fee's refunds and a transfer's reversals newest first, like the
+    // embedded lists.
+    let mut all = view.store().children(sub.child, sub.field, id);
+    all.reverse();
     let (page, has_more) = paginate(
         &all,
         |o| p.created.matches(o.created) && view.listed(o).is_some(),

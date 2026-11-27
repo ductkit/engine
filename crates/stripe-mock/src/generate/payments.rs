@@ -8,13 +8,14 @@
 
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::generate::catalog::active_ids;
-use crate::generate::{Continuation, Ctx, billing, pick};
+use crate::generate::{Continuation, Ctx, billing, connect, pick};
 use crate::model::catalog::{random_currency, random_nonzero_amount};
 use crate::model::payments::{
-    BRAND, CardDraw, LAST4, NewCharge, NewDispute, NewPaymentIntent, NewRefund, decline_error,
-    new_card_payment_method, new_charge, new_charge_balance_transaction, new_dispute,
-    new_dispute_balance_transaction, new_invoice_payment, new_payment_intent, new_refund,
-    new_refund_balance_transaction, new_setup_intent, setup_decline_error, submit_evidence,
+    AVAILABLE_AFTER_SECS, BRAND, CardDraw, LAST4, NewCharge, NewDispute, NewPaymentIntent,
+    NewRefund, add_application_fee, decline_error, new_card_payment_method, new_charge,
+    new_charge_balance_transaction, new_dispute, new_dispute_balance_transaction,
+    new_invoice_payment, new_payment_intent, new_refund, new_refund_balance_transaction,
+    new_setup_intent, setup_decline_error, submit_evidence,
 };
 use crate::rng::SimRng;
 use crate::stripe::{
@@ -133,6 +134,7 @@ fn create_payment_intent(
 ) -> String {
     let id = ctx.payments.id(ObjectType::PaymentIntent.id_prefix());
     let secret = format!("{id}_{}", ctx.payments.id_len("secret", 25));
+    let application_fee_amount = connect::draw_application_fee(engine, ctx, amount);
     let pi = new_payment_intent(&NewPaymentIntent {
         id: &id,
         created: engine.now().unix_seconds(),
@@ -141,6 +143,7 @@ fn create_payment_intent(
         customer,
         payment_method,
         client_secret: &secret,
+        application_fee_amount,
     });
     engine.create_obj(
         ObjectType::PaymentIntent,
@@ -172,6 +175,11 @@ fn confirm(
         .latest_obj(ObjectType::PaymentIntent, pi)
         .expect("payment intent exists");
     let amount = intent.amount.unwrap_or(0);
+    // The fee of a succeeded direct charge in a connected account's scope.
+    let fee_amount = intent
+        .application_fee_amount
+        .flatten()
+        .filter(|a| succeed && *a > 0);
     let currency = intent.currency.clone().unwrap_or_default();
     let customer = intent
         .customer
@@ -184,11 +192,23 @@ fn confirm(
     let now = engine.now();
     let created = now.unix_seconds();
     let charge = ctx.payments.id(ObjectType::Charge.id_prefix());
+    let fee_id = fee_amount.map(|_| ctx.payments.id(ObjectType::ApplicationFee.id_prefix()));
+    let application = fee_amount.map(|_| {
+        engine
+            .projector()
+            .application
+            .as_ref()
+            .map(|a| a.id.clone())
+            .expect("a platform with connected accounts has an application")
+    });
     let risk_score = ctx.payments.below(65) as i64;
     let network_transaction_id = format!("{:015}", ctx.payments.below(1_000_000_000_000_000));
     let balance_transaction = succeed.then(|| {
         let id = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
-        let txn = new_charge_balance_transaction(&id, created, amount, &currency, &charge);
+        let mut txn = new_charge_balance_transaction(&id, created, amount, &currency, &charge);
+        if let (Some(fee), Some(application)) = (fee_amount, &application) {
+            add_application_fee(&mut txn, fee, application);
+        }
         engine.create_obj(
             ObjectType::BalanceTransaction,
             id.clone(),
@@ -216,6 +236,7 @@ fn confirm(
         balance_transaction: balance_transaction.as_deref(),
         risk_score,
         network_transaction_id: &network_transaction_id,
+        application_fee: fee_id.as_deref().zip(fee_amount),
     });
     let charge_event = if succeed {
         "charge.succeeded"
@@ -260,6 +281,21 @@ fn confirm(
             &[event],
         )
         .expect("live payment intent");
+    if let (Some(fee), Some(fee_amount), Some(application)) = (&fee_id, fee_amount, &application) {
+        connect::collect_application_fee(
+            engine,
+            ctx,
+            &connect::FeeCollection {
+                fee,
+                charge: &charge,
+                amount: fee_amount,
+                currency: &currency,
+                application,
+                available_on: created + AVAILABLE_AFTER_SECS,
+            },
+            cause,
+        );
+    }
     PaymentOutcome {
         payment_intent: pi.to_string(),
         charge,

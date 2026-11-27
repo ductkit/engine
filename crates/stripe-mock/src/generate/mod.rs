@@ -34,7 +34,7 @@ use crate::model::catalog::PriceSpec;
 use crate::model::customer::{self, apply_update, random_new_customer, random_update};
 use crate::rng::{RngStreams, SimRng};
 use crate::stripe;
-use crate::{ActionsConfig, Config, MockError, ObjectType, SimTime};
+use crate::{ActionsConfig, ApplicationFeeConfig, Config, MockError, ObjectType, SimTime};
 
 /// A business action to run now with [`crate::MockStripe::run_action`] (spec section 11,
 /// "Triggers").
@@ -109,6 +109,14 @@ pub enum Action {
     /// Delete the named or a random person of the account. Deleting the last
     /// representative sets the account's `requirements`.
     DeletePerson { id: Option<String> },
+    /// Refund `amount` (drawn like a refund's when `None`) of the named or a random
+    /// application fee with something left, in the platform scope. A named fee with
+    /// nothing left, or whose account has disconnected, is an error naming it; so is a
+    /// connected account's scope.
+    ApplicationFeeRefund {
+        fee: Option<String>,
+        amount: Option<i64>,
+    },
 }
 
 /// The kind of an external account.
@@ -146,6 +154,7 @@ enum ActionKind {
     ExternalAccountDelete,
     PersonUpdate,
     PersonDelete,
+    ApplicationFeeRefund,
 }
 
 /// A follow-up step of an action.
@@ -257,6 +266,10 @@ pub(crate) struct Ctx {
     /// Draws for payment objects (stream `"generate.payments"`): their IDs and card
     /// details. Whether a payment succeeds stays a `billing` draw.
     pub payments: SimRng,
+    /// `accounts.application_fee`.
+    pub application_fee: ApplicationFeeConfig,
+    /// Whether a payment carries an application fee (stream `"generate.application_fee"`).
+    pub fee_rng: SimRng,
 }
 
 impl Ctx {
@@ -436,6 +449,11 @@ impl Generator {
                 c.person.delete,
                 "generate.person.delete",
             ),
+            (
+                ActionKind::ApplicationFeeRefund,
+                a.application_fee_refund,
+                "generate.application_fee_refund",
+            ),
         ];
         let actions = specs
             .into_iter()
@@ -463,6 +481,8 @@ impl Generator {
                 lifecycle: stream("generate.lifecycle"),
                 billing: stream("generate.billing"),
                 payments: stream("generate.payments"),
+                application_fee: config.accounts.application_fee.clone(),
+                fee_rng: stream("generate.application_fee"),
             },
             setup: stream("generate.account_setup"),
             control: stream("control.actions"),
@@ -779,6 +799,18 @@ impl Generator {
                     connect::scope_name(engine)
                 ))
             })?,
+            Action::ApplicationFeeRefund { fee, amount } => connect::application_fee_refund(
+                &mut self.control,
+                engine,
+                &mut self.ctx,
+                fee,
+                amount,
+            )?
+            .ok_or_else(|| {
+                MockError::InvalidAction(
+                    "no application fee with something left to refund".to_string(),
+                )
+            })?,
         };
         self.run_due_now(engine);
         Ok(cause)
@@ -843,14 +875,14 @@ impl Generator {
                 &[ActionKind::ExternalAccountCreate]
             }
             ObjectType::Person if connect::controlled(engine) => &[ActionKind::PersonUpdate],
+            ObjectType::ApplicationFee | ObjectType::FeeRefund => {
+                &[ActionKind::ApplicationFeeRefund]
+            }
             // The write kinds for these arrive with their tasks, so the arms return early
-            // until then: Transfer and TransferReversal -> TransferReversal (task 7),
-            // ApplicationFee and FeeRefund -> ApplicationFeeRefund (task 5). A payout has
-            // no write.
+            // until then: Transfer and TransferReversal -> TransferReversal (task 7). A
+            // payout has no write.
             ObjectType::Transfer
             | ObjectType::TransferReversal
-            | ObjectType::ApplicationFee
-            | ObjectType::FeeRefund
             | ObjectType::Payout
             | ObjectType::BankAccount
             | ObjectType::Card
@@ -1033,6 +1065,13 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
         ActionKind::PersonDelete => {
             if connect::controlled(engine) {
                 connect::delete_person(rng, engine, None).expect("random targets are valid");
+            }
+        }
+        // Fees live in the platform scope; a connected account's generator does nothing.
+        ActionKind::ApplicationFeeRefund => {
+            if engine.scope().is_none() {
+                connect::application_fee_refund(rng, engine, ctx, None, None)
+                    .expect("random targets are valid");
             }
         }
     }

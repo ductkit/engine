@@ -2,7 +2,7 @@
 //! external accounts and persons. They arrive with the generators that create these
 //! objects (phase 8, tasks 3 to 8); this file holds the ones built so far: external
 //! accounts (bank accounts and debit cards) and persons of controlled accounts, whose
-//! presence follows ruling R1 (spec section 5.4).
+//! presence follows ruling R1 (spec section 5.4), and application fees with their refunds.
 
 use crate::stripe::{self, Expandable};
 
@@ -294,4 +294,135 @@ pub(crate) fn representative_due(a: &mut stripe::Account) {
         .expect("every mock account has requirements");
     r.currently_due = due();
     r.eventually_due = due();
+}
+
+/// The platform's balance transaction for an application fee: `+amount`, no fee, `pending`
+/// until `available_on` (the charge's).
+pub(crate) fn new_application_fee_balance_transaction(
+    id: &str,
+    created: i64,
+    available_on: i64,
+    amount: i64,
+    currency: &str,
+    fee: &str,
+) -> stripe::BalanceTransaction {
+    stripe::BalanceTransaction {
+        amount,
+        available_on,
+        balance_type: stripe::BalanceTransactionBalanceType::Payments,
+        created,
+        currency: currency.to_string(),
+        description: Some(None),
+        exchange_rate: Some(None),
+        fee: 0,
+        fee_details: Vec::new(),
+        id: id.to_string(),
+        net: amount,
+        object: stripe::BalanceTransactionObject::BalanceTransaction,
+        reporting_category: "platform_earning".to_string(),
+        source: Some(Some(Expandable::Id(fee.to_string()))),
+        status: "pending".to_string(),
+        type_: stripe::BalanceTransactionType::ApplicationFee,
+    }
+}
+
+/// The inputs of an application fee.
+pub(crate) struct NewApplicationFee<'a> {
+    pub id: &'a str,
+    pub created: i64,
+    /// The connected account the fee was taken from.
+    pub account: &'a str,
+    /// The platform's application (`ca_…`).
+    pub application: &'a str,
+    pub charge: &'a str,
+    pub amount: i64,
+    pub currency: &'a str,
+    pub balance_transaction: &'a str,
+}
+
+/// The URL of an application fee's refunds list.
+pub(crate) fn fee_refunds_url(fee: &str) -> String {
+    format!("/v1/application_fees/{fee}/refunds")
+}
+
+/// A platform application fee on a connected account's direct charge: nothing refunded, an
+/// empty embedded `refunds` list.
+pub(crate) fn new_application_fee(f: &NewApplicationFee) -> stripe::ApplicationFee {
+    stripe::ApplicationFee {
+        account: Expandable::Id(f.account.to_string()),
+        amount: f.amount,
+        amount_refunded: 0,
+        application: Expandable::Id(f.application.to_string()),
+        balance_transaction: Some(Some(Expandable::Id(f.balance_transaction.to_string()))),
+        charge: Expandable::Id(f.charge.to_string()),
+        created: f.created,
+        currency: f.currency.to_string(),
+        fee_source: Some(Some(stripe::PlatformEarningFeeSource {
+            charge: Some(f.charge.to_string()),
+            payout: None,
+            type_: stripe::PlatformEarningFeeSourceType::Charge,
+        })),
+        id: f.id.to_string(),
+        livemode: false,
+        object: stripe::ApplicationFeeObject::ApplicationFee,
+        originating_transaction: Some(None),
+        refunded: false,
+        refunds: stripe::List {
+            object: stripe::ListObject::List,
+            data: Vec::new(),
+            has_more: false,
+            url: fee_refunds_url(f.id),
+            total_count: None,
+        },
+    }
+}
+
+/// A balance transaction of an application fee refund, `available` at once with no fee:
+/// the platform's is `-amount`, the account's `+amount`.
+pub(crate) fn new_fee_refund_balance_transaction(
+    id: &str,
+    created: i64,
+    amount: i64,
+    currency: &str,
+    refund: &str,
+) -> stripe::BalanceTransaction {
+    stripe::BalanceTransaction {
+        amount,
+        available_on: created,
+        balance_type: stripe::BalanceTransactionBalanceType::Payments,
+        created,
+        currency: currency.to_string(),
+        description: Some(None),
+        exchange_rate: Some(None),
+        fee: 0,
+        fee_details: Vec::new(),
+        id: id.to_string(),
+        net: amount,
+        object: stripe::BalanceTransactionObject::BalanceTransaction,
+        reporting_category: "platform_earning_refund".to_string(),
+        source: Some(Some(Expandable::Id(refund.to_string()))),
+        status: "available".to_string(),
+        type_: stripe::BalanceTransactionType::ApplicationFeeRefund,
+    }
+}
+
+/// A refund of part or all of an application fee.
+pub(crate) fn new_fee_refund(
+    id: &str,
+    created: i64,
+    fee: &str,
+    amount: i64,
+    currency: &str,
+    balance_transaction: &str,
+) -> stripe::FeeRefund {
+    stripe::FeeRefund {
+        amount,
+        balance_transaction: Some(Some(Expandable::Id(balance_transaction.to_string()))),
+        created,
+        currency: currency.to_string(),
+        fee: Expandable::Id(fee.to_string()),
+        id: id.to_string(),
+        metadata: Some(Some(Default::default())),
+        object: stripe::FeeRefundObject::FeeRefund,
+    }
 }
