@@ -1049,3 +1049,44 @@ async fn disconnected_destination_expands_to_its_id() {
     common::assert_conforms(&v);
     assert_eq!(v["data"][0]["transfer_data"]["destination"], acct.as_str());
 }
+
+/// Regression (phase 8 final review): `transfer_reversal` is an `[actions]` rate, so changing
+/// it at runtime redraws its next due time from now, in both directions.
+#[tokio::test]
+async fn transfer_reversal_rate_changes_at_runtime() {
+    let m = mock_with(&with_pattern("{ destination = 1.0 }")).await;
+    let acct = m.connect_account(AccountApi::V1).unwrap();
+    m.run_action(Action::OneOffPayment {
+        customer: None,
+        amount: Some(100_000),
+        succeed: Some(true),
+        pattern: Some(ChargePattern::Destination),
+        recipient: Some(acct),
+    })
+    .unwrap();
+    let reversals = |m: &MockStripe| {
+        m.truth_log()
+            .iter()
+            .filter(|u| u.object_type == ObjectType::TransferReversal)
+            .count()
+    };
+    // Off by default: nothing is reversed.
+    m.step(Duration::from_secs(2 * HOUR)).await.unwrap();
+    assert_eq!(reversals(&m), 0);
+
+    m.update_actions_config(|a| a.transfer_reversal = 50.0)
+        .unwrap();
+    m.step(Duration::from_secs(2 * HOUR)).await.unwrap();
+    let on = reversals(&m);
+    assert!(on > 0, "the new rate takes effect");
+    assert!(
+        m.event_timeline()
+            .iter()
+            .any(|e| e.event_type == "transfer.reversed")
+    );
+
+    m.update_actions_config(|a| a.transfer_reversal = 0.0)
+        .unwrap();
+    m.step(Duration::from_secs(2 * HOUR)).await.unwrap();
+    assert_eq!(reversals(&m), on, "rate 0 stops reversals");
+}

@@ -231,12 +231,19 @@ impl Engine {
         id: &str,
         content: AccountContent,
     ) -> Result<(), MockError> {
-        let api = self.connected_api(id)?;
-        let events: &[&str] = match api {
+        let events = self.account_updated_events(id)?;
+        self.update_account_with(id, |a| account::apply_content(a, &content), events)
+    }
+
+    /// The events announcing a change to a connected account: V2 accounts add the thin one.
+    pub(crate) fn account_updated_events(
+        &self,
+        id: &str,
+    ) -> Result<&'static [&'static str], MockError> {
+        Ok(match self.connected_api(id)? {
             AccountApi::V1 => &["account.updated"],
             AccountApi::V2 => &["account.updated", "v2.core.account.updated"],
-        };
-        self.update_account_with(id, |a| account::apply_content(a, &content), events)
+        })
     }
 
     /// Changes a connected account with `f` now, in the platform scope, as an

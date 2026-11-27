@@ -391,8 +391,11 @@ pub(super) fn delete_person(
     });
     // Only the deletion of the last representative changes the requirements.
     if was_representative && !representative_left {
+        let events = engine
+            .account_updated_events(&acct)
+            .expect("the account is connected");
         engine
-            .update_account_with(&acct, representative_due, &["account.updated"])
+            .update_account_with(&acct, representative_due, events)
             .expect("the account is connected");
     }
     Ok(Some(cause))

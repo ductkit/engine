@@ -605,3 +605,26 @@ async fn deleting_non_representative_after_representative_gone_emits_no_account_
     // Only the person's deletion was recorded.
     assert_eq!(m.truth_log().len(), log_len + 1);
 }
+
+/// Regression (phase 8 final review): a V2 account losing its last representative announces
+/// the change on both event APIs, as every other account update does.
+#[tokio::test]
+async fn v2_account_losing_representative_emits_both_events() {
+    let m = mock_with(CUSTOM).await;
+    let a = m.connect_account(AccountApi::V2).unwrap();
+    let persons = json(&m, &format!("/v1/accounts/{a}/persons")).await;
+    let rep = persons["data"][0]["id"].as_str().unwrap().to_string();
+    let n = m.event_timeline().len();
+    m.account(&a)
+        .run_action(Action::DeletePerson { id: Some(rep) })
+        .unwrap();
+    let types: Vec<String> = m.event_timeline()[n..]
+        .iter()
+        .map(|e| e.event_type.clone())
+        .collect();
+    assert!(types.contains(&"account.updated".to_string()), "{types:?}");
+    assert!(
+        types.contains(&"v2.core.account.updated".to_string()),
+        "{types:?}"
+    );
+}

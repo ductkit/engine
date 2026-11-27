@@ -187,6 +187,7 @@ payout_failure_probability = 1.0
     let first = json(&m, &format!("/v1/payouts/{}", ids[0]), None).await;
     common::assert_conforms(&first);
     assert_eq!(first["status"], "failed");
+    assert_eq!(first["reconciliation_status"], "in_progress");
     assert_eq!(first["failure_code"], "account_closed");
     assert_eq!(
         first["failure_message"],
@@ -529,4 +530,79 @@ async fn payout_action_pays_out_now() {
     assert_eq!(p["status"], "pending");
     // Nothing left to pay out.
     assert!(m.run_action(Action::Payout).is_err());
+}
+
+/// A scope whose available balance in a currency is at or below zero at midnight pays
+/// nothing out and sweeps nothing: the negative balance carries forward, and the same
+/// transactions are swept once a later payout finds the balance positive.
+#[tokio::test]
+async fn negative_balance_carries_forward() {
+    let m = mock_with(DAILY).await;
+    m.step(Duration::from_secs(HOUR)).await.unwrap();
+    // A payment fully refunded at once: the fee is kept, so the balance nets below zero.
+    let cause = m.run_action(payment(10_000)).unwrap();
+    let charge = m
+        .truth_log()
+        .into_iter()
+        .find(|u| u.cause.as_ref() == Some(&cause) && u.object_type == ObjectType::Charge)
+        .unwrap()
+        .object_id;
+    m.run_action(Action::Refund {
+        charge: Some(charge),
+        amount: Some(10_000),
+    })
+    .unwrap();
+    let bts: Vec<StateUpdate> = m
+        .truth_log()
+        .into_iter()
+        .filter(|u| u.object_type == ObjectType::BalanceTransaction)
+        .collect();
+    let first_ids: BTreeSet<String> = bts.iter().map(|u| u.object_id.clone()).collect();
+    let currency = bts[0].state["currency"].as_str().unwrap().to_string();
+    let total: i64 = bts.iter().map(|u| u.state["net"].as_i64().unwrap()).sum();
+    assert!(total < 0, "{total}");
+
+    // Payments draw their currency, so other currencies may pay out; this one must not.
+    let in_currency = |m: &MockStripe| -> Vec<String> {
+        let mut ids: Vec<String> = m
+            .truth_log()
+            .into_iter()
+            .filter(|u| u.object_type == ObjectType::Payout && u.state["currency"] == currency)
+            .map(|u| u.object_id)
+            .collect();
+        ids.dedup();
+        ids
+    };
+    m.step(Duration::from_secs(5 * DAY)).await.unwrap();
+    assert!(in_currency(&m).is_empty(), "nothing is paid out");
+
+    // Money arrives in the currency: the next midnight sweeps the earlier transactions too.
+    let mut fresh = None;
+    for _ in 0..60 {
+        let cause = m.run_action(payment(10_000)).unwrap();
+        let bt = m
+            .truth_log()
+            .into_iter()
+            .find(|u| {
+                u.cause.as_ref() == Some(&cause) && u.object_type == ObjectType::BalanceTransaction
+            })
+            .unwrap();
+        if bt.state["currency"] == currency.as_str() {
+            fresh = Some(bt.object_id);
+            break;
+        }
+    }
+    let fresh = fresh.expect("a payment in the currency");
+    m.step(Duration::from_secs(4 * DAY)).await.unwrap();
+    let ids = in_currency(&m);
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    let members: BTreeSet<String> = listed_members(&m, &ids[0], None)
+        .await
+        .into_iter()
+        .collect();
+    let mut expected = first_ids.clone();
+    expected.insert(fresh);
+    assert_eq!(members, expected);
+    let p = json(&m, &format!("/v1/payouts/{}", ids[0]), None).await;
+    assert!(p["amount"].as_i64().unwrap() > 0);
 }

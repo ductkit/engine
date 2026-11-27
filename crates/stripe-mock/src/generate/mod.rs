@@ -685,6 +685,8 @@ impl Generator {
                 ActionKind::Dispute => config.dispute,
                 ActionKind::SavePaymentMethod => config.save_payment_method,
                 ActionKind::Checkout => config.checkout,
+                ActionKind::ApplicationFeeRefund => config.application_fee_refund,
+                ActionKind::TransferReversal => config.transfer_reversal,
                 _ => continue,
             };
             a.base_rate = rate;
