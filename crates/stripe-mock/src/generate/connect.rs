@@ -361,6 +361,9 @@ pub(super) fn delete_person(
     let Some(id) = pick_person(rng, engine, id)? else {
         return Ok(None);
     };
+    let was_representative = engine
+        .latest_obj::<stripe::Person>(ObjectType::Person, &id)
+        .is_some_and(|p| is_representative(&p));
     let cause = engine.begin_action("person_delete");
     engine
         .delete(
@@ -376,7 +379,8 @@ pub(super) fn delete_person(
             .latest_obj::<stripe::Person>(ObjectType::Person, p)
             .is_some_and(|p| is_representative(&p))
     });
-    if !representative_left {
+    // Only the deletion of the last representative changes the requirements.
+    if was_representative && !representative_left {
         engine
             .update_account_with(&acct, representative_due, &["account.updated"])
             .expect("the account is connected");

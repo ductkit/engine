@@ -288,8 +288,10 @@ pub(crate) fn representative_due(a: &mut stripe::Account) {
             "representative.last_name".to_string(),
         ]))
     };
-    if let Some(r) = &mut a.requirements {
-        r.currently_due = due();
-        r.eventually_due = due();
-    }
+    let r = a
+        .requirements
+        .as_mut()
+        .expect("every mock account has requirements");
+    r.currently_due = due();
+    r.eventually_due = due();
 }

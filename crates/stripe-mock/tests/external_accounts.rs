@@ -564,3 +564,44 @@ async fn pagination_writes_validate_the_account_first_and_write_in_its_scope() {
         "a person update"
     );
 }
+
+#[tokio::test]
+async fn deleting_non_representative_after_representative_gone_emits_no_account_update() {
+    let m = mock_with(CUSTOM).await;
+    // Find a seed-independent account with at least two persons.
+    let mut a = m.connect_account(AccountApi::V1).unwrap();
+    for _ in 0..40 {
+        let n = json(&m, &format!("/v1/accounts/{a}/persons")).await["data"]
+            .as_array()
+            .unwrap()
+            .len();
+        if n >= 2 {
+            break;
+        }
+        a = m.connect_account(AccountApi::V1).unwrap();
+    }
+    let persons = json(&m, &format!("/v1/accounts/{a}/persons")).await;
+    let people = ids(&persons);
+    assert!(people.len() >= 2);
+    m.account(&a)
+        .run_action(Action::DeletePerson {
+            id: Some(people[0].clone()),
+        })
+        .unwrap();
+    let count = |m: &MockStripe| {
+        snapshot_types(m, &a)
+            .iter()
+            .filter(|t| *t == "account.updated")
+            .count()
+    };
+    let log_len = m.truth_log().len();
+    assert_eq!(count(&m), 1);
+    m.account(&a)
+        .run_action(Action::DeletePerson {
+            id: Some(people[1].clone()),
+        })
+        .unwrap();
+    assert_eq!(count(&m), 1);
+    // Only the person's deletion was recorded.
+    assert_eq!(m.truth_log().len(), log_len + 1);
+}
