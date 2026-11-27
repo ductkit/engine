@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use crate::api::ApiError;
 use crate::api::resources::View;
+use crate::engine::Scope;
 use crate::model::embedded::embedded_list;
 use crate::model::invoice::payments_url;
 use crate::model::payments::refunds_url;
@@ -39,6 +40,10 @@ pub(crate) fn allowed(t: ObjectType) -> &'static [&'static str] {
             "failure_balance_transaction",
             "payment_intent",
             "refunds",
+            "transfer",
+            "application_fee",
+            "source_transfer",
+            "transfer_data.destination",
         ],
         ObjectType::Refund => &[
             "balance_transaction",
@@ -47,6 +52,8 @@ pub(crate) fn allowed(t: ObjectType) -> &'static [&'static str] {
             "failure_balance_transaction",
             "payment_intent",
             "payment_method",
+            "source_transfer_reversal",
+            "transfer_reversal",
         ],
         ObjectType::Dispute => &["charge", "payment_intent"],
         ObjectType::BalanceTransaction => &["source"],
@@ -60,7 +67,41 @@ pub(crate) fn allowed(t: ObjectType) -> &'static [&'static str] {
             "subscription",
         ],
         ObjectType::InvoicePayment => &["invoice"],
-        ObjectType::Product | ObjectType::InvoiceLineItem | ObjectType::Account => &[],
+        // The modelled targets only: `reversals` and `refunds` are lists the object
+        // carries, and `application`, `fee_source` and the sub-objects are not types.
+        ObjectType::Transfer => &[
+            "balance_transaction",
+            "destination",
+            "destination_payment",
+            "source_transaction",
+        ],
+        ObjectType::TransferReversal => &[
+            "balance_transaction",
+            "destination_payment_refund",
+            "source_refund",
+            "transfer",
+        ],
+        ObjectType::ApplicationFee => &[
+            "account",
+            "balance_transaction",
+            "charge",
+            "originating_transaction",
+        ],
+        ObjectType::FeeRefund => &["balance_transaction", "fee"],
+        ObjectType::Payout => &[
+            "application_fee",
+            "balance_transaction",
+            "destination",
+            "failure_balance_transaction",
+            "original_payout",
+            "reversed_by",
+        ],
+        // `account` is a platform-scope object (see `foreign_scope`).
+        ObjectType::BankAccount | ObjectType::Card => &["account", "customer"],
+        ObjectType::Product
+        | ObjectType::InvoiceLineItem
+        | ObjectType::Account
+        | ObjectType::Person => &[],
     }
 }
 
@@ -93,6 +134,13 @@ fn validate(t: ObjectType, paths: &[String], list: bool) -> Result<(), ApiError>
 /// The type an ID names. The longest matching `prefix_` wins, so `cs_test_...` is a checkout
 /// session even though prefixes could contain underscores.
 fn type_of_id(id: &str) -> Option<ObjectType> {
+    // A destination payment (`py_`) is a charge in the account, its refund (`pyr_`) a refund.
+    // Neither is a type of its own.
+    for (prefix, t) in [("pyr_", ObjectType::Refund), ("py_", ObjectType::Charge)] {
+        if id.starts_with(prefix) {
+            return Some(t);
+        }
+    }
     ObjectType::ALL
         .into_iter()
         .filter(|t| {
@@ -104,8 +152,26 @@ fn type_of_id(id: &str) -> Option<ObjectType> {
 
 /// The object an ID names, as expansion shows it: a deleted customer is its
 /// stub, other deleted objects are `null`, unknown IDs stay strings.
-fn lookup(view: &View, id: &str) -> Option<Value> {
+fn lookup(view: &View, id: &str, foreign: Option<Scope>) -> Option<Value> {
     let t = type_of_id(id)?;
+    // A foreign scope is read at the view's own time; an account that has disconnected is
+    // out of reach, so its objects stay IDs.
+    let other;
+    let view = match foreign {
+        Some(scope) => {
+            if let Some(acct) = &scope
+                && !view.engine.account_meta(acct).is_some_and(|m| m.connected)
+            {
+                return None;
+            }
+            other = View {
+                scope,
+                ..view.clone()
+            };
+            &other
+        }
+        None => view,
+    };
     let u = view.state(view.store().get(t, id)?)?;
     if u.kind == ChangeKind::Deleted && t != ObjectType::Customer {
         return Some(Value::Null);
@@ -144,6 +210,37 @@ fn includable(view: &View, parent: &Value, field: &str) -> Option<Value> {
     )
 }
 
+/// The scope a path of `obj` (an object of type `t`) resolves in when it is not the view's
+/// own (phase 8 ruling P2): the destination payment of a transfer lives in the destination
+/// account, an application fee's charge in the account it was taken from, and a direct
+/// charge's fee, source transfer and transfer reversal on the platform. `None` is the
+/// view's scope; `Some(None)` is the platform.
+pub(crate) fn foreign_scope(view: &View, t: ObjectType, obj: &Value, path: &str) -> Option<Scope> {
+    let account = |field: &str| obj[field].as_str().map(|a| Some(a.to_string()));
+    match (t, path) {
+        (ObjectType::Transfer, "destination_payment") => account("destination"),
+        (ObjectType::TransferReversal, "destination_payment_refund") => {
+            let transfer = obj["transfer"].as_str()?;
+            let u = view.state(view.store().get(ObjectType::Transfer, transfer)?)?;
+            u.state["destination"]
+                .as_str()
+                .map(|a| Some(a.to_string()))
+        }
+        (ObjectType::ApplicationFee, "charge") => account("account"),
+        (ObjectType::Charge, "application_fee" | "source_transfer")
+        | (ObjectType::Refund, "source_transfer_reversal")
+        // An external account names its account, which lives on the platform.
+        | (ObjectType::BankAccount | ObjectType::Card, "account") => Some(None),
+        _ => None,
+    }
+}
+
+/// The type an object's `object` field names.
+fn type_of_object(v: &Value) -> Option<ObjectType> {
+    let name = v["object"].as_str()?;
+    ObjectType::ALL.into_iter().find(|t| t.as_str() == name)
+}
+
 fn apply(view: &View, v: &mut Value, segs: &[&str]) {
     let Some((first, rest)) = segs.split_first() else {
         return;
@@ -161,11 +258,17 @@ fn apply(view: &View, v: &mut Value, segs: &[&str]) {
     {
         v[*first] = list;
     }
+    // `foreign_scope` reads sibling fields of the parent, so it is decided before the child
+    // is borrowed.
+    let foreign = match v.get(*first).and_then(Value::as_str) {
+        Some(_) => type_of_object(v).and_then(|t| foreign_scope(view, t, v, first)),
+        None => None,
+    };
     let Some(child) = v.get_mut(*first) else {
         return;
     };
     if let Some(id) = child.as_str()
-        && let Some(found) = lookup(view, id)
+        && let Some(found) = lookup(view, id, foreign)
     {
         *child = found;
     }
@@ -192,6 +295,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn py_and_pyr_ids_resolve_by_prefix() {
+        assert_eq!(type_of_id("py_1Nabc"), Some(ObjectType::Charge));
+        assert_eq!(type_of_id("pyr_1Nabc"), Some(ObjectType::Refund));
+        assert_eq!(type_of_id("py1"), None);
+    }
+
+    #[test]
     fn ids_resolve_by_longest_prefix() {
         assert_eq!(
             type_of_id("cs_test_a1B2"),
@@ -201,6 +311,14 @@ mod tests {
         assert_eq!(type_of_id("in_1"), Some(ObjectType::Invoice));
         assert_eq!(type_of_id("inpay_1"), Some(ObjectType::InvoicePayment));
         assert_eq!(type_of_id("pi_1"), Some(ObjectType::PaymentIntent));
+        assert_eq!(type_of_id("tr_1"), Some(ObjectType::Transfer));
+        assert_eq!(type_of_id("trr_1"), Some(ObjectType::TransferReversal));
+        assert_eq!(type_of_id("fee_1"), Some(ObjectType::ApplicationFee));
+        assert_eq!(type_of_id("fr_1"), Some(ObjectType::FeeRefund));
+        assert_eq!(type_of_id("po_1"), Some(ObjectType::Payout));
+        assert_eq!(type_of_id("ba_1"), Some(ObjectType::BankAccount));
+        assert_eq!(type_of_id("card_1"), Some(ObjectType::Card));
+        assert_eq!(type_of_id("person_1"), Some(ObjectType::Person));
         assert_eq!(type_of_id("cs_live_1"), None);
         assert_eq!(type_of_id("nope"), None);
     }

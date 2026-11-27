@@ -735,6 +735,19 @@ impl Generator {
             ObjectType::SubscriptionItem | ObjectType::InvoiceLineItem | ObjectType::Account => {
                 return;
             }
+            // The write kinds for these arrive with their tasks, so the arms return early
+            // until then: Transfer and TransferReversal -> TransferReversal (task 7),
+            // ApplicationFee and FeeRefund -> ApplicationFeeRefund (task 5),
+            // BankAccount and Card -> ExternalAccountCreate (task 3),
+            // Person -> PersonUpdate (task 3). A payout has no write.
+            ObjectType::Transfer
+            | ObjectType::TransferReversal
+            | ObjectType::ApplicationFee
+            | ObjectType::FeeRefund
+            | ObjectType::Payout
+            | ObjectType::BankAccount
+            | ObjectType::Card
+            | ObjectType::Person => return,
         };
         let kind = *pick(&mut self.pagination_rng, kinds);
         perform(kind, &mut self.pagination_rng, engine, &mut self.ctx);

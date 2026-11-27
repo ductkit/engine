@@ -155,8 +155,31 @@ fn new_types_have_the_documented_names() {
             "invoice_payment",
             "inpay",
         ),
+        (ObjectType::Transfer, "transfer", "transfer", "tr"),
+        (
+            ObjectType::TransferReversal,
+            "transfer_reversal",
+            "transfer_reversal",
+            "trr",
+        ),
+        (
+            ObjectType::ApplicationFee,
+            "application_fee",
+            "application_fee",
+            "fee",
+        ),
+        (ObjectType::FeeRefund, "fee_refund", "fee_refund", "fr"),
+        (ObjectType::Payout, "payout", "payout", "po"),
+        (
+            ObjectType::BankAccount,
+            "bank_account",
+            "bank_account",
+            "ba",
+        ),
+        (ObjectType::Card, "card", "card", "card"),
+        (ObjectType::Person, "person", "person", "person"),
     ];
-    assert_eq!(ObjectType::ALL.len(), 17);
+    assert_eq!(ObjectType::ALL.len(), 25);
     for (t, name, serde_name, prefix) in expected {
         assert_eq!(t.as_str(), name);
         assert_eq!(t.serde_name(), serde_name);

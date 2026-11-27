@@ -115,3 +115,25 @@ async fn bad_expand_is_400() {
         "You cannot expand more than 4 levels of a property."
     );
 }
+
+#[tokio::test]
+async fn connect_money_expand_paths_are_validated() {
+    let m = mock_with("[accounts]\nconnect = true\n").await;
+    for ok in [
+        "/v1/transfers?expand[]=data.destination_payment&expand[]=data.balance_transaction",
+        "/v1/application_fees?expand[]=data.charge",
+        "/v1/payouts?expand[]=data.destination",
+        "/v1/charges?expand[]=data.transfer&expand[]=data.application_fee&expand[]=data.source_transfer&expand[]=data.transfer_data.destination",
+        "/v1/refunds?expand[]=data.source_transfer_reversal&expand[]=data.transfer_reversal",
+    ] {
+        let (s, v) = json(&m, ok).await;
+        assert_eq!((s, v["object"].as_str()), (200, Some("list")), "{ok}");
+    }
+    for bad in [
+        "/v1/transfers?expand[]=data.reversals",
+        "/v1/payouts?expand[]=data.nope",
+    ] {
+        let (s, v) = json(&m, bad).await;
+        assert_eq!(s, 400, "{bad}: {v}");
+    }
+}

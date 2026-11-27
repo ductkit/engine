@@ -100,7 +100,7 @@ pub(crate) static PAYMENT_INTENTS: Resource = Resource {
 pub(crate) static CHARGES: Resource = Resource {
     t: ObjectType::Charge,
     path: "/v1/charges",
-    filters: &["customer", "payment_intent"],
+    filters: &["customer", "payment_intent", "transfer_group"],
     order: Order::CreatedDesc,
     required: None,
 };
@@ -150,6 +150,28 @@ pub(crate) static INVOICE_PAYMENTS: Resource = Resource {
     t: ObjectType::InvoicePayment,
     path: "/v1/invoice_payments",
     filters: &["invoice", "payment"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+
+pub(crate) static TRANSFERS: Resource = Resource {
+    t: ObjectType::Transfer,
+    path: "/v1/transfers",
+    filters: &["destination", "transfer_group"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static APPLICATION_FEES: Resource = Resource {
+    t: ObjectType::ApplicationFee,
+    path: "/v1/application_fees",
+    filters: &["charge"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static PAYOUTS: Resource = Resource {
+    t: ObjectType::Payout,
+    path: "/v1/payouts",
+    filters: &["status", "destination"],
     order: Order::CreatedDesc,
     required: None,
 };
@@ -269,7 +291,22 @@ fn matches(
         ObjectType::SetupIntent => {
             eq("customer", "customer") && eq("payment_method", "payment_method")
         }
-        ObjectType::Charge => eq("customer", "customer") && eq("payment_intent", "payment_intent"),
+        ObjectType::Charge => {
+            eq("customer", "customer")
+                && eq("payment_intent", "payment_intent")
+                && eq("transfer_group", "transfer_group")
+        }
+        ObjectType::Transfer => {
+            eq("destination", "destination") && eq("transfer_group", "transfer_group")
+        }
+        ObjectType::ApplicationFee => eq("charge", "charge"),
+        ObjectType::Payout => eq("status", "status") && eq("destination", "destination"),
+        // Children are listed under their parent, whose handler applies any filter.
+        ObjectType::TransferReversal
+        | ObjectType::FeeRefund
+        | ObjectType::BankAccount
+        | ObjectType::Card
+        | ObjectType::Person => true,
         ObjectType::Refund | ObjectType::Dispute => {
             eq("charge", "charge") && eq("payment_intent", "payment_intent")
         }
@@ -439,14 +476,8 @@ fn no_such(t: ObjectType, id: &str) -> ApiError {
     }
 }
 
-/// `GET {path}/{id}`.
-async fn retrieve(
-    r: &'static Resource,
-    State(shared): State<Arc<Shared>>,
-    Extension(RequestScope(scope)): Extension<RequestScope>,
-    Path(id): Path<String>,
-    RawQuery(query): RawQuery,
-) -> Result<Json<Value>, ApiError> {
+/// The `expand[]` paths of a retrieve, whose only parameter is `expand`.
+fn expand_only(query: Option<String>) -> Result<Vec<String>, ApiError> {
     let mut paths = Vec::new();
     for (key, value) in decode(query) {
         if array_base(&key) != Some("expand") {
@@ -458,6 +489,18 @@ async fn retrieve(
         }
         paths.push(value);
     }
+    Ok(paths)
+}
+
+/// `GET {path}/{id}`.
+async fn retrieve(
+    r: &'static Resource,
+    State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
+    Path(id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    let paths = expand_only(query)?;
     let mut sim = shared.lock();
     ensure_connected(&sim.engine, &scope)?;
     let at = stale_at(&mut sim);
@@ -553,4 +596,270 @@ pub(crate) async fn customer_payment_methods(
     );
     expand(&view, r.t, &mut out, expand_paths(&p))?;
     Ok(Json(out))
+}
+
+/// `GET /v1/transfers/{id}/reversals`.
+pub(crate) async fn transfer_reversals(
+    state: State<Arc<Shared>>,
+    scope: Extension<RequestScope>,
+    Path(id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    sub_list(state, scope, &id, query, &Sub::TRANSFER_REVERSALS).await
+}
+
+/// `GET /v1/transfers/{id}/reversals/{rid}`.
+pub(crate) async fn transfer_reversal(
+    state: State<Arc<Shared>>,
+    scope: Extension<RequestScope>,
+    Path((id, rid)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    sub_retrieve(state, scope, &id, &rid, query, &Sub::TRANSFER_REVERSALS).await
+}
+
+/// `GET /v1/application_fees/{id}/refunds`.
+pub(crate) async fn fee_refunds(
+    state: State<Arc<Shared>>,
+    scope: Extension<RequestScope>,
+    Path(id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    sub_list(state, scope, &id, query, &Sub::FEE_REFUNDS).await
+}
+
+/// `GET /v1/application_fees/{id}/refunds/{rid}`.
+pub(crate) async fn fee_refund(
+    state: State<Arc<Shared>>,
+    scope: Extension<RequestScope>,
+    Path((id, rid)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    sub_retrieve(state, scope, &id, &rid, query, &Sub::FEE_REFUNDS).await
+}
+
+/// A child collection under a parent that lives in the request's scope.
+struct Sub {
+    parent: ObjectType,
+    child: ObjectType,
+    /// The child's parent field.
+    field: &'static str,
+    /// The collection segment after the parent's path.
+    segment: &'static str,
+    base: &'static str,
+}
+
+impl Sub {
+    const TRANSFER_REVERSALS: Sub = Sub {
+        parent: ObjectType::Transfer,
+        child: ObjectType::TransferReversal,
+        field: "transfer",
+        segment: "reversals",
+        base: "/v1/transfers",
+    };
+    const FEE_REFUNDS: Sub = Sub {
+        parent: ObjectType::ApplicationFee,
+        child: ObjectType::FeeRefund,
+        field: "fee",
+        segment: "refunds",
+        base: "/v1/application_fees",
+    };
+}
+
+async fn sub_list(
+    State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
+    id: &str,
+    query: Option<String>,
+    sub: &Sub,
+) -> Result<Json<Value>, ApiError> {
+    let p = parse_list_params(decode(query), &[], &["expand"])?;
+    let mut sim = shared.lock();
+    ensure_connected(&sim.engine, &scope)?;
+    pagination_write(&mut sim, &scope, &p, sub.child);
+    let at = stale_at(&mut sim);
+    let view = View {
+        engine: &sim.engine,
+        at,
+        scope,
+        page_size: sim.generators.nested_list_page_size(),
+    };
+    if view.visible(sub.parent, id).is_none() {
+        return Err(no_such(sub.parent, id));
+    }
+    let all = view.store().children(sub.child, sub.field, id);
+    let (page, has_more) = paginate(
+        &all,
+        |o| p.created.matches(o.created) && view.listed(o).is_some(),
+        &p,
+    )?;
+    let mut out = v1_list(
+        format!("{}/{id}/{}", sub.base, sub.segment),
+        has_more,
+        states(&view, &page),
+    );
+    expand(&view, sub.child, &mut out, expand_paths(&p))?;
+    Ok(Json(out))
+}
+
+async fn sub_retrieve(
+    State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
+    id: &str,
+    child_id: &str,
+    query: Option<String>,
+    sub: &Sub,
+) -> Result<Json<Value>, ApiError> {
+    let paths = expand_only(query)?;
+    let mut sim = shared.lock();
+    ensure_connected(&sim.engine, &scope)?;
+    let at = stale_at(&mut sim);
+    let view = View {
+        engine: &sim.engine,
+        at,
+        scope,
+        page_size: sim.generators.nested_list_page_size(),
+    };
+    if view.visible(sub.parent, id).is_none() {
+        return Err(no_such(sub.parent, id));
+    }
+    let mut obj = view
+        .visible(sub.child, child_id)
+        .filter(|o| o[sub.field].as_str() == Some(id))
+        .ok_or_else(|| no_such(sub.child, child_id))?;
+    expand(&view, sub.child, &mut obj, &paths)?;
+    Ok(Json(obj))
+}
+
+/// The view of an account sub-resource request: the account's own scope, which holds what
+/// is listed. The account itself is checked in the platform's scope, at the same time.
+fn account_view<'a>(sim: &'a mut Sim, acct: &str) -> Result<View<'a>, ApiError> {
+    let at = stale_at(sim);
+    let platform = View {
+        engine: &sim.engine,
+        at,
+        scope: None,
+        page_size: sim.generators.nested_list_page_size(),
+    };
+    if platform.visible(ObjectType::Account, acct).is_none() {
+        return Err(no_such(ObjectType::Account, acct));
+    }
+    Ok(View {
+        scope: Some(acct.to_string()),
+        ..platform
+    })
+}
+
+/// `GET /v1/accounts/{acct}/external_accounts`: bank accounts and cards together, in
+/// creation order.
+pub(crate) async fn external_accounts(
+    State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
+    Path(acct): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    let p = parse_list_params(decode(query), &["object"], &["expand"])?;
+    if let Some(want) = p.extra.get("object")
+        && !["bank_account", "card"].contains(&want.as_str())
+    {
+        return Err(ApiError::bad_request(
+            format!("Invalid object: {want}. Must be one of bank_account or card."),
+            None,
+            Some("object"),
+        ));
+    }
+    let mut sim = shared.lock();
+    ensure_connected(&sim.engine, &scope)?;
+    pagination_write(&mut sim, &Some(acct.clone()), &p, ObjectType::BankAccount);
+    let view = account_view(&mut sim, &acct)?;
+    let mut all: Vec<&StoredObject> = [ObjectType::BankAccount, ObjectType::Card]
+        .into_iter()
+        .flat_map(|t| view.store().in_creation_order(t))
+        .collect();
+    // The log position of the first version is the global creation order.
+    all.sort_by_key(|o| o.versions[0]);
+    let (page, has_more) = paginate(
+        &all,
+        |o| {
+            p.created.matches(o.created)
+                && view.listed(o).is_some_and(|u| {
+                    p.extra
+                        .get("object")
+                        .is_none_or(|want| u.state["object"].as_str() == Some(want))
+                })
+        },
+        &p,
+    )?;
+    let mut out = v1_list(
+        format!("/v1/accounts/{acct}/external_accounts"),
+        has_more,
+        states(&view, &page),
+    );
+    expand(&view, ObjectType::BankAccount, &mut out, expand_paths(&p))?;
+    Ok(Json(out))
+}
+
+/// `GET /v1/accounts/{acct}/external_accounts/{id}`.
+pub(crate) async fn external_account(
+    State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
+    Path((acct, id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    let paths = expand_only(query)?;
+    let mut sim = shared.lock();
+    ensure_connected(&sim.engine, &scope)?;
+    let view = account_view(&mut sim, &acct)?;
+    let (t, mut obj) = [ObjectType::BankAccount, ObjectType::Card]
+        .into_iter()
+        .find_map(|t| view.visible(t, &id).map(|o| (t, o)))
+        .ok_or_else(|| no_such(ObjectType::BankAccount, &id))?;
+    expand(&view, t, &mut obj, &paths)?;
+    Ok(Json(obj))
+}
+
+/// `GET /v1/accounts/{acct}/persons`.
+pub(crate) async fn persons(
+    State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
+    Path(acct): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    // Phase 8 ruling P8: no `relationship[...]` filters, so they are `parameter_unknown`.
+    let p = parse_list_params(decode(query), &[], &["expand"])?;
+    let mut sim = shared.lock();
+    ensure_connected(&sim.engine, &scope)?;
+    pagination_write(&mut sim, &Some(acct.clone()), &p, ObjectType::Person);
+    let view = account_view(&mut sim, &acct)?;
+    let all = view.store().in_creation_order(ObjectType::Person);
+    let (page, has_more) = paginate(
+        &all,
+        |o| p.created.matches(o.created) && view.listed(o).is_some(),
+        &p,
+    )?;
+    let mut out = v1_list(
+        format!("/v1/accounts/{acct}/persons"),
+        has_more,
+        states(&view, &page),
+    );
+    expand(&view, ObjectType::Person, &mut out, expand_paths(&p))?;
+    Ok(Json(out))
+}
+
+/// `GET /v1/accounts/{acct}/persons/{id}`.
+pub(crate) async fn person(
+    State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
+    Path((acct, id)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    let paths = expand_only(query)?;
+    let mut sim = shared.lock();
+    ensure_connected(&sim.engine, &scope)?;
+    let view = account_view(&mut sim, &acct)?;
+    let mut obj = view
+        .visible(ObjectType::Person, &id)
+        .ok_or_else(|| no_such(ObjectType::Person, &id))?;
+    expand(&view, ObjectType::Person, &mut obj, &paths)?;
+    Ok(Json(obj))
 }

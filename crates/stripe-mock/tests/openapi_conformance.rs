@@ -449,7 +449,10 @@ async fn busy_connect_run_conforms() {
         served.record(&v);
     }
 
-    for t in ObjectType::ALL {
+    for t in ObjectType::ALL
+        .into_iter()
+        .filter(|t| !NOT_YET_GENERATED.contains(t))
+    {
         assert!(
             served.objects.contains_key(t.as_str()),
             "{t:?} never served; served: {:?}",
@@ -509,8 +512,19 @@ async fn busy_connect_run_conforms() {
         (ObjectType::Refund, "failure_balance_transaction"),
         // Checkout sessions run in payment or subscription mode, never setup mode.
         (ObjectType::CheckoutSession, "setup_intent"),
+        // Nothing sets these until the Connect money generators land (phase 8, tasks 3 to
+        // 8; task 9 removes these entries).
+        (ObjectType::Charge, "transfer"),
+        (ObjectType::Charge, "application_fee"),
+        (ObjectType::Charge, "source_transfer"),
+        (ObjectType::Charge, "transfer_data.destination"),
+        (ObjectType::Refund, "source_transfer_reversal"),
+        (ObjectType::Refund, "transfer_reversal"),
     ];
-    for t in ObjectType::ALL {
+    for t in ObjectType::ALL
+        .into_iter()
+        .filter(|t| !NOT_YET_GENERATED.contains(t))
+    {
         for path in expand_paths(t) {
             assert_eq!(
                 platform.contains(&(t, *path)),
@@ -637,7 +651,17 @@ fn excluded(t: ObjectType, o: &Value) -> Vec<&'static str> {
         | ObjectType::InvoiceLineItem
         | ObjectType::Dispute
         | ObjectType::BalanceTransaction
-        | ObjectType::InvoicePayment => vec![],
+        | ObjectType::InvoicePayment
+        // Nothing generates the Connect money objects yet (phase 8, tasks 3 to 8), so
+        // there is nothing to skip.
+        | ObjectType::Transfer
+        | ObjectType::TransferReversal
+        | ObjectType::ApplicationFee
+        | ObjectType::FeeRefund
+        | ObjectType::Payout
+        | ObjectType::BankAccount
+        | ObjectType::Card
+        | ObjectType::Person => vec![],
     };
     // Only where the platform controls the account (the field's own description), so not
     // on Standard accounts.
@@ -646,6 +670,19 @@ fn excluded(t: ObjectType, o: &Value) -> Vec<&'static str> {
     }
     out
 }
+
+/// Connect money types that no generator creates yet (phase 8, tasks 3 to 8 add them, and
+/// task 9 drops this list).
+const NOT_YET_GENERATED: [ObjectType; 8] = [
+    ObjectType::Transfer,
+    ObjectType::TransferReversal,
+    ObjectType::ApplicationFee,
+    ObjectType::FeeRefund,
+    ObjectType::Payout,
+    ObjectType::BankAccount,
+    ObjectType::Card,
+    ObjectType::Person,
+];
 
 /// A payment method carries the hash of its own `type` only (`card` for the mock's cards).
 const PAYMENT_METHOD_TYPE_HASHES: &[&str] = &[
@@ -791,7 +828,10 @@ async fn served_objects_carry_their_documented_fields() {
     );
 
     let mut failures = Vec::new();
-    for t in ObjectType::ALL {
+    for t in ObjectType::ALL
+        .into_iter()
+        .filter(|t| !NOT_YET_GENERATED.contains(t))
+    {
         let schema = t.as_str();
         let list = objects.get(&t).cloned().unwrap_or_default();
         assert!(!list.is_empty(), "no {t:?} served");

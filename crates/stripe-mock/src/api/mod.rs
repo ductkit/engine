@@ -220,6 +220,9 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
         &resources::SETUP_INTENTS,
         &resources::CHECKOUT_SESSIONS,
         &resources::INVOICE_PAYMENTS,
+        &resources::TRANSFERS,
+        &resources::APPLICATION_FEES,
+        &resources::PAYOUTS,
     ] {
         router = resources::routes(router, r);
     }
@@ -229,6 +232,32 @@ pub(crate) fn router(shared: Arc<Shared>) -> Router {
             "/v1/customers/{id}/payment_methods",
             get(resources::customer_payment_methods),
         )
+        .route(
+            "/v1/transfers/{id}/reversals",
+            get(resources::transfer_reversals),
+        )
+        .route(
+            "/v1/transfers/{id}/reversals/{rid}",
+            get(resources::transfer_reversal),
+        )
+        .route(
+            "/v1/application_fees/{id}/refunds",
+            get(resources::fee_refunds),
+        )
+        .route(
+            "/v1/application_fees/{id}/refunds/{rid}",
+            get(resources::fee_refund),
+        )
+        .route(
+            "/v1/accounts/{id}/external_accounts",
+            get(resources::external_accounts),
+        )
+        .route(
+            "/v1/accounts/{id}/external_accounts/{eid}",
+            get(resources::external_account),
+        )
+        .route("/v1/accounts/{id}/persons", get(resources::persons))
+        .route("/v1/accounts/{id}/persons/{pid}", get(resources::person))
         .route("/v2/core/accounts", get(accounts::list_v2))
         .route("/v2/core/accounts/{id}", get(accounts::retrieve_v2))
         .route("/v1/events", get(events_v1::list))

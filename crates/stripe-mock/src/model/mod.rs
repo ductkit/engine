@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub mod account;
 pub mod catalog;
 pub mod checkout;
+pub mod connect;
 pub mod customer;
 pub mod embedded;
 pub mod invoice;
@@ -33,11 +34,25 @@ pub enum ObjectType {
     SetupIntent,
     CheckoutSession,
     InvoicePayment,
+    /// A platform-to-account transfer.
+    Transfer,
+    /// A reversal of a transfer. Child of a transfer.
+    TransferReversal,
+    ApplicationFee,
+    /// A refund of an application fee. Child of an application fee.
+    FeeRefund,
+    Payout,
+    /// An external account that is a bank account. Child of an account.
+    BankAccount,
+    /// An external account that is a card. Child of an account.
+    Card,
+    /// A person of a connected account. Child of an account.
+    Person,
 }
 
 impl ObjectType {
     /// Every type, in declaration order.
-    pub const ALL: [ObjectType; 17] = [
+    pub const ALL: [ObjectType; 25] = [
         ObjectType::Customer,
         ObjectType::Product,
         ObjectType::Price,
@@ -55,6 +70,14 @@ impl ObjectType {
         ObjectType::SetupIntent,
         ObjectType::CheckoutSession,
         ObjectType::InvoicePayment,
+        ObjectType::Transfer,
+        ObjectType::TransferReversal,
+        ObjectType::ApplicationFee,
+        ObjectType::FeeRefund,
+        ObjectType::Payout,
+        ObjectType::BankAccount,
+        ObjectType::Card,
+        ObjectType::Person,
     ];
 
     /// The Stripe `object` name.
@@ -77,6 +100,14 @@ impl ObjectType {
             ObjectType::SetupIntent => "setup_intent",
             ObjectType::CheckoutSession => "checkout.session",
             ObjectType::InvoicePayment => "invoice_payment",
+            ObjectType::Transfer => "transfer",
+            ObjectType::TransferReversal => "transfer_reversal",
+            ObjectType::ApplicationFee => "application_fee",
+            ObjectType::FeeRefund => "fee_refund",
+            ObjectType::Payout => "payout",
+            ObjectType::BankAccount => "bank_account",
+            ObjectType::Card => "card",
+            ObjectType::Person => "person",
         }
     }
 
@@ -110,6 +141,14 @@ impl ObjectType {
             // Includes the mode: real session IDs read `cs_test_...`.
             ObjectType::CheckoutSession => "cs_test",
             ObjectType::InvoicePayment => "inpay",
+            ObjectType::Transfer => "tr",
+            ObjectType::TransferReversal => "trr",
+            ObjectType::ApplicationFee => "fee",
+            ObjectType::FeeRefund => "fr",
+            ObjectType::Payout => "po",
+            ObjectType::BankAccount => "ba",
+            ObjectType::Card => "card",
+            ObjectType::Person => "person",
         }
     }
 
@@ -133,9 +172,31 @@ impl ObjectType {
             ObjectType::SetupIntent => "setup_intents",
             ObjectType::CheckoutSession => "checkout/sessions",
             ObjectType::InvoicePayment => "invoice_payments",
-            ObjectType::InvoiceLineItem => return None,
+            ObjectType::Transfer => "transfers",
+            ObjectType::ApplicationFee => "application_fees",
+            ObjectType::Payout => "payouts",
+            ObjectType::InvoiceLineItem
+            | ObjectType::TransferReversal
+            | ObjectType::FeeRefund
+            | ObjectType::BankAccount
+            | ObjectType::Card
+            | ObjectType::Person => return None,
         };
         Some(format!("/v1/{collection}/{id}"))
+    }
+
+    /// The retrieve path of a child object under its `parent`, e.g.
+    /// `/v1/transfers/tr_1/reversals/trr_1`; `None` for types that are not such children.
+    pub fn sub_path(&self, parent: &str, id: &str) -> Option<String> {
+        match self {
+            ObjectType::TransferReversal => Some(format!("/v1/transfers/{parent}/reversals/{id}")),
+            ObjectType::FeeRefund => Some(format!("/v1/application_fees/{parent}/refunds/{id}")),
+            ObjectType::BankAccount | ObjectType::Card => {
+                Some(format!("/v1/accounts/{parent}/external_accounts/{id}"))
+            }
+            ObjectType::Person => Some(format!("/v1/accounts/{parent}/persons/{id}")),
+            _ => None,
+        }
     }
 }
 
