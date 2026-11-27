@@ -422,6 +422,9 @@ pub struct ActionsConfig {
     /// A full or partial refund of a random application fee with something left (the
     /// platform scope only).
     pub application_fee_refund: f64,
+    /// A full or partial reversal of a random transfer with something left whose
+    /// destination is still connected (the platform scope only).
+    pub transfer_reversal: f64,
     pub renew_subscription_cycle: RenewMode,
     /// Gap between consecutive steps of one action.
     pub step_delay: Distribution,
@@ -446,6 +449,7 @@ impl ActionsConfig {
                 "actions.application_fee_refund",
                 self.application_fee_refund,
             ),
+            ("actions.transfer_reversal", self.transfer_reversal),
         ] {
             check_rate(name, rate)?;
         }

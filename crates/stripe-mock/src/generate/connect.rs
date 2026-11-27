@@ -17,6 +17,10 @@ use crate::model::connect::{
     new_fee_refund_balance_transaction, new_person, new_transfer, new_transfer_balance_transaction,
     representative_due,
 };
+use crate::model::connect::{
+    NewPaymentRefund, NewTransferReversal, new_payment_refund, new_reversal_balance_transaction,
+    new_transfer_reversal, transfer_reversals_url,
+};
 use crate::rng::SimRng;
 use crate::stripe;
 use crate::{AccountKind, ChargePattern, MockError, ObjectType, SimTime};
@@ -392,7 +396,8 @@ pub(super) fn delete_person(
     Ok(Some(cause))
 }
 
-/// Chance that an application fee refund with no given amount refunds everything left.
+/// Chance that an application fee refund or transfer reversal with no given amount covers
+/// everything left.
 const FULL_FEE_REFUND_PROBABILITY: f64 = 0.7;
 
 /// Whether the payment intent about to be created in the engine's scope carries an
@@ -918,4 +923,212 @@ pub(crate) fn transfer_to(
         cause.clone(),
     );
     tr
+}
+
+/// What is left to reverse of a transfer: `None` when it is fully reversed or its
+/// destination has disconnected.
+fn reversible_transfer(engine: &Engine, transfer: &str) -> Option<i64> {
+    let state = &engine.latest(ObjectType::Transfer, transfer)?.state;
+    let destination = state["destination"].as_str()?;
+    if !connected(engine, destination) {
+        return None;
+    }
+    let left = state["amount"].as_i64()? - state["amount_reversed"].as_i64()?;
+    (left > 0).then_some(left)
+}
+
+/// Reverses `amount` (all of what is left with p = 0.7, else a uniform amount in
+/// `[1, left]`, when `None`) of the named or a random transfer with something left whose
+/// destination is still connected. Platform scope only. `None` when no transfer was named
+/// and none can be reversed; a named transfer that cannot be reversed, or an `amount`
+/// outside `[1, left]`, is an error naming it.
+///
+/// Under one cause: the platform's balance transaction (`type: transfer_refund`, `+amount`,
+/// `available` at once), the `transfer_reversal` (no event), the transfer with
+/// `amount_reversed`, `reversed` once fully reversed and the reversal first in `reversals`
+/// (`transfer.reversed`); then, in the destination's scope and with no events, the `py_`
+/// payment's refund (a `pyr_`) with its balance transaction (`type: payment_refund`,
+/// `-amount`, `available` at once), and the payment's `amount_refunded` and `refunded`.
+pub(super) fn transfer_reversal(
+    rng: &mut SimRng,
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    transfer: Option<String>,
+    amount: Option<i64>,
+) -> Result<Option<Cause>, MockError> {
+    if engine.scope().is_some() {
+        return Err(MockError::InvalidAction(format!(
+            "transfer_reversal runs in the platform scope, not {}",
+            scope_name(engine)
+        )));
+    }
+    let (transfer, left) = match transfer {
+        Some(id) => {
+            if engine.latest(ObjectType::Transfer, &id).is_none() {
+                return Err(MockError::NoSuchObject {
+                    object_type: ObjectType::Transfer,
+                    id,
+                });
+            }
+            let Some(left) = reversible_transfer(engine, &id) else {
+                return Err(MockError::InvalidAction(format!(
+                    "transfer {id} cannot be reversed: it is fully reversed or its \
+                     destination has disconnected"
+                )));
+            };
+            (id, left)
+        }
+        None => {
+            let candidates: Vec<(&String, i64)> = engine
+                .store()
+                .live_ids(ObjectType::Transfer)
+                .iter()
+                .filter_map(|id| reversible_transfer(engine, id).map(|left| (id, left)))
+                .collect();
+            if candidates.is_empty() {
+                return Ok(None);
+            }
+            let (id, left) = *pick(rng, &candidates);
+            (id.clone(), left)
+        }
+    };
+    let amount = match amount {
+        Some(a) if (1..=left).contains(&a) => a,
+        Some(a) => {
+            return Err(MockError::InvalidAction(format!(
+                "cannot reverse {a} of transfer {transfer}: {left} left to reverse"
+            )));
+        }
+        None if rng.chance(FULL_FEE_REFUND_PROBABILITY) => left,
+        None => 1 + rng.below(left as u64) as i64,
+    };
+    let state = engine
+        .latest(ObjectType::Transfer, &transfer)
+        .expect("the transfer exists")
+        .state
+        .clone();
+    let account = state["destination"]
+        .as_str()
+        .expect("a transfer names its destination")
+        .to_string();
+    let py = state["destination_payment"]
+        .as_str()
+        .expect("a transfer names its destination payment")
+        .to_string();
+    let currency = state["currency"]
+        .as_str()
+        .expect("a transfer has a currency")
+        .to_string();
+    let created = engine.now().unix_seconds();
+    let reversal_id = ctx.payments.id(ObjectType::TransferReversal.id_prefix());
+    let refund_id = ctx.payments.id("pyr");
+    let bt_id = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
+    let account_bt_id = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
+    let cause = engine.begin_action("transfer_reversal");
+
+    let bt =
+        new_reversal_balance_transaction(&bt_id, created, amount, &currency, &reversal_id, true);
+    engine.create_obj(
+        ObjectType::BalanceTransaction,
+        bt_id.clone(),
+        &bt,
+        cause.clone(),
+        &[],
+    );
+    let reversal = new_transfer_reversal(&NewTransferReversal {
+        id: &reversal_id,
+        created,
+        transfer: &transfer,
+        amount,
+        currency: &currency,
+        balance_transaction: &bt_id,
+        destination_payment_refund: &refund_id,
+    });
+    engine.create_obj(
+        ObjectType::TransferReversal,
+        reversal_id.clone(),
+        &reversal,
+        cause.clone(),
+        &[],
+    );
+    // Newest first, cut to the page size.
+    let ids: Vec<String> = engine
+        .store()
+        .children(ObjectType::TransferReversal, "transfer", &transfer)
+        .into_iter()
+        .rev()
+        .filter(|o| !o.deleted)
+        .map(|o| o.latest.object_id.clone())
+        .collect();
+    let data: Vec<stripe::TransferReversal> = ids
+        .iter()
+        .take(ctx.page_size)
+        .map(|id| {
+            engine
+                .latest_obj(ObjectType::TransferReversal, id)
+                .expect("live transfer reversal")
+        })
+        .collect();
+    let list = stripe::List {
+        object: stripe::ListObject::List,
+        data,
+        has_more: ids.len() > ctx.page_size,
+        url: transfer_reversals_url(&transfer),
+        total_count: None,
+    };
+    engine
+        .update_obj::<stripe::Transfer>(
+            ObjectType::Transfer,
+            &transfer,
+            |t| {
+                t.amount_reversed += amount;
+                t.reversed = t.amount_reversed == t.amount;
+                t.reversals = list;
+            },
+            cause.clone(),
+            ChangeKind::Updated,
+            &["transfer.reversed"],
+        )
+        .expect("live transfer");
+
+    let account_bt = new_reversal_balance_transaction(
+        &account_bt_id,
+        created,
+        amount,
+        &currency,
+        &refund_id,
+        false,
+    );
+    let refund = new_payment_refund(&NewPaymentRefund {
+        id: &refund_id,
+        created,
+        amount,
+        currency: &currency,
+        charge: &py,
+        balance_transaction: &account_bt_id,
+        transfer_reversal: &reversal_id,
+    });
+    engine.in_scope(Some(account), |e| {
+        e.create_obj(
+            ObjectType::BalanceTransaction,
+            account_bt_id,
+            &account_bt,
+            cause.clone(),
+            &[],
+        );
+        e.create_obj(ObjectType::Refund, refund_id, &refund, cause.clone(), &[]);
+        e.update_obj::<stripe::Charge>(
+            ObjectType::Charge,
+            &py,
+            |c| {
+                c.amount_refunded += amount;
+                c.refunded = c.amount_refunded == c.amount;
+            },
+            cause.clone(),
+            ChangeKind::Updated,
+            &[],
+        )
+        .expect("live destination payment");
+    });
+    Ok(Some(cause))
 }

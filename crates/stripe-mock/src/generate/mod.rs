@@ -129,6 +129,14 @@ pub enum Action {
         fee: Option<String>,
         amount: Option<i64>,
     },
+    /// Reverse `amount` (drawn like a refund's when `None`) of the named or a random
+    /// transfer with something left whose destination is still connected, in the platform
+    /// scope. A named transfer with nothing left, or to a disconnected account, is an error
+    /// naming it; so is a connected account's scope.
+    TransferReversal {
+        transfer: Option<String>,
+        amount: Option<i64>,
+    },
 }
 
 /// The kind of an external account.
@@ -167,6 +175,7 @@ enum ActionKind {
     PersonUpdate,
     PersonDelete,
     ApplicationFeeRefund,
+    TransferReversal,
 }
 
 /// A follow-up step of an action.
@@ -479,6 +488,11 @@ impl Generator {
                 ActionKind::ApplicationFeeRefund,
                 a.application_fee_refund,
                 "generate.application_fee_refund",
+            ),
+            (
+                ActionKind::TransferReversal,
+                a.transfer_reversal,
+                "generate.transfer_reversal",
             ),
         ];
         let actions = specs
@@ -846,6 +860,16 @@ impl Generator {
                     "no application fee with something left to refund".to_string(),
                 )
             })?,
+            Action::TransferReversal { transfer, amount } => connect::transfer_reversal(
+                &mut self.control,
+                engine,
+                &mut self.ctx,
+                transfer,
+                amount,
+            )?
+            .ok_or_else(|| {
+                MockError::InvalidAction("no transfer with something left to reverse".to_string())
+            })?,
         };
         self.run_due_now(engine);
         Ok(cause)
@@ -913,12 +937,10 @@ impl Generator {
             ObjectType::ApplicationFee | ObjectType::FeeRefund => {
                 &[ActionKind::ApplicationFeeRefund]
             }
+            ObjectType::Transfer | ObjectType::TransferReversal => &[ActionKind::TransferReversal],
             // The write kinds for these arrive with their tasks, so the arms return early
-            // until then: Transfer and TransferReversal -> TransferReversal (task 7). A
-            // payout has no write.
-            ObjectType::Transfer
-            | ObjectType::TransferReversal
-            | ObjectType::Payout
+            // until then. A payout has no write.
+            ObjectType::Payout
             | ObjectType::BankAccount
             | ObjectType::Card
             | ObjectType::Person => return,
@@ -1111,6 +1133,13 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
         ActionKind::ApplicationFeeRefund => {
             if engine.scope().is_none() {
                 connect::application_fee_refund(rng, engine, ctx, None, None)
+                    .expect("random targets are valid");
+            }
+        }
+        // Transfers live in the platform scope too.
+        ActionKind::TransferReversal => {
+            if engine.scope().is_none() {
+                connect::transfer_reversal(rng, engine, ctx, None, None)
                     .expect("random targets are valid");
             }
         }

@@ -604,3 +604,124 @@ pub(crate) fn new_destination_payment(p: &NewDestinationPayment) -> stripe::Char
         transfer_group: Some(None),
     }
 }
+
+/// A balance transaction of a transfer reversal's money: the platform's gets `+amount`
+/// back (`transfer_refund`), the account's loses `-amount` (`payment_refund`). `available`
+/// at once with no fee.
+pub(crate) fn new_reversal_balance_transaction(
+    id: &str,
+    created: i64,
+    amount: i64,
+    currency: &str,
+    source: &str,
+    platform: bool,
+) -> stripe::BalanceTransaction {
+    let (amount, category, type_) = if platform {
+        (
+            amount,
+            "transfer_reversal",
+            stripe::BalanceTransactionType::TransferRefund,
+        )
+    } else {
+        (
+            -amount,
+            "refund",
+            stripe::BalanceTransactionType::PaymentRefund,
+        )
+    };
+    stripe::BalanceTransaction {
+        amount,
+        available_on: created,
+        balance_type: stripe::BalanceTransactionBalanceType::Payments,
+        created,
+        currency: currency.to_string(),
+        description: Some(None),
+        exchange_rate: Some(None),
+        fee: 0,
+        fee_details: Vec::new(),
+        id: id.to_string(),
+        net: amount,
+        object: stripe::BalanceTransactionObject::BalanceTransaction,
+        reporting_category: category.to_string(),
+        source: Some(Some(Expandable::Id(source.to_string()))),
+        status: "available".to_string(),
+        type_,
+    }
+}
+
+/// The inputs of a transfer reversal.
+pub(crate) struct NewTransferReversal<'a> {
+    pub id: &'a str,
+    pub created: i64,
+    pub transfer: &'a str,
+    pub amount: i64,
+    pub currency: &'a str,
+    pub balance_transaction: &'a str,
+    /// The `pyr_` refund of the `py_` payment, drawn before the reversal is built.
+    pub destination_payment_refund: &'a str,
+}
+
+/// A reversal of part or all of a transfer. It has no `source_refund`: that is set only
+/// when a refund of the original charge reverses the transfer.
+pub(crate) fn new_transfer_reversal(r: &NewTransferReversal) -> stripe::TransferReversal {
+    stripe::TransferReversal {
+        amount: r.amount,
+        balance_transaction: Some(Some(Expandable::Id(r.balance_transaction.to_string()))),
+        created: r.created,
+        currency: r.currency.to_string(),
+        destination_payment_refund: Some(Some(Expandable::Id(
+            r.destination_payment_refund.to_string(),
+        ))),
+        id: r.id.to_string(),
+        metadata: Some(Some(Default::default())),
+        object: stripe::TransferReversalObject::TransferReversal,
+        source_refund: Some(None),
+        transfer: Expandable::Id(r.transfer.to_string()),
+    }
+}
+
+/// The inputs of the refund of a `py_` payment that a transfer reversal creates.
+pub(crate) struct NewPaymentRefund<'a> {
+    pub id: &'a str,
+    pub created: i64,
+    pub amount: i64,
+    pub currency: &'a str,
+    /// The `py_` payment refunded.
+    pub charge: &'a str,
+    pub balance_transaction: &'a str,
+    pub transfer_reversal: &'a str,
+}
+
+/// The `pyr_` refund of a `py_` payment: `succeeded`, with no customer, payment intent or
+/// payment method (the payment has none) and the reversal that caused it as its
+/// `source_transfer_reversal`.
+pub(crate) fn new_payment_refund(r: &NewPaymentRefund) -> stripe::Refund {
+    stripe::Refund {
+        amount: r.amount,
+        application: Some(None),
+        balance_transaction: Some(Some(Expandable::Id(r.balance_transaction.to_string()))),
+        charge: Some(Some(Expandable::Id(r.charge.to_string()))),
+        created: r.created,
+        currency: r.currency.to_string(),
+        customer: Some(None),
+        customer_account: Some(None),
+        description: None,
+        destination_details: None,
+        failure_balance_transaction: None,
+        failure_reason: None,
+        id: r.id.to_string(),
+        instructions_email: None,
+        metadata: Some(Some(Default::default())),
+        next_action: None,
+        object: stripe::RefundObject::Refund,
+        payment_intent: Some(None),
+        payment_method: Some(None),
+        pending_reason: None,
+        presentment_details: None,
+        reason: Some(None),
+        receipt_number: Some(None),
+        source_transfer_reversal: Some(Some(Expandable::Id(r.transfer_reversal.to_string()))),
+        status: Some(Some("succeeded".to_string())),
+        transfer_reversal: Some(None),
+    }
+}

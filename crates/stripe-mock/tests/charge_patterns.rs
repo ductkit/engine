@@ -655,3 +655,299 @@ delete = 0.1
         }
     }
 }
+
+fn reverse(transfer: &str, amount: Option<i64>) -> Action {
+    Action::TransferReversal {
+        transfer: Some(transfer.to_string()),
+        amount,
+    }
+}
+
+/// A mock with one destination payment of `amount`: the account, the transfer and its
+/// `py_` payment.
+async fn transfer_setup(amount: i64) -> (MockStripe, String, String, String) {
+    let m = mock_with(&with_pattern("{ destination = 1.0 }")).await;
+    let acct = m.connect_account(AccountApi::V1).unwrap();
+    let cause = m.run_action(payment(amount)).unwrap();
+    let tr = only_id(&caused(&m, &cause), ObjectType::Transfer);
+    let t = json(&m, &format!("/v1/transfers/{tr}")).await;
+    let py = t["destination_payment"].as_str().unwrap().to_string();
+    (m, acct, tr, py)
+}
+
+#[tokio::test]
+async fn partial_then_full_reversal() {
+    let (m, acct, tr, py) = transfer_setup(1000).await;
+
+    // A partial reversal.
+    let cause = m.run_action(reverse(&tr, Some(300))).unwrap();
+    let mine = caused(&m, &cause);
+    let trr1 = only_id(&mine, ObjectType::TransferReversal);
+    assert!(trr1.starts_with("trr_"), "{trr1}");
+    let r1 = json(&m, &format!("/v1/transfers/{tr}/reversals/{trr1}")).await;
+    assert_eq!(r1["object"], "transfer_reversal");
+    assert_eq!(r1["amount"], 300);
+    assert_eq!(r1["transfer"], tr.as_str());
+    assert!(r1["source_refund"].is_null(), "{r1:#}");
+    let pyr1 = r1["destination_payment_refund"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(pyr1.starts_with("pyr_"), "{pyr1}");
+    // The platform's balance transaction: `+amount`, available at once.
+    let bt = json(
+        &m,
+        &format!(
+            "/v1/balance_transactions/{}",
+            r1["balance_transaction"].as_str().unwrap()
+        ),
+    )
+    .await;
+    assert_eq!(bt["type"], "transfer_refund");
+    assert_eq!(bt["amount"], 300);
+    assert_eq!(bt["fee"], 0);
+    assert_eq!(bt["net"], 300);
+    assert_eq!(bt["status"], "available");
+    let t = json(&m, &format!("/v1/transfers/{tr}")).await;
+    assert_eq!(t["amount_reversed"], 300);
+    assert_eq!(t["reversed"], false);
+    assert_eq!(t["reversals"]["data"][0]["id"], trr1.as_str());
+    // The refund of the `py_` payment, in the account.
+    let refund = json_as(&m, &format!("/v1/refunds/{pyr1}"), &acct).await;
+    assert_eq!(refund["object"], "refund");
+    assert_eq!(refund["amount"], 300);
+    assert_eq!(refund["status"], "succeeded");
+    assert_eq!(refund["charge"], py.as_str());
+    assert_eq!(refund["source_transfer_reversal"], trr1.as_str());
+    let rbt = json_as(
+        &m,
+        &format!(
+            "/v1/balance_transactions/{}",
+            refund["balance_transaction"].as_str().unwrap()
+        ),
+        &acct,
+    )
+    .await;
+    assert_eq!(rbt["type"], "payment_refund");
+    assert_eq!(rbt["amount"], -300);
+    assert_eq!(rbt["net"], -300);
+    assert_eq!(rbt["status"], "available");
+    assert_eq!(rbt["source"], pyr1.as_str());
+    let p = json_as(&m, "/v1/charges", &acct).await;
+    assert_eq!(p["data"][0]["id"], py.as_str());
+    assert_eq!(p["data"][0]["amount_refunded"], 300);
+    assert_eq!(p["data"][0]["refunded"], false);
+    // Everything happened in this instant.
+    assert!(mine.iter().all(|u| u.at == mine[0].at));
+
+    // Too much is refused, naming the transfer.
+    let msg = invalid_action(m.run_action(reverse(&tr, Some(701))));
+    assert!(msg.contains(&tr), "{msg}");
+    invalid_action(m.run_action(reverse(&tr, Some(0))));
+
+    // The rest.
+    let cause = m.run_action(reverse(&tr, Some(700))).unwrap();
+    let trr2 = only_id(&caused(&m, &cause), ObjectType::TransferReversal);
+    let t = json(&m, &format!("/v1/transfers/{tr}")).await;
+    assert_eq!(t["amount_reversed"], 1000);
+    assert_eq!(t["reversed"], true);
+    // The amounts across the transfer, its reversals and the `py_` payment agree.
+    let embedded: Vec<&str> = t["reversals"]["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(embedded, [trr2.as_str(), trr1.as_str()], "newest first");
+    let sum: i64 = t["reversals"]["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["amount"].as_i64().unwrap())
+        .sum();
+    assert_eq!(sum, t["amount_reversed"].as_i64().unwrap());
+    // The sub-list lists newest first too, and is the embedded list's first page.
+    let sub = json(&m, &format!("/v1/transfers/{tr}/reversals")).await;
+    assert_eq!(sub["data"], t["reversals"]["data"]);
+    assert_eq!(sub["has_more"], false);
+    let p = json_as(&m, &format!("/v1/charges/{py}"), &acct).await;
+    assert_eq!(p["amount_refunded"], 1000);
+    assert_eq!(p["refunded"], true);
+    let refunds = json_as(&m, "/v1/refunds", &acct).await;
+    let total: i64 = refunds["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["amount"].as_i64().unwrap())
+        .sum();
+    assert_eq!(total, 1000);
+
+    // A third reversal has nothing left to reverse.
+    let msg = invalid_action(m.run_action(reverse(&tr, None)));
+    assert!(msg.contains(&tr), "{msg}");
+    let msg = invalid_action(m.run_action(reverse(&tr, Some(1))));
+    assert!(msg.contains(&tr), "{msg}");
+    // An unknown transfer is a 404; an account scope cannot reverse.
+    assert!(matches!(
+        m.run_action(reverse("tr_missing", None)),
+        Err(MockError::NoSuchObject { .. })
+    ));
+    invalid_action(m.account(&acct).run_action(reverse(&tr, Some(1))));
+}
+
+#[tokio::test]
+async fn reversal_events_and_scopes() {
+    let (m, acct, tr, py) = transfer_setup(1000).await;
+    let cause = m.run_action(reverse(&tr, Some(400))).unwrap();
+    let mine = caused(&m, &cause);
+    // One event, platform scope, unlabelled: the transfer's. Nothing else announces.
+    let events = events_of(&m, &mine);
+    assert_eq!(events, [("transfer.reversed".to_string(), None)]);
+    let trr = only_id(&mine, ObjectType::TransferReversal);
+    let reversal = mine
+        .iter()
+        .find(|u| u.object_type == ObjectType::TransferReversal)
+        .unwrap();
+    assert!(reversal.events.snapshot.is_empty());
+    // Steps 4-6 are in the account scope, with no events.
+    let in_account: Vec<(ObjectType, String)> = mine
+        .iter()
+        .filter(|u| u.account.is_some())
+        .map(|u| (u.object_type, u.object_id.clone()))
+        .collect();
+    let types: Vec<ObjectType> = in_account.iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        types,
+        [
+            ObjectType::BalanceTransaction,
+            ObjectType::Refund,
+            ObjectType::Charge
+        ]
+    );
+    assert_eq!(in_account[2].1, py);
+    assert!(
+        mine.iter()
+            .filter(|u| u.account.is_some())
+            .all(|u| u.account.as_deref() == Some(acct.as_str()) && u.events.snapshot.is_empty())
+    );
+    // The platform side: balance transaction, reversal, transfer.
+    let platform: Vec<ObjectType> = mine
+        .iter()
+        .filter(|u| u.account.is_none())
+        .map(|u| u.object_type)
+        .collect();
+    assert_eq!(
+        platform,
+        [
+            ObjectType::BalanceTransaction,
+            ObjectType::TransferReversal,
+            ObjectType::Transfer
+        ]
+    );
+    // The `pyr_` refund is found in the account's refunds, not the platform's.
+    let r = json(&m, &format!("/v1/transfers/{tr}/reversals/{trr}")).await;
+    let pyr = r["destination_payment_refund"].as_str().unwrap();
+    let listed = json_as(&m, "/v1/refunds", &acct).await;
+    assert_eq!(listed["data"][0]["id"], pyr);
+    assert_eq!(listed["data"].as_array().unwrap().len(), 1);
+    assert_eq!(json(&m, "/v1/refunds").await["data"], Value::Array(vec![]));
+    assert_eq!(get(&m, &format!("/v1/refunds/{pyr}")).await.status(), 404);
+    assert!(m.event_timeline().iter().all(|e| e.object_id != pyr));
+}
+
+#[tokio::test]
+async fn reversal_refund_expands_across_scopes() {
+    let (m, acct, tr, _py) = transfer_setup(800).await;
+    let cause = m.run_action(reverse(&tr, Some(250))).unwrap();
+    let trr = only_id(&caused(&m, &cause), ObjectType::TransferReversal);
+    // The platform expands the reversal's refund, which lives in the account.
+    let e = json(
+        &m,
+        &format!("/v1/transfers/{tr}/reversals/{trr}?expand[]=destination_payment_refund"),
+    )
+    .await;
+    assert_eq!(e["destination_payment_refund"]["object"], "refund");
+    assert_eq!(e["destination_payment_refund"]["amount"], 250);
+    let pyr = e["destination_payment_refund"]["id"].as_str().unwrap();
+    assert!(pyr.starts_with("pyr_"), "{pyr}");
+    // The account expands the refund's reversal, which lives on the platform.
+    let e = json_as(
+        &m,
+        &format!("/v1/refunds/{pyr}?expand[]=source_transfer_reversal"),
+        &acct,
+    )
+    .await;
+    assert_eq!(e["source_transfer_reversal"]["object"], "transfer_reversal");
+    assert_eq!(e["source_transfer_reversal"]["id"], trr.as_str());
+    assert_eq!(e["source_transfer_reversal"]["amount"], 250);
+    // Through the transfer's list too: the sub-list expands its items.
+    let l = json(
+        &m,
+        &format!("/v1/transfers/{tr}/reversals?expand[]=data.destination_payment_refund"),
+    )
+    .await;
+    assert_eq!(l["data"][0]["destination_payment_refund"]["id"], pyr);
+}
+
+#[tokio::test]
+async fn transfers_to_disconnected_accounts_are_not_reversed() {
+    let m = mock_with(&format!(
+        "{}[actions]\ntransfer_reversal = 50.0\n",
+        with_pattern("{ destination = 1.0 }")
+    ))
+    .await;
+    let gone = m.connect_account(AccountApi::V1).unwrap();
+    let kept = m.connect_account(AccountApi::V1).unwrap();
+    let pay_to = |to: &str| Action::OneOffPayment {
+        customer: None,
+        amount: Some(1000),
+        succeed: Some(true),
+        pattern: Some(ChargePattern::Destination),
+        recipient: Some(to.to_string()),
+    };
+    let tr_gone = only_id(
+        &caused(&m, &m.run_action(pay_to(&gone)).unwrap()),
+        ObjectType::Transfer,
+    );
+    let tr_kept = only_id(
+        &caused(&m, &m.run_action(pay_to(&kept)).unwrap()),
+        ObjectType::Transfer,
+    );
+    m.disconnect_account(&gone).unwrap();
+    let before = m.truth_log().len();
+    // A named transfer to a disconnected account is a 409 naming it.
+    let msg = invalid_action(m.run_action(reverse(&tr_gone, Some(10))));
+    assert!(msg.contains(&tr_gone), "{msg}");
+    // The generator reverses the other one only.
+    m.step(Duration::from_secs(2 * HOUR)).await.unwrap();
+    let log = m.truth_log();
+    let reversed: Vec<&StateUpdate> = log[before..]
+        .iter()
+        .filter(|u| u.object_type == ObjectType::TransferReversal)
+        .collect();
+    assert!(!reversed.is_empty(), "the connected transfer is reversed");
+    assert!(
+        reversed
+            .iter()
+            .all(|u| u.state["transfer"] == tr_kept.as_str()),
+        "{reversed:?}"
+    );
+    assert!(
+        log[before..]
+            .iter()
+            .all(|u| u.account.as_deref() != Some(&gone)),
+        "nothing happens in a disconnected account's scope"
+    );
+    let t = json(&m, &format!("/v1/transfers/{tr_gone}")).await;
+    assert_eq!(t["amount_reversed"], 0);
+    // Once the connected one is fully reversed, nothing is left to draw.
+    let t = json(&m, &format!("/v1/transfers/{tr_kept}")).await;
+    assert_eq!(t["reversed"], true);
+    let n = m.truth_log().len();
+    m.step(Duration::from_secs(HOUR)).await.unwrap();
+    assert!(
+        m.truth_log()[n..]
+            .iter()
+            .all(|u| u.object_type != ObjectType::TransferReversal)
+    );
+}
