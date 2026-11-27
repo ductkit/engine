@@ -485,7 +485,7 @@ History events are listed by the Events APIs while inside retention, but never d
 - Embedded lists (`subscription.items`, `invoice.lines`) truncated to `nested_list_page_size` with `has_more: true` and a `url` for the sub-list.
 - Expandable fields return IDs unless `expand[]` asks for the object.
 - Includable lists, `charge.refunds` and `invoice.payments`, are absent unless `expand[]` names them (`refunds`, `payments`, or `data.refunds` / `data.payments` on a list), as live Stripe serves them. They never appear in events or truth. When expanded, they are built from the objects visible to the request (refunds newest first, invoice payments in creation order), truncated to `nested_list_page_size` with `has_more`, `total_count` and the sub-list `url`.
-- Sub-lists list in creation order, ascending, so their first page equals the embedded list.
+- Sub-lists list in creation order, ascending, so their first page equals the embedded list. The exceptions are a transfer's `/reversals` and an application fee's `/refunds`, which list newest first, like their embedded lists.
 
 ### 7.4 Consistency faults on the API
 
