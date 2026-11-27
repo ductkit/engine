@@ -102,7 +102,7 @@ pub struct Subscription {
         skip_serializing_if = "Option::is_none",
         with = "crate::stripe::double_option"
     )]
-    pub default_source: Option<Option<String>>,
+    pub default_source: Option<Option<Expandable<SubscriptionDefaultSource>>>,
     /// The tax rates that will apply to any subscription item that does not have `tax_rates` set.
     #[serde(
         default,
@@ -564,6 +564,20 @@ impl HasId for SubscriptionCustomer {
         match self {
             Self::Customer(x) => x.id(),
             Self::DeletedCustomer(x) => x.id(),
+        }
+    }
+}
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum SubscriptionDefaultSource {
+    BankAccount(BankAccount),
+    Card(Card),
+}
+impl HasId for SubscriptionDefaultSource {
+    fn id(&self) -> &str {
+        match self {
+            Self::BankAccount(x) => x.id(),
+            Self::Card(x) => x.id(),
         }
     }
 }

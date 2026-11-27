@@ -105,16 +105,26 @@ pub enum BalanceTransactionObject {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(untagged)]
 pub enum BalanceTransactionSource {
+    ApplicationFee(ApplicationFee),
     Charge(Charge),
     Dispute(Dispute),
+    FeeRefund(FeeRefund),
+    Payout(Payout),
     Refund(Refund),
+    Transfer(Transfer),
+    TransferReversal(TransferReversal),
 }
 impl HasId for BalanceTransactionSource {
     fn id(&self) -> &str {
         match self {
+            Self::ApplicationFee(x) => x.id(),
             Self::Charge(x) => x.id(),
             Self::Dispute(x) => x.id(),
+            Self::FeeRefund(x) => x.id(),
+            Self::Payout(x) => x.id(),
             Self::Refund(x) => x.id(),
+            Self::Transfer(x) => x.id(),
+            Self::TransferReversal(x) => x.id(),
         }
     }
 }

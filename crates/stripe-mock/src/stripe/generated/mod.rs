@@ -42,6 +42,17 @@ mod payment_method;
 mod setup_intent;
 mod checkout_session;
 mod invoice_payment;
+mod transfer;
+mod transfer_reversal;
+mod application_fee;
+mod fee_refund;
+mod payout;
+mod bank_account;
+mod deleted_bank_account;
+mod card;
+mod deleted_card;
+mod person;
+mod deleted_person;
 pub use customer::*;
 pub use deleted_customer::*;
 pub use product::*;
@@ -73,15 +84,29 @@ pub use payment_method::*;
 pub use setup_intent::*;
 pub use checkout_session::*;
 pub use invoice_payment::*;
+pub use transfer::*;
+pub use transfer_reversal::*;
+pub use application_fee::*;
+pub use fee_refund::*;
+pub use payout::*;
+pub use bank_account::*;
+pub use deleted_bank_account::*;
+pub use card::*;
+pub use deleted_card::*;
+pub use person::*;
+pub use deleted_person::*;
 /// `(object value, schema)` for every generated component schema with a one-value
 /// `object` field. Several schemas can share a value (`customer`, `deleted_customer`).
 pub const SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("account", "account"),
     ("account", "deleted_account"),
     ("application", "application"),
+    ("application_fee", "application_fee"),
     ("balance_transaction", "balance_transaction"),
     ("bank_account", "bank_account"),
+    ("bank_account", "deleted_bank_account"),
     ("card", "card"),
+    ("card", "deleted_card"),
     ("cash_balance", "cash_balance"),
     ("charge", "charge"),
     ("checkout.session", "checkout.session"),
@@ -90,6 +115,7 @@ pub const SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("discount", "discount"),
     ("dispute", "dispute"),
     ("event", "event"),
+    ("fee_refund", "fee_refund"),
     ("invoice", "deleted_invoice"),
     ("invoice", "invoice"),
     ("invoice_payment", "invoice_payment"),
@@ -101,6 +127,8 @@ pub const SCHEMA_OBJECTS: &[(&str, &str)] = &[
         "payment_intent_amount_details_line_item",
     ),
     ("payment_method", "payment_method"),
+    ("payout", "payout"),
+    ("person", "deleted_person"),
     ("person", "person"),
     ("price", "deleted_price"),
     ("price", "price"),
@@ -114,6 +142,8 @@ pub const SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("subscription_item", "subscription_item"),
     ("tax_id", "tax_id"),
     ("tax_rate", "tax_rate"),
+    ("transfer", "transfer"),
+    ("transfer_reversal", "transfer_reversal"),
     ("v2.core.account", "v2.core.account"),
     ("v2.core.event", "v2.core.event"),
     ("v2.core.event_destination", "v2.core.event_destination"),
@@ -370,6 +400,25 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
                 ]
             }
             "application" => &["id", "name", "object"],
+            "application_fee" => {
+                &[
+                    "account",
+                    "amount",
+                    "amount_refunded",
+                    "application",
+                    "balance_transaction",
+                    "charge",
+                    "created",
+                    "currency",
+                    "fee_source",
+                    "id",
+                    "livemode",
+                    "object",
+                    "originating_transaction",
+                    "refunded",
+                    "refunds",
+                ]
+            }
             "automatic_tax" => {
                 &["disabled_reason", "enabled", "liability", "provider", "status"]
             }
@@ -920,8 +969,11 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
             "customer_tax" => &["automatic_tax", "ip_address", "location", "provider"],
             "customer_tax_location" => &["country", "source", "state"],
             "deleted_account" => &["deleted", "id", "object"],
+            "deleted_bank_account" => &["currency", "deleted", "id", "object"],
+            "deleted_card" => &["currency", "deleted", "id", "object"],
             "deleted_customer" => &["deleted", "id", "object"],
             "deleted_invoice" => &["deleted", "id", "object"],
+            "deleted_person" => &["deleted", "id", "object"],
             "deleted_price" => &["deleted", "id", "object"],
             "deleted_product" => &["deleted", "id", "object"],
             "deleted_subscription_item" => &["deleted", "id", "object"],
@@ -1095,6 +1147,18 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
                 &["currently_due", "errors", "past_due", "pending_verification"]
             }
             "fee" => &["amount", "application", "currency", "description", "type"],
+            "fee_refund" => {
+                &[
+                    "amount",
+                    "balance_transaction",
+                    "created",
+                    "currency",
+                    "fee",
+                    "id",
+                    "metadata",
+                    "object",
+                ]
+            }
             "funding_instructions_bank_transfer_aba_record" => {
                 &[
                     "account_holder_address",
@@ -3094,6 +3158,38 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
             "payment_pages_private_card_payment_method_options_resource_restrictions" => {
                 &["brands_blocked", "funding_types_blocked"]
             }
+            "payout" => {
+                &[
+                    "amount",
+                    "application_fee",
+                    "application_fee_amount",
+                    "arrival_date",
+                    "automatic",
+                    "balance_transaction",
+                    "created",
+                    "currency",
+                    "description",
+                    "destination",
+                    "failure_balance_transaction",
+                    "failure_code",
+                    "failure_message",
+                    "id",
+                    "livemode",
+                    "metadata",
+                    "method",
+                    "object",
+                    "original_payout",
+                    "payout_method",
+                    "reconciliation_status",
+                    "reversed_by",
+                    "source_type",
+                    "statement_descriptor",
+                    "status",
+                    "trace_id",
+                    "type",
+                ]
+            }
+            "payouts_trace_id" => &["status", "value"],
             "paypal_seller_protection" => &["dispute_categories", "status"],
             "person" => {
                 &[
@@ -3170,6 +3266,7 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
             "person_us_cfpb_data" => {
                 &["ethnicity_details", "race_details", "self_identified_gender"]
             }
+            "platform_earning_fee_source" => &["charge", "payout", "type"],
             "price" => {
                 &[
                     "active",
@@ -3999,8 +4096,43 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
             "token_card_networks" => &["preferred"],
             "token_card_wallet" => &["apple_pay", "type"],
             "token_card_wallet_apple_pay" => &["type"],
+            "transfer" => {
+                &[
+                    "amount",
+                    "amount_reversed",
+                    "balance_transaction",
+                    "created",
+                    "currency",
+                    "description",
+                    "destination",
+                    "destination_payment",
+                    "id",
+                    "livemode",
+                    "metadata",
+                    "object",
+                    "reversals",
+                    "reversed",
+                    "source_transaction",
+                    "source_type",
+                    "transfer_group",
+                ]
+            }
             "transfer_data" => {
                 &["amount", "description", "destination", "metadata", "payment_data"]
+            }
+            "transfer_reversal" => {
+                &[
+                    "amount",
+                    "balance_transaction",
+                    "created",
+                    "currency",
+                    "destination_payment_refund",
+                    "id",
+                    "metadata",
+                    "object",
+                    "source_refund",
+                    "transfer",
+                ]
             }
             "transfer_schedule" => {
                 &[
@@ -4095,6 +4227,15 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
 /// The JSON names of a generated component schema's expandable fields.
 pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
     match schema {
+        "application_fee" => {
+            &[
+                "account",
+                "application",
+                "balance_transaction",
+                "charge",
+                "originating_transaction",
+            ]
+        }
         "balance_transaction" => &["source"],
         "bank_account" => &["account", "customer"],
         "billing_bill_resource_invoicing_parents_invoice_subscription_parent" => {
@@ -4105,11 +4246,14 @@ pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
         "charge" => {
             &[
                 "application",
+                "application_fee",
                 "balance_transaction",
                 "customer",
                 "failure_balance_transaction",
                 "on_behalf_of",
                 "payment_intent",
+                "source_transfer",
+                "transfer",
             ]
         }
         "charge_transfer_data" => &["destination"],
@@ -4117,13 +4261,16 @@ pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
             &["customer", "invoice", "payment_intent", "setup_intent", "subscription"]
         }
         "connect_account_reference" => &["account"],
+        "customer" => &["default_source"],
         "discount" => &["customer"],
         "dispute" => &["charge", "payment_intent"],
+        "fee_refund" => &["balance_transaction", "fee"],
         "invoice" => {
             &[
                 "application",
                 "customer",
                 "default_payment_method",
+                "default_source",
                 "latest_revision",
                 "on_behalf_of",
             ]
@@ -4148,6 +4295,16 @@ pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
         "payment_method_details_bancontact" => &["generated_sepa_debit"],
         "payment_method_details_ideal" => &["generated_sepa_debit"],
         "payment_method_details_sofort" => &["generated_sepa_debit"],
+        "payout" => {
+            &[
+                "application_fee",
+                "balance_transaction",
+                "destination",
+                "failure_balance_transaction",
+                "original_payout",
+                "reversed_by",
+            ]
+        }
         "price" => &["product"],
         "product" => &["default_price"],
         "refund" => {
@@ -4159,6 +4316,8 @@ pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
                 "failure_balance_transaction",
                 "payment_intent",
                 "payment_method",
+                "source_transfer_reversal",
+                "transfer_reversal",
             ]
         }
         "sepa_debit_generated_from" => &["charge"],
@@ -4168,6 +4327,7 @@ pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
                 "application",
                 "customer",
                 "default_payment_method",
+                "default_source",
                 "latest_invoice",
                 "on_behalf_of",
                 "pending_setup_intent",
@@ -4177,7 +4337,23 @@ pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
         "subscriptions_resource_billing_schedules_applies_to" => &["price"],
         "tax_i_ds_owner" => &["account", "application", "customer"],
         "tax_id" => &["customer"],
+        "transfer" => {
+            &[
+                "balance_transaction",
+                "destination",
+                "destination_payment",
+                "source_transaction",
+            ]
+        }
         "transfer_data" => &["destination"],
+        "transfer_reversal" => {
+            &[
+                "balance_transaction",
+                "destination_payment_refund",
+                "source_refund",
+                "transfer",
+            ]
+        }
         _ => &[],
     }
 }
@@ -4204,6 +4380,12 @@ pub(crate) fn check_by_object(
                     &[("application", super::check::<Application>)],
                 )
             }
+            "application_fee" => {
+                super::check_candidates(
+                    v,
+                    &[("application_fee", super::check::<ApplicationFee>)],
+                )
+            }
             "balance_transaction" => {
                 super::check_candidates(
                     v,
@@ -4213,10 +4395,21 @@ pub(crate) fn check_by_object(
             "bank_account" => {
                 super::check_candidates(
                     v,
-                    &[("bank_account", super::check::<BankAccount>)],
+                    &[
+                        ("bank_account", super::check::<BankAccount>),
+                        ("deleted_bank_account", super::check::<DeletedBankAccount>),
+                    ],
                 )
             }
-            "card" => super::check_candidates(v, &[("card", super::check::<Card>)]),
+            "card" => {
+                super::check_candidates(
+                    v,
+                    &[
+                        ("card", super::check::<Card>),
+                        ("deleted_card", super::check::<DeletedCard>),
+                    ],
+                )
+            }
             "cash_balance" => {
                 super::check_candidates(
                     v,
@@ -4246,6 +4439,9 @@ pub(crate) fn check_by_object(
                 super::check_candidates(v, &[("dispute", super::check::<Dispute>)])
             }
             "event" => super::check_candidates(v, &[("event", super::check::<Event>)]),
+            "fee_refund" => {
+                super::check_candidates(v, &[("fee_refund", super::check::<FeeRefund>)])
+            }
             "invoice" => {
                 super::check_candidates(
                     v,
@@ -4288,7 +4484,16 @@ pub(crate) fn check_by_object(
                     &[("payment_method", super::check::<PaymentMethod>)],
                 )
             }
-            "person" => super::check_candidates(v, &[("person", super::check::<Person>)]),
+            "payout" => super::check_candidates(v, &[("payout", super::check::<Payout>)]),
+            "person" => {
+                super::check_candidates(
+                    v,
+                    &[
+                        ("deleted_person", super::check::<DeletedPerson>),
+                        ("person", super::check::<Person>),
+                    ],
+                )
+            }
             "price" => {
                 super::check_candidates(
                     v,
@@ -4336,6 +4541,15 @@ pub(crate) fn check_by_object(
             "tax_id" => super::check_candidates(v, &[("tax_id", super::check::<TaxId>)]),
             "tax_rate" => {
                 super::check_candidates(v, &[("tax_rate", super::check::<TaxRate>)])
+            }
+            "transfer" => {
+                super::check_candidates(v, &[("transfer", super::check::<Transfer>)])
+            }
+            "transfer_reversal" => {
+                super::check_candidates(
+                    v,
+                    &[("transfer_reversal", super::check::<TransferReversal>)],
+                )
             }
             "v2.core.account" => {
                 super::check_candidates(

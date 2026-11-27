@@ -462,3 +462,61 @@ async fn replay_guard_writes_on_panic() {
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_dir_all(&quiet).unwrap();
 }
+
+/// Every phase 7 rate on, Connect on with two Standard accounts (controlled accounts get
+/// setup objects from phase 8 on, so the guard uses Standard only).
+const PHASE_7_FULL: &str = r#"
+seed = 11
+[actions]
+new_customer = 10.0
+start_subscription = 4.0
+cancel_subscription = 0.5
+one_off_payment = 6.0
+refund = 0.4
+dispute = 0.05
+save_payment_method = 1.0
+checkout = 2.0
+catalog_change = 0.2
+one_off_invoice = 2.0
+step_delay = { distribution = "lognormal", median_ms = 200, p99_ms = 2000 }
+payment_failure_probability = 0.1
+[churn.customer]
+update = 3.0
+delete = 0.2
+[churn.product]
+update = 0.5
+archive = 0.1
+[churn.price]
+update = 0.5
+archive = 0.1
+[churn.subscription]
+update = 0.5
+[churn.invoice]
+update = 0.5
+[churn.account]
+update = 0.2
+[churn.payment_method]
+detach = 0.1
+[accounts]
+connect = true
+connected_accounts = { initial = 2, connect_rate = 0.5, deauthorize_rate = 0.1 }
+account_api = { v1 = 1.0, v2 = 0.0 }
+account_types = { standard = 1.0, express = 0.0, custom = 0.0 }
+"#;
+
+/// SHA-256 (hex) of `serde_json::to_string(&m.truth_log())` for [`PHASE_7_FULL`] stepped two
+/// days. Recorded by running this test on the phase 8 base commit 8ad493d, before any phase 8
+/// change, by printing the digest. A phase 8 default config must draw nothing new.
+const PHASE_7_TRUTH_SHA256: &str =
+    "fca4a7cf5616829262ebea30d6f0da27fbc31f3d56e461b460652e7a04509d33";
+
+#[tokio::test]
+async fn default_config_replays_phase_7_run() {
+    use sha2::{Digest, Sha256};
+    let m = mock_with(PHASE_7_FULL).await;
+    m.step(Duration::from_secs(2 * 86_400)).await.unwrap();
+    let log = m.truth_log();
+    assert!(log.len() > 200, "{}", log.len());
+    let digest = hex::encode(Sha256::digest(truth(&m).as_bytes()));
+    assert_eq!(digest, PHASE_7_TRUTH_SHA256, "log len {}", log.len());
+}

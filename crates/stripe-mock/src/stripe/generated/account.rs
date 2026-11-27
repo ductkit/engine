@@ -1651,6 +1651,215 @@ pub enum AccountFutureRequirementsDisabledReason {
 }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct AccountRequirementsError {
+    /// The code for the type of error.
+    pub code: AccountRequirementsErrorCode,
+    /// An informative message that indicates the error type and provides additional details about the error.
+    pub reason: String,
+    /// The specific user onboarding requirement field (in the requirements hash) that needs to be resolved.
+    pub requirement: String,
+}
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AccountRequirementsErrorCode {
+    #[serde(rename = "external_request")]
+    ExternalRequest,
+    #[serde(rename = "information_missing")]
+    InformationMissing,
+    #[serde(rename = "invalid_address_city_state_postal_code")]
+    InvalidAddressCityStatePostalCode,
+    #[serde(rename = "invalid_address_cmra_address")]
+    InvalidAddressCmraAddress,
+    #[serde(rename = "invalid_address_highway_contract_box")]
+    InvalidAddressHighwayContractBox,
+    #[serde(rename = "invalid_address_private_mailbox")]
+    InvalidAddressPrivateMailbox,
+    #[serde(rename = "invalid_address_registered_agent_address")]
+    InvalidAddressRegisteredAgentAddress,
+    #[serde(rename = "invalid_business_profile_name")]
+    InvalidBusinessProfileName,
+    #[serde(rename = "invalid_business_profile_name_denylisted")]
+    InvalidBusinessProfileNameDenylisted,
+    #[serde(rename = "invalid_company_name_denylisted")]
+    InvalidCompanyNameDenylisted,
+    #[serde(rename = "invalid_dob_age_over_maximum")]
+    InvalidDobAgeOverMaximum,
+    #[serde(rename = "invalid_dob_age_under_18")]
+    InvalidDobAgeUnder18,
+    #[serde(rename = "invalid_dob_age_under_minimum")]
+    InvalidDobAgeUnderMinimum,
+    #[serde(rename = "invalid_product_description_length")]
+    InvalidProductDescriptionLength,
+    #[serde(rename = "invalid_product_description_url_match")]
+    InvalidProductDescriptionUrlMatch,
+    #[serde(rename = "invalid_representative_country")]
+    InvalidRepresentativeCountry,
+    #[serde(rename = "invalid_signator")]
+    InvalidSignator,
+    #[serde(rename = "invalid_statement_descriptor_business_mismatch")]
+    InvalidStatementDescriptorBusinessMismatch,
+    #[serde(rename = "invalid_statement_descriptor_denylisted")]
+    InvalidStatementDescriptorDenylisted,
+    #[serde(rename = "invalid_statement_descriptor_length")]
+    InvalidStatementDescriptorLength,
+    #[serde(rename = "invalid_statement_descriptor_prefix_denylisted")]
+    InvalidStatementDescriptorPrefixDenylisted,
+    #[serde(rename = "invalid_statement_descriptor_prefix_mismatch")]
+    InvalidStatementDescriptorPrefixMismatch,
+    #[serde(rename = "invalid_street_address")]
+    InvalidStreetAddress,
+    #[serde(rename = "invalid_tax_id")]
+    InvalidTaxId,
+    #[serde(rename = "invalid_tax_id_format")]
+    InvalidTaxIdFormat,
+    #[serde(rename = "invalid_tos_acceptance")]
+    InvalidTosAcceptance,
+    #[serde(rename = "invalid_url_denylisted")]
+    InvalidUrlDenylisted,
+    #[serde(rename = "invalid_url_format")]
+    InvalidUrlFormat,
+    #[serde(rename = "invalid_url_web_presence_detected")]
+    InvalidUrlWebPresenceDetected,
+    #[serde(rename = "invalid_url_website_business_information_mismatch")]
+    InvalidUrlWebsiteBusinessInformationMismatch,
+    #[serde(rename = "invalid_url_website_empty")]
+    InvalidUrlWebsiteEmpty,
+    #[serde(rename = "invalid_url_website_inaccessible")]
+    InvalidUrlWebsiteInaccessible,
+    #[serde(rename = "invalid_url_website_inaccessible_geoblocked")]
+    InvalidUrlWebsiteInaccessibleGeoblocked,
+    #[serde(rename = "invalid_url_website_inaccessible_password_protected")]
+    InvalidUrlWebsiteInaccessiblePasswordProtected,
+    #[serde(rename = "invalid_url_website_incomplete")]
+    InvalidUrlWebsiteIncomplete,
+    #[serde(rename = "invalid_url_website_incomplete_cancellation_policy")]
+    InvalidUrlWebsiteIncompleteCancellationPolicy,
+    #[serde(rename = "invalid_url_website_incomplete_customer_service_details")]
+    InvalidUrlWebsiteIncompleteCustomerServiceDetails,
+    #[serde(rename = "invalid_url_website_incomplete_legal_restrictions")]
+    InvalidUrlWebsiteIncompleteLegalRestrictions,
+    #[serde(rename = "invalid_url_website_incomplete_refund_policy")]
+    InvalidUrlWebsiteIncompleteRefundPolicy,
+    #[serde(rename = "invalid_url_website_incomplete_return_policy")]
+    InvalidUrlWebsiteIncompleteReturnPolicy,
+    #[serde(rename = "invalid_url_website_incomplete_terms_and_conditions")]
+    InvalidUrlWebsiteIncompleteTermsAndConditions,
+    #[serde(rename = "invalid_url_website_incomplete_under_construction")]
+    InvalidUrlWebsiteIncompleteUnderConstruction,
+    #[serde(rename = "invalid_url_website_other")]
+    InvalidUrlWebsiteOther,
+    #[serde(rename = "invalid_value_other")]
+    InvalidValueOther,
+    #[serde(rename = "unsupported_business_type")]
+    UnsupportedBusinessType,
+    #[serde(rename = "verification_directors_mismatch")]
+    VerificationDirectorsMismatch,
+    #[serde(rename = "verification_document_address_mismatch")]
+    VerificationDocumentAddressMismatch,
+    #[serde(rename = "verification_document_address_missing")]
+    VerificationDocumentAddressMissing,
+    #[serde(rename = "verification_document_corrupt")]
+    VerificationDocumentCorrupt,
+    #[serde(rename = "verification_document_country_not_supported")]
+    VerificationDocumentCountryNotSupported,
+    #[serde(rename = "verification_document_directors_mismatch")]
+    VerificationDocumentDirectorsMismatch,
+    #[serde(rename = "verification_document_dob_mismatch")]
+    VerificationDocumentDobMismatch,
+    #[serde(rename = "verification_document_duplicate_type")]
+    VerificationDocumentDuplicateType,
+    #[serde(rename = "verification_document_expired")]
+    VerificationDocumentExpired,
+    #[serde(rename = "verification_document_failed_copy")]
+    VerificationDocumentFailedCopy,
+    #[serde(rename = "verification_document_failed_greyscale")]
+    VerificationDocumentFailedGreyscale,
+    #[serde(rename = "verification_document_failed_other")]
+    VerificationDocumentFailedOther,
+    #[serde(rename = "verification_document_failed_test_mode")]
+    VerificationDocumentFailedTestMode,
+    #[serde(rename = "verification_document_fraudulent")]
+    VerificationDocumentFraudulent,
+    #[serde(rename = "verification_document_id_number_mismatch")]
+    VerificationDocumentIdNumberMismatch,
+    #[serde(rename = "verification_document_id_number_missing")]
+    VerificationDocumentIdNumberMissing,
+    #[serde(rename = "verification_document_incomplete")]
+    VerificationDocumentIncomplete,
+    #[serde(rename = "verification_document_invalid")]
+    VerificationDocumentInvalid,
+    #[serde(rename = "verification_document_issue_or_expiry_date_missing")]
+    VerificationDocumentIssueOrExpiryDateMissing,
+    #[serde(rename = "verification_document_manipulated")]
+    VerificationDocumentManipulated,
+    #[serde(rename = "verification_document_missing_back")]
+    VerificationDocumentMissingBack,
+    #[serde(rename = "verification_document_missing_front")]
+    VerificationDocumentMissingFront,
+    #[serde(rename = "verification_document_name_mismatch")]
+    VerificationDocumentNameMismatch,
+    #[serde(rename = "verification_document_name_missing")]
+    VerificationDocumentNameMissing,
+    #[serde(rename = "verification_document_nationality_mismatch")]
+    VerificationDocumentNationalityMismatch,
+    #[serde(rename = "verification_document_not_readable")]
+    VerificationDocumentNotReadable,
+    #[serde(rename = "verification_document_not_signed")]
+    VerificationDocumentNotSigned,
+    #[serde(rename = "verification_document_not_uploaded")]
+    VerificationDocumentNotUploaded,
+    #[serde(rename = "verification_document_photo_mismatch")]
+    VerificationDocumentPhotoMismatch,
+    #[serde(rename = "verification_document_too_large")]
+    VerificationDocumentTooLarge,
+    #[serde(rename = "verification_document_type_not_supported")]
+    VerificationDocumentTypeNotSupported,
+    #[serde(rename = "verification_extraneous_directors")]
+    VerificationExtraneousDirectors,
+    #[serde(rename = "verification_failed_address_match")]
+    VerificationFailedAddressMatch,
+    #[serde(rename = "verification_failed_authorizer_authority")]
+    VerificationFailedAuthorizerAuthority,
+    #[serde(rename = "verification_failed_business_iec_number")]
+    VerificationFailedBusinessIecNumber,
+    #[serde(rename = "verification_failed_document_match")]
+    VerificationFailedDocumentMatch,
+    #[serde(rename = "verification_failed_id_number_match")]
+    VerificationFailedIdNumberMatch,
+    #[serde(rename = "verification_failed_keyed_identity")]
+    VerificationFailedKeyedIdentity,
+    #[serde(rename = "verification_failed_keyed_match")]
+    VerificationFailedKeyedMatch,
+    #[serde(rename = "verification_failed_name_match")]
+    VerificationFailedNameMatch,
+    #[serde(rename = "verification_failed_other")]
+    VerificationFailedOther,
+    #[serde(rename = "verification_failed_representative_authority")]
+    VerificationFailedRepresentativeAuthority,
+    #[serde(rename = "verification_failed_residential_address")]
+    VerificationFailedResidentialAddress,
+    #[serde(rename = "verification_failed_tax_id_match")]
+    VerificationFailedTaxIdMatch,
+    #[serde(rename = "verification_failed_tax_id_not_issued")]
+    VerificationFailedTaxIdNotIssued,
+    #[serde(rename = "verification_legal_entity_structure_mismatch")]
+    VerificationLegalEntityStructureMismatch,
+    #[serde(rename = "verification_missing_directors")]
+    VerificationMissingDirectors,
+    #[serde(rename = "verification_missing_executives")]
+    VerificationMissingExecutives,
+    #[serde(rename = "verification_missing_owners")]
+    VerificationMissingOwners,
+    #[serde(rename = "verification_rejected_ownership_exemption_reason")]
+    VerificationRejectedOwnershipExemptionReason,
+    #[serde(rename = "verification_requires_additional_memorandum_of_associations")]
+    VerificationRequiresAdditionalMemorandumOfAssociations,
+    #[serde(rename = "verification_requires_additional_proof_of_registration")]
+    VerificationRequiresAdditionalProofOfRegistration,
+    #[serde(rename = "verification_supportability")]
+    VerificationSupportability,
+}
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AccountGroupMembership {
     /// The group the account is in to determine their payments pricing, and null if the account is on customized pricing.
     #[serde(
@@ -1659,531 +1868,6 @@ pub struct AccountGroupMembership {
         with = "crate::stripe::double_option"
     )]
     pub payments_pricing: Option<Option<String>>,
-}
-/// This is an object representing a person associated with a Stripe account.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Person {
-    /// The account the person is associated with.
-    pub account: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub additional_tos_acceptances: Option<PersonAdditionalTosAcceptances>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub address: Option<Address>,
-    /// The Kana variation of the person's address (Japan only).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub address_kana: Option<Option<LegalEntityJapanAddress>>,
-    /// The Kanji variation of the person's address (Japan only).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub address_kanji: Option<Option<LegalEntityJapanAddress>>,
-    /// Time at which the object was created.
-    pub created: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dob: Option<LegalEntityDob>,
-    /// The person's email address.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub email: Option<Option<String>>,
-    /// The person's first name.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub first_name: Option<Option<String>>,
-    /// The Kana variation of the person's first name (Japan only).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub first_name_kana: Option<Option<String>>,
-    /// The Kanji variation of the person's first name (Japan only).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub first_name_kanji: Option<Option<String>>,
-    /// A list of alternate names or aliases that the person is known by.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub full_name_aliases: Option<Vec<String>>,
-    /// Information about the [upcoming new requirements for this person](https://docs.stripe.com/connect/custom-accounts/future-requirements), including what information needs to be collected, and by when.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub future_requirements: Option<Option<PersonFutureRequirements>>,
-    /// The person's gender.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub gender: Option<Option<String>>,
-    /// Unique identifier for the object.
-    pub id: String,
-    /// Whether the person's `id_number` was provided.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id_number_provided: Option<bool>,
-    /// Whether the person's `id_number_secondary` was provided.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id_number_secondary_provided: Option<bool>,
-    /// The person's last name.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub last_name: Option<Option<String>>,
-    /// The Kana variation of the person's last name (Japan only).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub last_name_kana: Option<Option<String>>,
-    /// The Kanji variation of the person's last name (Japan only).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub last_name_kanji: Option<Option<String>>,
-    /// The person's maiden name.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub maiden_name: Option<Option<String>>,
-    /// Set of [key-value pairs](https://docs.stripe.com/api/metadata) that you can attach to an object.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<BTreeMap<String, String>>,
-    /// The country where the person is a national.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub nationality: Option<Option<String>>,
-    /// String representing the object's type.
-    pub object: PersonObject,
-    /// The person's phone number.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub phone: Option<Option<String>>,
-    /// Indicates if the person or any of their representatives, family members, or other closely related persons, declares that they hold or have held an important public job or function, in any jurisdiction.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub political_exposure: Option<PersonPoliticalExposure>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub registered_address: Option<Address>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub relationship: Option<PersonRelationship>,
-    /// Information about the requirements for this person, including what information needs to be collected, and by when.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub requirements: Option<Option<PersonRequirements>>,
-    /// Whether the last four digits of the person's Social Security number have been provided (U.S.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssn_last_4_provided: Option<bool>,
-    /// Demographic data related to the person.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub us_cfpb_data: Option<Option<PersonUsCfpbData>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub verification: Option<LegalEntityPersonVerification>,
-}
-impl HasId for Person {
-    fn id(&self) -> &str {
-        &self.id
-    }
-}
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct PersonAdditionalTosAcceptances {
-    /// Details on the legal guardian's acceptance of the main Stripe service agreement.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub account: Option<Option<PersonAdditionalTosAcceptance>>,
-}
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct PersonAdditionalTosAcceptance {
-    /// The Unix timestamp marking when the legal guardian accepted the service agreement.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub date: Option<Option<i64>>,
-    /// The IP address from which the legal guardian accepted the service agreement.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub ip: Option<Option<String>>,
-    /// The user agent of the browser from which the legal guardian accepted the service agreement.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub user_agent: Option<Option<String>>,
-}
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct LegalEntityDob {
-    /// The day of birth, between 1 and 31.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub day: Option<Option<i64>>,
-    /// The month of birth, between 1 and 12.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub month: Option<Option<i64>>,
-    /// The four-digit year of birth.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub year: Option<Option<i64>>,
-}
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct PersonFutureRequirements {
-    /// Fields that are due and can be resolved by providing the corresponding alternative fields instead.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub alternatives: Option<Option<Vec<AccountRequirementsAlternative>>>,
-    /// Fields that need to be resolved to keep the person's account enabled.
-    pub currently_due: Vec<String>,
-    /// Fields that are `currently_due` and need to be collected again because validation or verification failed.
-    pub errors: Vec<AccountRequirementsError>,
-    /// Fields you must collect when all thresholds are reached.
-    pub eventually_due: Vec<String>,
-    /// Fields that haven't been resolved by the account's `requirements.current_deadline`.
-    pub past_due: Vec<String>,
-    /// Fields that are being reviewed, or might become required depending on the results of a review.
-    pub pending_verification: Vec<String>,
-}
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PersonObject {
-    #[serde(rename = "person")]
-    Person,
-}
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PersonPoliticalExposure {
-    #[serde(rename = "existing")]
-    Existing,
-    #[serde(rename = "none")]
-    None,
-}
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct PersonRelationship {
-    /// Whether the person is the authorizer of the account's representative.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub authorizer: Option<Option<bool>>,
-    /// Whether the person is a director of the account's legal entity.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub director: Option<Option<bool>>,
-    /// Whether the person has significant responsibility to control, manage, or direct the organization.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub executive: Option<Option<bool>>,
-    /// Whether the person is the legal guardian of the account's representative.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub legal_guardian: Option<Option<bool>>,
-    /// Whether the person is an owner of the account’s legal entity.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub owner: Option<Option<bool>>,
-    /// The percent owned by the person of the account's legal entity.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub percent_ownership: Option<Option<f64>>,
-    /// Whether the person is authorized as the primary representative of the account.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub representative: Option<Option<bool>>,
-    /// The person's title (e.g., CEO, Support Engineer).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub title: Option<Option<String>>,
-}
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct PersonRequirements {
-    /// Fields that are due and can be resolved by providing the corresponding alternative fields instead.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub alternatives: Option<Option<Vec<AccountRequirementsAlternative>>>,
-    /// Fields that need to be resolved to keep the person's account enabled.
-    pub currently_due: Vec<String>,
-    /// Fields that are `currently_due` and need to be collected again because validation or verification failed.
-    pub errors: Vec<AccountRequirementsError>,
-    /// Fields you must collect when all thresholds are reached.
-    pub eventually_due: Vec<String>,
-    /// Fields that haven't been resolved by `current_deadline`.
-    pub past_due: Vec<String>,
-    /// Fields that are being reviewed, or might become required depending on the results of a review.
-    pub pending_verification: Vec<String>,
-}
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct PersonUsCfpbData {
-    /// The persons ethnicity details
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub ethnicity_details: Option<Option<PersonEthnicityDetails>>,
-    /// The persons race details
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub race_details: Option<Option<PersonRaceDetails>>,
-    /// The persons self-identified gender
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub self_identified_gender: Option<Option<String>>,
-}
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct PersonEthnicityDetails {
-    /// The persons ethnicity
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub ethnicity: Option<Option<Vec<PersonEthnicityDetailsEthnicity>>>,
-    /// Please specify your origin, when other is selected.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub ethnicity_other: Option<Option<String>>,
-}
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PersonEthnicityDetailsEthnicity {
-    #[serde(rename = "cuban")]
-    Cuban,
-    #[serde(rename = "hispanic_or_latino")]
-    HispanicOrLatino,
-    #[serde(rename = "mexican")]
-    Mexican,
-    #[serde(rename = "not_hispanic_or_latino")]
-    NotHispanicOrLatino,
-    #[serde(rename = "other_hispanic_or_latino")]
-    OtherHispanicOrLatino,
-    #[serde(rename = "prefer_not_to_answer")]
-    PreferNotToAnswer,
-    #[serde(rename = "puerto_rican")]
-    PuertoRican,
-}
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct PersonRaceDetails {
-    /// The persons race.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub race: Option<Option<Vec<PersonRaceDetailsRace>>>,
-    /// Please specify your race, when other is selected.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub race_other: Option<Option<String>>,
-}
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PersonRaceDetailsRace {
-    #[serde(rename = "african_american")]
-    AfricanAmerican,
-    #[serde(rename = "american_indian_or_alaska_native")]
-    AmericanIndianOrAlaskaNative,
-    #[serde(rename = "asian")]
-    Asian,
-    #[serde(rename = "asian_indian")]
-    AsianIndian,
-    #[serde(rename = "black_or_african_american")]
-    BlackOrAfricanAmerican,
-    #[serde(rename = "chinese")]
-    Chinese,
-    #[serde(rename = "ethiopian")]
-    Ethiopian,
-    #[serde(rename = "filipino")]
-    Filipino,
-    #[serde(rename = "guamanian_or_chamorro")]
-    GuamanianOrChamorro,
-    #[serde(rename = "haitian")]
-    Haitian,
-    #[serde(rename = "jamaican")]
-    Jamaican,
-    #[serde(rename = "japanese")]
-    Japanese,
-    #[serde(rename = "korean")]
-    Korean,
-    #[serde(rename = "native_hawaiian")]
-    NativeHawaiian,
-    #[serde(rename = "native_hawaiian_or_other_pacific_islander")]
-    NativeHawaiianOrOtherPacificIslander,
-    #[serde(rename = "nigerian")]
-    Nigerian,
-    #[serde(rename = "other_asian")]
-    OtherAsian,
-    #[serde(rename = "other_black_or_african_american")]
-    OtherBlackOrAfricanAmerican,
-    #[serde(rename = "other_pacific_islander")]
-    OtherPacificIslander,
-    #[serde(rename = "prefer_not_to_answer")]
-    PreferNotToAnswer,
-    #[serde(rename = "samoan")]
-    Samoan,
-    #[serde(rename = "somali")]
-    Somali,
-    #[serde(rename = "vietnamese")]
-    Vietnamese,
-    #[serde(rename = "white")]
-    White,
-}
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct LegalEntityPersonVerification {
-    /// A document showing address, either a passport, local ID card, or utility bill from a well-known utility company.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub additional_document: Option<Option<LegalEntityPersonVerificationDocument>>,
-    /// A user-displayable string describing the verification state for the person.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub details: Option<Option<String>>,
-    /// One of `document_address_mismatch`, `document_dob_mismatch`, `document_duplicate_type`, `document_id_number_mismatch`, `document_name_mismatch`, `document_nationality_mismatch`, `failed_keyed_identity`, or `failed_other`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub details_code: Option<Option<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub document: Option<LegalEntityPersonVerificationDocument>,
-    /// The state of verification for the person.
-    pub status: String,
-}
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct LegalEntityPersonVerificationDocument {
-    /// The back of an ID returned by a [file upload](https://docs.stripe.com/api#create_file) with a `purpose` value of `identity_document`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub back: Option<Option<String>>,
-    /// A user-displayable string describing the verification state of this document.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub details: Option<Option<String>>,
-    /// One of `document_corrupt`, `document_country_not_supported`, `document_expired`, `document_failed_copy`, `document_failed_other`, `document_failed_test_mode`, `document_fraudulent`, `document_failed_greyscale`, `document_incomplete`, `document_invalid`, `document_manipulated`, `document_missing_back`, `document_missing_front`, `document_not_readable`, `document_not_uploaded`, `document_photo_mismatch`, `document_too_large`, or `document_type_not_supported`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub details_code: Option<Option<String>>,
-    /// The front of an ID returned by a [file upload](https://docs.stripe.com/api#create_file) with a `purpose` value of `identity_document`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub front: Option<Option<String>>,
 }
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AccountObject {

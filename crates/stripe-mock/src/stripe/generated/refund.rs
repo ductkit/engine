@@ -115,7 +115,7 @@ pub struct Refund {
         skip_serializing_if = "Option::is_none",
         with = "crate::stripe::double_option"
     )]
-    pub source_transfer_reversal: Option<Option<String>>,
+    pub source_transfer_reversal: Option<Option<Expandable<TransferReversal>>>,
     /// Status of the refund.
     #[serde(
         default,
@@ -129,7 +129,7 @@ pub struct Refund {
         skip_serializing_if = "Option::is_none",
         with = "crate::stripe::double_option"
     )]
-    pub transfer_reversal: Option<Option<String>>,
+    pub transfer_reversal: Option<Option<Expandable<TransferReversal>>>,
 }
 impl HasId for Refund {
     fn id(&self) -> &str {

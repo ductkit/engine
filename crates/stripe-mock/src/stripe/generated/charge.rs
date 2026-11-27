@@ -27,7 +27,7 @@ pub struct Charge {
         skip_serializing_if = "Option::is_none",
         with = "crate::stripe::double_option"
     )]
-    pub application_fee: Option<Option<String>>,
+    pub application_fee: Option<Option<Expandable<ApplicationFee>>>,
     /// The amount of the application fee (if any) requested for the charge.
     #[serde(
         default,
@@ -199,7 +199,7 @@ pub struct Charge {
         skip_serializing_if = "Option::is_none",
         with = "crate::stripe::double_option"
     )]
-    pub source_transfer: Option<Option<String>>,
+    pub source_transfer: Option<Option<Expandable<Transfer>>>,
     /// For a non-card charge, text that appears on the customer's statement as the statement descriptor.
     #[serde(
         default,
@@ -218,7 +218,7 @@ pub struct Charge {
     pub status: ChargeStatus,
     /// ID of the transfer to the `destination` account (only applicable if the charge was created using the `destination` parameter).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub transfer: Option<String>,
+    pub transfer: Option<Expandable<Transfer>>,
     /// An optional dictionary including the account to automatically transfer to as part of a destination charge.
     #[serde(
         default,

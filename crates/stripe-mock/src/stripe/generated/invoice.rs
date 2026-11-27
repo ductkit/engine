@@ -160,7 +160,7 @@ pub struct Invoice {
         skip_serializing_if = "Option::is_none",
         with = "crate::stripe::double_option"
     )]
-    pub default_source: Option<Option<String>>,
+    pub default_source: Option<Option<Expandable<InvoiceDefaultSource>>>,
     /// The tax rates applied to this invoice, if any.
     pub default_tax_rates: Vec<TaxRate>,
     /// An arbitrary string attached to the object.
@@ -799,6 +799,20 @@ pub enum InvoicesResourceInvoiceTaxIdType {
     ZmTin,
     #[serde(rename = "zw_tin")]
     ZwTin,
+}
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum InvoiceDefaultSource {
+    BankAccount(BankAccount),
+    Card(Card),
+}
+impl HasId for InvoiceDefaultSource {
+    fn id(&self) -> &str {
+        match self {
+            Self::BankAccount(x) => x.id(),
+            Self::Card(x) => x.id(),
+        }
+    }
 }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]

@@ -828,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_7_roots_resolve() {
+    fn roots_resolve() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/openapi/spec3.json");
         let bytes = std::fs::read(path).expect("vendored spec is missing");
         let spec: Value = serde_json::from_slice(&bytes).unwrap();
@@ -845,6 +845,6 @@ mod tests {
             .values()
             .filter(|t| matches!(t, TypeDef::Struct(s) if !s.schema.contains('/')))
             .count();
-        assert_eq!(named_schemas, 755);
+        assert_eq!(named_schemas, 765);
     }
 }
