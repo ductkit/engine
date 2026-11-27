@@ -54,6 +54,47 @@ pub struct AccountsConfig {
     pub account_types: AccountTypeMix,
     /// Application fees on connected accounts' direct charges (needs `connect`).
     pub application_fee: ApplicationFeeConfig,
+    /// Share of the platform's own payments made with each Connect charge pattern (a
+    /// non-default mix needs `connect`).
+    pub platform_payments: PlatformPaymentsMix,
+}
+
+/// Share of the platform's payments made with each charge pattern; sums to 1. Keys left out
+/// of a given mix are 0; with no mix at all, every payment is the platform's own.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformPaymentsMix {
+    /// A plain charge that stays on the platform.
+    #[serde(default)]
+    pub own: f64,
+    /// A destination charge: `transfer_data.destination` and an automatic transfer.
+    #[serde(default)]
+    pub destination: f64,
+    /// Separate charges and transfers: a `transfer_group`, then a transfer 1-72 hours later.
+    #[serde(default)]
+    pub separate: f64,
+}
+
+impl Default for PlatformPaymentsMix {
+    fn default() -> Self {
+        PlatformPaymentsMix {
+            own: 1.0,
+            destination: 0.0,
+            separate: 0.0,
+        }
+    }
+}
+
+/// How a platform payment moves money to a connected account (spec section 5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChargePattern {
+    /// The platform keeps the payment.
+    Own,
+    /// A destination charge.
+    Destination,
+    /// Separate charges and transfers.
+    Separate,
 }
 
 /// Which direct charges of connected accounts carry an application fee, and how big it is.
@@ -114,6 +155,7 @@ impl Default for AccountsConfig {
             account_api: AccountApiMix::default(),
             account_types: AccountTypeMix::default(),
             application_fee: ApplicationFeeConfig::default(),
+            platform_payments: PlatformPaymentsMix::default(),
         }
     }
 }
@@ -159,6 +201,20 @@ impl AccountsConfig {
         if !self.connect && fee.probability != 0.0 {
             return config_err(
                 "`accounts.application_fee` with a probability above 0 needs `accounts.connect = true`",
+            );
+        }
+        let pp = &self.platform_payments;
+        check_mix(
+            "accounts.platform_payments",
+            &[
+                ("own", pp.own),
+                ("destination", pp.destination),
+                ("separate", pp.separate),
+            ],
+        )?;
+        if !self.connect && *pp != PlatformPaymentsMix::default() {
+            return config_err(
+                "a non-default `accounts.platform_payments` needs `accounts.connect = true`",
             );
         }
         check_mix(
@@ -1672,6 +1728,95 @@ update = 0.0"
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn platform_payments_mix_must_sum_to_one() {
+        let d = Config::default().accounts.platform_payments;
+        assert_eq!((d.own, d.destination, d.separate), (1.0, 0.0, 0.0));
+        // Keys left out of a given mix are 0.
+        let c = Config::from_toml_str(
+            "[accounts]
+connect = true
+platform_payments = { destination = 1.0 }",
+        )
+        .unwrap()
+        .accounts
+        .platform_payments;
+        assert_eq!((c.own, c.destination, c.separate), (0.0, 1.0, 0.0));
+        let c = Config::from_toml_str(
+            "[accounts]
+connect = true
+platform_payments = { own = 0.5, destination = 0.25, separate = 0.25 }",
+        )
+        .unwrap()
+        .accounts
+        .platform_payments;
+        assert_eq!((c.own, c.destination, c.separate), (0.5, 0.25, 0.25));
+        for bad in [
+            "{ own = 0.5, destination = 0.6 }",
+            "{ separate = 0.5 }",
+            "{ own = 1.5, destination = -0.5 }",
+            "{ own = nan }",
+        ] {
+            let msg = Config::from_toml_str(&format!(
+                "[accounts]
+connect = true
+platform_payments = {bad}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(msg.contains("accounts.platform_payments"), "{bad}: {msg}");
+        }
+        let msg = Config::from_toml_str(
+            "[accounts]
+connect = true
+platform_payments = { own = 1.0, other = 0.0 }",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("other"), "{msg}");
+    }
+
+    #[test]
+    fn platform_payments_need_connect() {
+        let msg = Config::from_toml_str(
+            "[accounts]
+platform_payments = { own = 0.5, separate = 0.5 }",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.contains("accounts.platform_payments") && msg.contains("accounts.connect = true"),
+            "{msg}"
+        );
+        // The default mix, spelled out, needs nothing.
+        assert!(
+            Config::from_toml_str(
+                "[accounts]
+platform_payments = { own = 1.0 }"
+            )
+            .is_ok()
+        );
+        assert!(
+            Config::from_toml_str(
+                "[accounts]
+platform_payments = { own = 1.0, destination = 0.0, separate = 0.0 }"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn charge_pattern_is_snake_case() {
+        for (p, s) in [
+            (ChargePattern::Own, "\"own\""),
+            (ChargePattern::Destination, "\"destination\""),
+            (ChargePattern::Separate, "\"separate\""),
+        ] {
+            assert_eq!(serde_json::to_string(&p).unwrap(), s);
+            assert_eq!(serde_json::from_str::<ChargePattern>(s).unwrap(), p);
+        }
     }
 
     #[test]

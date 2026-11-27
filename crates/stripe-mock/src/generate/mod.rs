@@ -34,7 +34,10 @@ use crate::model::catalog::PriceSpec;
 use crate::model::customer::{self, apply_update, random_new_customer, random_update};
 use crate::rng::{RngStreams, SimRng};
 use crate::stripe;
-use crate::{ActionsConfig, ApplicationFeeConfig, Config, MockError, ObjectType, SimTime};
+use crate::{
+    ActionsConfig, ApplicationFeeConfig, ChargePattern, Config, MockError, ObjectType,
+    PlatformPaymentsMix, SimTime,
+};
 
 /// A business action to run now with [`crate::MockStripe::run_action`] (spec section 11,
 /// "Triggers").
@@ -66,11 +69,20 @@ pub enum Action {
         at_period_end: Option<bool>,
     },
     /// A payment with no invoice for the named customer, or a random one or none (drawn
-    /// when `None`). `amount` and the outcome (`succeed`) are drawn when `None`.
+    /// when `None`). `amount` and the outcome (`succeed`) are drawn when `None`. In the
+    /// platform scope, `pattern` fixes the Connect charge pattern (drawn from
+    /// `accounts.platform_payments` when `None`) and `recipient` the connected account a
+    /// non-`own` pattern pays (drawn when `None`). A non-`own` pattern with no connected
+    /// account, a recipient that is not connected, a recipient with pattern `own`, or
+    /// either field in a connected account's scope is an error.
     OneOffPayment {
         customer: Option<String>,
         amount: Option<i64>,
         succeed: Option<bool>,
+        #[serde(default)]
+        pattern: Option<ChargePattern>,
+        #[serde(default)]
+        recipient: Option<String>,
     },
     /// Refund `amount` (drawn when `None`) of the named or a random refundable charge.
     /// A named charge that cannot be refunded is an error naming it.
@@ -235,6 +247,13 @@ pub(crate) enum Continuation {
     CheckoutExpire {
         id: String,
     },
+    /// The transfer of a separate charge's full amount to `account`, unless it has
+    /// disconnected since.
+    SeparateTransfer {
+        charge: String,
+        account: String,
+        group: String,
+    },
 }
 
 #[derive(Debug)]
@@ -270,6 +289,13 @@ pub(crate) struct Ctx {
     pub application_fee: ApplicationFeeConfig,
     /// Whether a payment carries an application fee (stream `"generate.application_fee"`).
     pub fee_rng: SimRng,
+    /// `accounts.platform_payments`.
+    pub platform_payments: PlatformPaymentsMix,
+    /// A platform payment intent's charge pattern and recipient, and a separate transfer's
+    /// delay (stream `"generate.platform_payments"`).
+    pub pattern_rng: SimRng,
+    /// The recipient of each separate-charges payment intent that has not succeeded yet.
+    pub separate_recipients: BTreeMap<String, String>,
 }
 
 impl Ctx {
@@ -483,6 +509,9 @@ impl Generator {
                 payments: stream("generate.payments"),
                 application_fee: config.accounts.application_fee.clone(),
                 fee_rng: stream("generate.application_fee"),
+                platform_payments: config.accounts.platform_payments.clone(),
+                pattern_rng: stream("generate.platform_payments"),
+                separate_recipients: BTreeMap::new(),
             },
             setup: stream("generate.account_setup"),
             control: stream("control.actions"),
@@ -722,13 +751,19 @@ impl Generator {
                 customer,
                 amount,
                 succeed,
+                pattern,
+                recipient,
             } => payments::one_off_payment(
                 &mut self.control,
                 engine,
                 &mut self.ctx,
-                customer,
-                amount,
-                succeed,
+                payments::OneOffPayment {
+                    customer,
+                    amount,
+                    succeed,
+                    pattern,
+                    recipient,
+                },
             )?,
             Action::Refund { charge, amount } => {
                 payments::refund_action(&mut self.control, engine, &mut self.ctx, charge, amount)?
@@ -932,6 +967,11 @@ fn run_continuation(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mu
             checkout::run_complete(engine, ctx, &id, plan, &cause);
         }
         Continuation::CheckoutExpire { id } => checkout::run_expire(engine, &id, &cause),
+        Continuation::SeparateTransfer {
+            charge,
+            account,
+            group,
+        } => connect::separate_transfer(engine, ctx, &charge, &account, &group, &cause),
         c => billing::run(c, cause, engine, ctx),
     }
 }
@@ -1022,7 +1062,7 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
         }
         ActionKind::SubscriptionUpdate => subscriptions::churn_update(rng, engine),
         ActionKind::OneOffPayment => {
-            payments::one_off_payment(rng, engine, ctx, None, None, None)
+            payments::one_off_payment(rng, engine, ctx, payments::OneOffPayment::default())
                 .expect("random targets are valid");
         }
         ActionKind::Refund => {

@@ -54,6 +54,8 @@ fn pay(m: &MockStripe, customer: Option<String>, amount: i64, succeed: bool) -> 
         customer,
         amount: Some(amount),
         succeed: Some(succeed),
+        pattern: None,
+        recipient: None,
     })
     .unwrap()
 }
@@ -141,6 +143,8 @@ async fn one_off_payment_rejects_bad_targets() {
             customer: Some("cus_missing".into()),
             amount: None,
             succeed: None,
+            pattern: None,
+            recipient: None,
         })
         .unwrap_err();
     assert!(matches!(e, MockError::NoSuchObject { .. }), "{e}");
@@ -149,6 +153,8 @@ async fn one_off_payment_rejects_bad_targets() {
             customer: None,
             amount: Some(0),
             succeed: None,
+            pattern: None,
+            recipient: None,
         })
         .unwrap_err();
     assert!(matches!(e, MockError::InvalidAction(_)), "{e}");
@@ -435,6 +441,8 @@ async fn connected_refund_stays_in_scope() {
             customer: None,
             amount: Some(1000),
             succeed: Some(true),
+            pattern: None,
+            recipient: None,
         })
         .unwrap();
     let ch = only_id(&caused(&m, &cause), ObjectType::Charge);
@@ -488,6 +496,8 @@ async fn generated_charges_stay_within_stripe_maximum() {
             customer: None,
             amount: None,
             succeed: Some(true),
+            pattern: None,
+            recipient: None,
         })
         .unwrap();
         m.run_action(Action::OneOffInvoice {
@@ -534,6 +544,8 @@ async fn generated_charges_stay_within_stripe_maximum() {
         customer: None,
         amount: Some(MAX_CHARGE + 1),
         succeed: Some(true),
+        pattern: None,
+        recipient: None,
     });
     assert!(matches!(over, Err(MockError::InvalidAction(_))), "{over:?}");
 }

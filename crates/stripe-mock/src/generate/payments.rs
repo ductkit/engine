@@ -8,14 +8,15 @@
 
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::generate::catalog::active_ids;
+use crate::generate::connect::AskedRouting;
 use crate::generate::{Continuation, Ctx, billing, connect, pick};
 use crate::model::catalog::{random_currency, random_nonzero_amount};
 use crate::model::payments::{
     AVAILABLE_AFTER_SECS, BRAND, CardDraw, LAST4, NewCharge, NewDispute, NewPaymentIntent,
-    NewRefund, add_application_fee, decline_error, new_card_payment_method, new_charge,
+    NewRefund, Routing, add_application_fee, decline_error, new_card_payment_method, new_charge,
     new_charge_balance_transaction, new_dispute, new_dispute_balance_transaction,
     new_invoice_payment, new_payment_intent, new_refund, new_refund_balance_transaction,
-    new_setup_intent, setup_decline_error, submit_evidence,
+    new_setup_intent, setup_decline_error, submit_evidence, transfer_group,
 };
 use crate::rng::SimRng;
 use crate::stripe::{
@@ -23,7 +24,7 @@ use crate::stripe::{
     PaymentIntent, PaymentIntentCancellationReason, PaymentIntentStatus, PaymentMethod,
     SetupIntent, SetupIntentStatus,
 };
-use crate::{MockError, ObjectType, SimTime};
+use crate::{ChargePattern, MockError, ObjectType, SimTime};
 
 /// Chance that a generated one-off payment has no customer.
 const NO_CUSTOMER_PROBABILITY: f64 = 0.2;
@@ -122,7 +123,11 @@ pub(crate) fn ensure_payment_method(
     }
 }
 
-/// Creates a payment intent (`payment_intent.created`), `requires_confirmation`.
+/// Creates a payment intent (`payment_intent.created`), `requires_confirmation`. A
+/// platform payment intent draws its Connect charge pattern now (see
+/// [`connect::draw_routing`]); a destination charge stores its recipient as
+/// `transfer_data.destination`, a separate one in `ctx` until it succeeds.
+#[allow(clippy::too_many_arguments)] // each argument is part of the payment
 fn create_payment_intent(
     engine: &mut Engine,
     ctx: &mut Ctx,
@@ -130,11 +135,18 @@ fn create_payment_intent(
     payment_method: &str,
     amount: i64,
     currency: &str,
+    asked: &AskedRouting,
     cause: &Cause,
 ) -> String {
     let id = ctx.payments.id(ObjectType::PaymentIntent.id_prefix());
     let secret = format!("{id}_{}", ctx.payments.id_len("secret", 25));
     let application_fee_amount = connect::draw_application_fee(engine, ctx, amount);
+    let routed = connect::draw_routing(engine, ctx, asked);
+    let group = transfer_group(&id);
+    let routing = routed.as_ref().map(|(pattern, recipient)| Routing {
+        destination: (*pattern == ChargePattern::Destination).then_some(recipient.as_str()),
+        group: &group,
+    });
     let pi = new_payment_intent(&NewPaymentIntent {
         id: &id,
         created: engine.now().unix_seconds(),
@@ -144,6 +156,7 @@ fn create_payment_intent(
         payment_method,
         client_secret: &secret,
         application_fee_amount,
+        routing,
     });
     engine.create_obj(
         ObjectType::PaymentIntent,
@@ -152,6 +165,9 @@ fn create_payment_intent(
         cause.clone(),
         &["payment_intent.created"],
     );
+    if let Some((ChargePattern::Separate, recipient)) = routed {
+        ctx.separate_recipients.insert(id.clone(), recipient);
+    }
     id
 }
 
@@ -181,6 +197,16 @@ fn confirm(
         .flatten()
         .filter(|a| succeed && *a > 0);
     let currency = intent.currency.clone().unwrap_or_default();
+    let group = intent.transfer_group.clone().flatten();
+    let destination = intent
+        .transfer_data
+        .clone()
+        .flatten()
+        .map(|t| t.destination.id().to_string());
+    let routing = group.as_deref().map(|group| Routing {
+        destination: destination.as_deref(),
+        group,
+    });
     let customer = intent
         .customer
         .clone()
@@ -237,6 +263,7 @@ fn confirm(
         risk_score,
         network_transaction_id: &network_transaction_id,
         application_fee: fee_id.as_deref().zip(fee_amount),
+        routing,
     });
     let charge_event = if succeed {
         "charge.succeeded"
@@ -281,6 +308,9 @@ fn confirm(
             &[event],
         )
         .expect("live payment intent");
+    if succeed {
+        connect::route_succeeded_payment(engine, ctx, &intent, &charge, cause);
+    }
     if let (Some(fee), Some(fee_amount), Some(application)) = (&fee_id, fee_amount, &application) {
         connect::collect_application_fee(
             engine,
@@ -305,7 +335,8 @@ fn confirm(
 }
 
 /// The shared core of a payment: the payment method (the customer's card, or a new
-/// unattached one without a customer), a new payment intent, and one confirmation.
+/// unattached one without a customer), a new payment intent (with the charge pattern
+/// `asked`, drawn where `None`), and one confirmation.
 #[allow(clippy::too_many_arguments)] // each argument is part of the payment
 pub(crate) fn charge_once(
     engine: &mut Engine,
@@ -314,13 +345,14 @@ pub(crate) fn charge_once(
     amount: i64,
     currency: &str,
     succeed: bool,
+    asked: &AskedRouting,
     cause: &Cause,
 ) -> PaymentOutcome {
     let pm = match customer {
         Some(c) => ensure_payment_method(engine, ctx, c, cause),
         None => create_payment_method(engine, ctx, None, cause),
     };
-    let pi = create_payment_intent(engine, ctx, customer, &pm, amount, currency, cause);
+    let pi = create_payment_intent(engine, ctx, customer, &pm, amount, currency, asked, cause);
     confirm(engine, ctx, &pi, &pm, succeed, cause)
 }
 
@@ -381,6 +413,7 @@ pub(crate) fn pay_invoice(
                 &pm,
                 amount,
                 &inv.currency,
+                &AskedRouting::default(),
                 cause,
             );
             let id = ctx.payments.id(ObjectType::InvoicePayment.id_prefix());
@@ -647,19 +680,37 @@ pub(super) fn live_customer(engine: &Engine, id: String) -> Result<String, MockE
     }
 }
 
+/// What a `one_off_payment` was asked for; every `None` is drawn.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OneOffPayment {
+    pub customer: Option<String>,
+    pub amount: Option<i64>,
+    pub succeed: Option<bool>,
+    pub pattern: Option<ChargePattern>,
+    pub recipient: Option<String>,
+}
+
 /// `one_off_payment`: a payment with no invoice (see [`charge_once`]), for the named
 /// customer, or a random live one, or none (probability 0.2, or when there is no live
 /// customer). `amount` and `succeed` are drawn when `None`; a drawn outcome fails with
 /// `actions.payment_failure_probability`. Every draw but the payment objects' comes from
-/// `rng`.
+/// `rng`. A `pattern` or `recipient` is checked first (see
+/// [`connect::check_asked_routing`]) and fixes the platform payment's charge pattern.
 pub(crate) fn one_off_payment(
     rng: &mut SimRng,
     engine: &mut Engine,
     ctx: &mut Ctx,
-    customer: Option<String>,
-    amount: Option<i64>,
-    succeed: Option<bool>,
+    asked: OneOffPayment,
 ) -> Result<Cause, MockError> {
+    let OneOffPayment {
+        customer,
+        amount,
+        succeed,
+        pattern,
+        recipient,
+    } = asked;
+    let routing = AskedRouting { pattern, recipient };
+    connect::check_asked_routing(engine, &routing)?;
     if let Some(a) = amount
         && a < 1
     {
@@ -696,6 +747,7 @@ pub(crate) fn one_off_payment(
         amount,
         &currency,
         succeed,
+        &routing,
         &cause,
     );
     Ok(cause)

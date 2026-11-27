@@ -2,6 +2,7 @@
 //! session that later completes (a payment or a new subscription) or expires.
 
 use crate::engine::{Cause, ChangeKind, Engine};
+use crate::generate::connect::AskedRouting;
 use crate::generate::payments::{charge_once, draw_amount, named_or_random_customer};
 use crate::generate::subscriptions::{
     SubscriptionDraw, active_recurring_prices, draw_subscription, pick_prices, start_paid_now,
@@ -176,6 +177,7 @@ pub(crate) fn run_complete(
                 amount,
                 &currency,
                 true,
+                &AskedRouting::default(),
                 cause,
             )
             .payment_intent;

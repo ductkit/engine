@@ -20,12 +20,12 @@ mod time;
 
 pub use config::{
     AccountApiMix, AccountTypeMix, AccountsConfig, ActionsConfig, ApiConfig, ApiErrors,
-    ApplicationFeeConfig, CatalogChurn, ChurnConfig, ClockConfig, ClockMode, ClockSkew, Config,
-    ConnectedAccounts, CustomerChurn, DestinationConfig, DisableAfter, Distribution, DurationStr,
-    EventRetentionConfig, EventsConfig, ExternalAccountChurn, HistoryConfig, LateTail,
-    MAX_DURATION_MS, MAX_SPEED, PINNED_API_VERSION, PaginationWrites, PayloadFormat,
-    PayloadsConfig, PaymentMethodChurn, PersonChurn, RateLimit, RenewMode, RetrySchedule,
-    StaleRead, UpdateChurn, WebhooksConfig,
+    ApplicationFeeConfig, CatalogChurn, ChargePattern, ChurnConfig, ClockConfig, ClockMode,
+    ClockSkew, Config, ConnectedAccounts, CustomerChurn, DestinationConfig, DisableAfter,
+    Distribution, DurationStr, EventRetentionConfig, EventsConfig, ExternalAccountChurn,
+    HistoryConfig, LateTail, MAX_DURATION_MS, MAX_SPEED, PINNED_API_VERSION, PaginationWrites,
+    PayloadFormat, PayloadsConfig, PaymentMethodChurn, PersonChurn, PlatformPaymentsMix, RateLimit,
+    RenewMode, RetrySchedule, StaleRead, UpdateChurn, WebhooksConfig,
 };
 pub use control::{
     ControlOp, JournalEntry, OpResult, RUN_FORMAT, ReplayGuard, ReplayOptions, RunExport,

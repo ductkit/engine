@@ -108,6 +108,8 @@ async fn writes_fire_on_payment_lists() {
             customer: None,
             amount: Some(amount),
             succeed: Some(true),
+            pattern: None,
+            recipient: None,
         })
         .unwrap();
     }

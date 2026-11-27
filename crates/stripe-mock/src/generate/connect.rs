@@ -1,22 +1,25 @@
-//! Connect flows of a connected account's generator: the external accounts and persons of
-//! an account the platform controls (spec section 5.4; phase 8 rulings P4, P8 and P9).
-//! Later phase 8 tasks add their flows here.
-//!
-//! Every function runs in the account's own scope, with the account's generator streams.
+//! Connect flows: the external accounts and persons of an account the platform controls
+//! (spec section 5.4; phase 8 rulings P4, P8 and P9), run in the account's own scope with
+//! its generator's streams; application fees (run from the connected account's payment);
+//! and the platform payments' charge patterns with their transfers (ruling P7, run by the
+//! platform's generator). Later phase 8 tasks add their flows here.
 
 use chrono::Datelike;
 
-use super::{Ctx, ExternalAccountKind, pick};
+use super::{Continuation, Ctx, ExternalAccountKind, pick};
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::model::connect::{
-    BankAccountDraw, DebitCardDraw, NewApplicationFee, PersonDraw, apply_person_contact,
-    deleted_bank_account, deleted_card, deleted_person, fee_refunds_url, is_representative,
-    new_application_fee, new_application_fee_balance_transaction, new_bank_account, new_debit_card,
-    new_fee_refund, new_fee_refund_balance_transaction, new_person, representative_due,
+    BankAccountDraw, DebitCardDraw, NewApplicationFee, NewDestinationPayment, NewTransfer,
+    PersonDraw, apply_person_contact, deleted_bank_account, deleted_card, deleted_person,
+    fee_refunds_url, is_representative, new_application_fee,
+    new_application_fee_balance_transaction, new_bank_account, new_debit_card,
+    new_destination_payment, new_destination_payment_balance_transaction, new_fee_refund,
+    new_fee_refund_balance_transaction, new_person, new_transfer, new_transfer_balance_transaction,
+    representative_due,
 };
 use crate::rng::SimRng;
 use crate::stripe;
-use crate::{AccountKind, MockError, ObjectType, SimTime};
+use crate::{AccountKind, ChargePattern, MockError, ObjectType, SimTime};
 
 const BANKS: [&str; 4] = [
     "STRIPE TEST BANK",
@@ -637,4 +640,282 @@ pub(super) fn application_fee_refund(
         );
     });
     Ok(Some(cause))
+}
+
+/// What a `one_off_payment` asked of its charge pattern; every `None` is drawn.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AskedRouting {
+    pub pattern: Option<ChargePattern>,
+    pub recipient: Option<String>,
+}
+
+/// Whether `account` is a connected account that is still connected.
+fn connected(engine: &Engine, account: &str) -> bool {
+    engine.account_meta(account).is_some_and(|m| m.connected)
+}
+
+/// The snake-case name of a pattern, for messages.
+fn pattern_name(p: ChargePattern) -> &'static str {
+    match p {
+        ChargePattern::Own => "own",
+        ChargePattern::Destination => "destination",
+        ChargePattern::Separate => "separate",
+    }
+}
+
+/// Checks a `one_off_payment`'s `pattern` and `recipient` before anything is drawn: either
+/// field in a connected account's scope, a recipient with pattern `own`, a recipient that
+/// is not connected, or a non-`own` pattern with no connected account is a 409
+/// `invalid_action`.
+pub(super) fn check_asked_routing(engine: &Engine, asked: &AskedRouting) -> Result<(), MockError> {
+    if asked.pattern.is_none() && asked.recipient.is_none() {
+        return Ok(());
+    }
+    if engine.scope().is_some() {
+        return Err(MockError::InvalidAction(format!(
+            "one_off_payment pattern and recipient apply to platform payments only, not to {}",
+            scope_name(engine)
+        )));
+    }
+    if let Some(r) = &asked.recipient {
+        if asked.pattern == Some(ChargePattern::Own) {
+            return Err(MockError::InvalidAction(format!(
+                "one_off_payment with pattern own pays no recipient, but {r} was given"
+            )));
+        }
+        if !connected(engine, r) {
+            return Err(MockError::InvalidAction(format!(
+                "one_off_payment recipient {r} is not a connected account"
+            )));
+        }
+    }
+    if let Some(p @ (ChargePattern::Destination | ChargePattern::Separate)) = asked.pattern
+        && engine.connected_ids().is_empty()
+    {
+        return Err(MockError::InvalidAction(format!(
+            "one_off_payment pattern {} needs a connected account, and none is connected",
+            pattern_name(p)
+        )));
+    }
+    Ok(())
+}
+
+/// The charge pattern and recipient of a payment intent about to be created in the engine's
+/// scope (phase 8 ruling P7): `None` for the platform's own payment. Only the platform's
+/// payments can route money, so a connected account's scope draws nothing; nor does a mix
+/// with nothing but `own` unless a pattern is asked for. Otherwise the pattern (unless
+/// asked) and then the recipient (unless asked; uniform over the connected accounts) are
+/// drawn from `generate.platform_payments`. With no account connected the payment falls
+/// back to own.
+pub(super) fn draw_routing(
+    engine: &Engine,
+    ctx: &mut Ctx,
+    asked: &AskedRouting,
+) -> Option<(ChargePattern, String)> {
+    if engine.scope().is_some() {
+        return None;
+    }
+    let pattern = match asked.pattern {
+        Some(p) => p,
+        None => {
+            let mix = &ctx.platform_payments;
+            if mix.destination + mix.separate <= 0.0 {
+                return None;
+            }
+            let u = ctx.pattern_rng.unit_f64();
+            if u < mix.own {
+                ChargePattern::Own
+            } else if u < mix.own + mix.destination {
+                ChargePattern::Destination
+            } else {
+                ChargePattern::Separate
+            }
+        }
+    };
+    if pattern == ChargePattern::Own {
+        return None;
+    }
+    let recipient = match &asked.recipient {
+        Some(r) => r.clone(),
+        None => {
+            let ids = engine.connected_ids();
+            if ids.is_empty() {
+                return None;
+            }
+            pick(&mut ctx.pattern_rng, &ids).clone()
+        }
+    };
+    Some((pattern, recipient))
+}
+
+/// The shortest and longest delay of a separate charge's transfer: 1 and 72 hours.
+const SEPARATE_DELAY_MS: (i64, i64) = (3_600_000, 72 * 3_600_000);
+
+/// After a platform payment's success (`payment_intent.succeeded`), its Connect charge
+/// pattern moves the money: a destination charge transfers the full amount now and sets
+/// the charge's `transfer` (a silent update); a separate charge queues its transfer 1-72
+/// hours later (drawn now from `generate.platform_payments`). A destination account that
+/// has disconnected since the intent was created gets nothing.
+pub(super) fn route_succeeded_payment(
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    intent: &stripe::PaymentIntent,
+    charge: &str,
+    cause: &Cause,
+) {
+    if engine.scope().is_some() {
+        return;
+    }
+    let Some(group) = intent.transfer_group.clone().flatten() else {
+        return;
+    };
+    match intent.transfer_data.clone().flatten() {
+        Some(data) => {
+            let account = data.destination.id().to_string();
+            if !connected(engine, &account) {
+                return;
+            }
+            let amount = intent.amount.unwrap_or(0);
+            let currency = intent.currency.clone().unwrap_or_default();
+            let tr = transfer_to(
+                engine, ctx, &account, charge, amount, &currency, &group, cause,
+            );
+            engine
+                .update_obj::<stripe::Charge>(
+                    ObjectType::Charge,
+                    charge,
+                    |c| c.transfer = Some(stripe::Expandable::Id(tr)),
+                    cause.clone(),
+                    ChangeKind::Updated,
+                    &[],
+                )
+                .expect("live charge");
+        }
+        None => {
+            let Some(account) = ctx.separate_recipients.remove(&intent.id) else {
+                return;
+            };
+            let delay = ctx
+                .pattern_rng
+                .uniform_ms(SEPARATE_DELAY_MS.0, SEPARATE_DELAY_MS.1);
+            let at = engine.now().plus_ms(delay);
+            ctx.schedule(
+                at,
+                Continuation::SeparateTransfer {
+                    charge: charge.to_string(),
+                    account,
+                    group,
+                },
+                cause.clone(),
+            );
+        }
+    }
+}
+
+/// The queued transfer of a separate charge: the charge's full amount to `account`, unless
+/// it has disconnected since (then nothing happens).
+pub(super) fn separate_transfer(
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    charge: &str,
+    account: &str,
+    group: &str,
+    cause: &Cause,
+) {
+    if !connected(engine, account) {
+        return;
+    }
+    let Some(ch) = engine.latest_obj::<stripe::Charge>(ObjectType::Charge, charge) else {
+        return;
+    };
+    transfer_to(
+        engine,
+        ctx,
+        account,
+        charge,
+        ch.amount,
+        &ch.currency,
+        group,
+        cause,
+    );
+}
+
+/// Transfers `amount` of the platform charge `charge` to `account`, all in this instant and
+/// under `cause`: the platform's balance transaction (`type: transfer`, `-amount`,
+/// `available` at once), the transfer (`transfer.created`), then in the account's scope the
+/// `py_` payment's balance transaction (`type: payment`, `+amount`, `pending` for two days,
+/// its settlement queued in the account's scope) and the `py_` payment itself (no event).
+/// Returns the transfer's ID.
+#[allow(clippy::too_many_arguments)] // each argument is part of the transfer
+pub(crate) fn transfer_to(
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    account: &str,
+    charge: &str,
+    amount: i64,
+    currency: &str,
+    group: &str,
+    cause: &Cause,
+) -> String {
+    let created = engine.now().unix_seconds();
+    let tr = ctx.payments.id(ObjectType::Transfer.id_prefix());
+    let py = ctx.payments.id("py");
+    let bt_id = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
+    let py_bt_id = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
+
+    let bt = new_transfer_balance_transaction(&bt_id, created, amount, currency, &tr);
+    let transfer = new_transfer(&NewTransfer {
+        id: &tr,
+        created,
+        amount,
+        currency,
+        destination: account,
+        destination_payment: &py,
+        source_transaction: charge,
+        transfer_group: group,
+        balance_transaction: &bt_id,
+    });
+    engine.in_scope(None, |e| {
+        e.create_obj(
+            ObjectType::BalanceTransaction,
+            bt_id,
+            &bt,
+            cause.clone(),
+            &[],
+        );
+        e.create_obj(
+            ObjectType::Transfer,
+            tr.clone(),
+            &transfer,
+            cause.clone(),
+            &["transfer.created"],
+        );
+    });
+    let py_bt =
+        new_destination_payment_balance_transaction(&py_bt_id, created, amount, currency, &py);
+    let payment = new_destination_payment(&NewDestinationPayment {
+        id: &py,
+        created,
+        amount,
+        currency,
+        source_transfer: &tr,
+        balance_transaction: &py_bt_id,
+    });
+    engine.in_scope(Some(account.to_string()), |e| {
+        e.create_obj(
+            ObjectType::BalanceTransaction,
+            py_bt_id.clone(),
+            &py_bt,
+            cause.clone(),
+            &[],
+        );
+        e.create_obj(ObjectType::Charge, py, &payment, cause.clone(), &[]);
+    });
+    ctx.schedule_settlement(
+        SimTime(py_bt.available_on * 1000),
+        Some(Some(account.to_string())),
+        py_bt_id,
+        cause.clone(),
+    );
+    tr
 }

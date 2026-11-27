@@ -55,6 +55,8 @@ fn pay(m: &MockStripe, acct: Option<&str>, amount: i64) -> Cause {
         customer: None,
         amount: Some(amount),
         succeed: Some(true),
+        pattern: None,
+        recipient: None,
     };
     match acct {
         Some(acct) => m.account(acct).run_action(a),

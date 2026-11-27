@@ -215,16 +215,16 @@ fn includable(view: &View, parent: &Value, field: &str) -> Option<Value> {
 /// account, an application fee's charge in the account it was taken from, and a direct
 /// charge's fee, source transfer and transfer reversal on the platform. `None` is the
 /// view's scope; `Some(None)` is the platform.
+///
+/// A sibling the same request expanded first is an object by now, so its `id` is read.
 pub(crate) fn foreign_scope(view: &View, t: ObjectType, obj: &Value, path: &str) -> Option<Scope> {
-    let account = |field: &str| obj[field].as_str().map(|a| Some(a.to_string()));
+    let account = |field: &str| id_of(&obj[field]).map(|a| Some(a.to_string()));
     match (t, path) {
         (ObjectType::Transfer, "destination_payment") => account("destination"),
         (ObjectType::TransferReversal, "destination_payment_refund") => {
-            let transfer = obj["transfer"].as_str()?;
+            let transfer = id_of(&obj["transfer"])?;
             let u = view.state(view.store().get(ObjectType::Transfer, transfer)?)?;
-            u.state["destination"]
-                .as_str()
-                .map(|a| Some(a.to_string()))
+            id_of(&u.state["destination"]).map(|a| Some(a.to_string()))
         }
         (ObjectType::ApplicationFee, "charge") => account("account"),
         (ObjectType::Charge, "application_fee" | "source_transfer")
@@ -233,6 +233,11 @@ pub(crate) fn foreign_scope(view: &View, t: ObjectType, obj: &Value, path: &str)
         | (ObjectType::BankAccount | ObjectType::Card, "account") => Some(None),
         _ => None,
     }
+}
+
+/// The ID an expandable field holds: the string itself, or an expanded object's `id`.
+fn id_of(v: &Value) -> Option<&str> {
+    v.as_str().or_else(|| v["id"].as_str())
 }
 
 /// The type an object's `object` field names.

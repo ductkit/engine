@@ -47,6 +47,8 @@ fn paid_charge(
         customer: None,
         amount: Some(amount),
         succeed: Some(true),
+        pattern: None,
+        recipient: None,
     })
     .unwrap();
     only_id(&caused(m, &cause), ObjectType::Charge)
@@ -264,6 +266,8 @@ async fn dispute_needs_an_undisputed_charge() {
                 customer: None,
                 amount: Some(800),
                 succeed: Some(false),
+                pattern: None,
+                recipient: None,
             })
             .unwrap();
         only_id(&caused(&m, &cause), ObjectType::Charge)

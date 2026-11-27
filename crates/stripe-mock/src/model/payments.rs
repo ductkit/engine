@@ -6,7 +6,8 @@
 //! Stripe documents it as includable-only or expandable-only, or it is optional and not
 //! nullable and only appears in a situation the mock does not model (a payment method's
 //! other-type details, `presentment_details`, `radar_options`, `hooks`, the card
-//! enterprise features, `charge.transfer`). Those are absent.
+//! enterprise features, `charge.transfer` until a destination charge's transfer sets it).
+//! Those are absent.
 
 use std::collections::BTreeMap;
 
@@ -45,7 +46,7 @@ pub(crate) struct CardDraw {
     pub fingerprint: String,
 }
 
-fn empty_billing_details() -> stripe::BillingDetails {
+pub(crate) fn empty_billing_details() -> stripe::BillingDetails {
     stripe::BillingDetails {
         address: Some(Some(stripe::Address {
             city: Some(None),
@@ -184,6 +185,23 @@ pub(crate) struct NewPaymentIntent<'a> {
     pub client_secret: &'a str,
     /// The fee a connected account's direct charge pays the platform.
     pub application_fee_amount: Option<i64>,
+    /// The Connect charge pattern of a platform payment that pays a connected account.
+    pub routing: Option<Routing<'a>>,
+}
+
+/// How a platform payment routes money to a connected account (phase 8 ruling P7): a
+/// destination charge names its `destination`; both patterns carry a `transfer_group`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Routing<'a> {
+    /// The destination account of a destination charge; `None` for separate charges and
+    /// transfers.
+    pub destination: Option<&'a str>,
+    pub group: &'a str,
+}
+
+/// The `transfer_group` of a payment intent's charges and transfers.
+pub(crate) fn transfer_group(payment_intent: &str) -> String {
+    format!("group_{payment_intent}")
 }
 
 fn card_options() -> stripe::PaymentIntentPaymentMethodOptions {
@@ -329,8 +347,20 @@ pub(crate) fn new_payment_intent(p: &NewPaymentIntent) -> stripe::PaymentIntent 
         statement_descriptor: Some(None),
         statement_descriptor_suffix: Some(None),
         status: stripe::PaymentIntentStatus::RequiresConfirmation,
-        transfer_data: Some(None),
-        transfer_group: Some(None),
+        // The schema's `transfer_data.amount` is not nullable, so the full-amount transfer
+        // leaves it out.
+        transfer_data: Some(
+            p.routing
+                .and_then(|r| r.destination)
+                .map(|d| stripe::TransferData {
+                    amount: None,
+                    description: None,
+                    destination: Expandable::Id(d.to_string()),
+                    metadata: None,
+                    payment_data: None,
+                }),
+        ),
+        transfer_group: Some(p.routing.map(|r| r.group.to_string())),
     }
 }
 
@@ -372,6 +402,8 @@ pub(crate) struct NewCharge<'a> {
     pub network_transaction_id: &'a str,
     /// The platform's application fee on a succeeded direct charge: its ID and amount.
     pub application_fee: Option<(&'a str, i64)>,
+    /// The intent's Connect charge pattern, for a platform payment that pays an account.
+    pub routing: Option<Routing<'a>>,
 }
 
 fn outcome(succeeded: bool, risk_score: i64) -> stripe::ChargeOutcome {
@@ -410,6 +442,61 @@ fn card_details(c: &NewCharge) -> stripe::PaymentMethodDetails {
         .card
         .as_ref()
         .expect("the mock pays with cards");
+    let card = stripe::PaymentMethodDetailsCard {
+        amount_authorized: Some(c.succeeded.then_some(c.amount)),
+        authorization_code: Some(None),
+        brand: Some(Some(pm_card.brand.clone())),
+        capture_before: None,
+        checks: Some(Some(stripe::PaymentMethodDetailsCardChecks {
+            address_line1_check: Some(None),
+            address_postal_code_check: Some(None),
+            cvc_check: Some(None),
+        })),
+        country: Some(pm_card.country.clone().flatten()),
+        electronic_commerce_indicator: Some(None),
+        exp_month: pm_card.exp_month,
+        exp_year: pm_card.exp_year,
+        extended_authorization: None,
+        fingerprint: Some(pm_card.fingerprint.clone().flatten()),
+        funding: Some(Some(pm_card.funding.clone())),
+        incremental_authorization: None,
+        installments: Some(None),
+        last4: Some(Some(pm_card.last4.clone())),
+        mandate: Some(None),
+        multicapture: None,
+        network: Some(Some(pm_card.brand.clone())),
+        network_token: Some(Some(stripe::PaymentMethodDetailsCardNetworkToken {
+            used: false,
+        })),
+        network_transaction_id: Some(Some(c.network_transaction_id.to_string())),
+        overcapture: None,
+        regulated_status: Some(Some(
+            stripe::PaymentMethodDetailsCardRegulatedStatus::Unregulated,
+        )),
+        setup_credential_usage: None,
+        stored_credential_usage: None,
+        three_d_secure: Some(None),
+        transaction_link_id: Some(None),
+        wallet: Some(None),
+    };
+    method_details("card", Some(card), None)
+}
+
+/// The `payment_method_details` of a `py_` payment a transfer created in its account.
+pub(crate) fn stripe_account_details() -> stripe::PaymentMethodDetails {
+    method_details(
+        "stripe_account",
+        None,
+        Some(stripe::PaymentMethodDetailsStripeAccount {}),
+    )
+}
+
+/// Payment method details of `type_`, with only the given type's sub-object.
+fn method_details(
+    type_: &str,
+    card: Option<stripe::PaymentMethodDetailsCard>,
+    stripe_account: Option<stripe::PaymentMethodDetailsStripeAccount>,
+) -> stripe::PaymentMethodDetails {
     stripe::PaymentMethodDetails {
         ach_credit_transfer: None,
         ach_debit: None,
@@ -426,43 +513,7 @@ fn card_details(c: &NewCharge) -> stripe::PaymentMethodDetails {
         bizum: None,
         blik: None,
         boleto: None,
-        card: Some(stripe::PaymentMethodDetailsCard {
-            amount_authorized: Some(c.succeeded.then_some(c.amount)),
-            authorization_code: Some(None),
-            brand: Some(Some(pm_card.brand.clone())),
-            capture_before: None,
-            checks: Some(Some(stripe::PaymentMethodDetailsCardChecks {
-                address_line1_check: Some(None),
-                address_postal_code_check: Some(None),
-                cvc_check: Some(None),
-            })),
-            country: Some(pm_card.country.clone().flatten()),
-            electronic_commerce_indicator: Some(None),
-            exp_month: pm_card.exp_month,
-            exp_year: pm_card.exp_year,
-            extended_authorization: None,
-            fingerprint: Some(pm_card.fingerprint.clone().flatten()),
-            funding: Some(Some(pm_card.funding.clone())),
-            incremental_authorization: None,
-            installments: Some(None),
-            last4: Some(Some(pm_card.last4.clone())),
-            mandate: Some(None),
-            multicapture: None,
-            network: Some(Some(pm_card.brand.clone())),
-            network_token: Some(Some(stripe::PaymentMethodDetailsCardNetworkToken {
-                used: false,
-            })),
-            network_transaction_id: Some(Some(c.network_transaction_id.to_string())),
-            overcapture: None,
-            regulated_status: Some(Some(
-                stripe::PaymentMethodDetailsCardRegulatedStatus::Unregulated,
-            )),
-            setup_credential_usage: None,
-            stored_credential_usage: None,
-            three_d_secure: Some(None),
-            transaction_link_id: Some(None),
-            wallet: Some(None),
-        }),
+        card,
         card_present: None,
         cashapp: None,
         crypto: None,
@@ -500,11 +551,11 @@ fn card_details(c: &NewCharge) -> stripe::PaymentMethodDetails {
         sepa_debit: None,
         sequra: None,
         sofort: None,
-        stripe_account: None,
+        stripe_account,
         sunbit: None,
         swish: None,
         twint: None,
-        type_: "card".to_string(),
+        type_: type_.to_string(),
         upi: None,
         us_bank_account: None,
         wechat: None,
@@ -579,8 +630,13 @@ pub(crate) fn new_charge(c: &NewCharge) -> stripe::Charge {
         statement_descriptor_suffix: Some(None),
         status,
         transfer: None,
-        transfer_data: Some(None),
-        transfer_group: Some(None),
+        transfer_data: Some(c.routing.and_then(|r| r.destination).map(|d| {
+            stripe::ChargeTransferData {
+                amount: Some(None),
+                destination: Expandable::Id(d.to_string()),
+            }
+        })),
+        transfer_group: Some(c.routing.map(|r| r.group.to_string())),
     }
 }
 
@@ -1162,6 +1218,7 @@ mod tests {
             payment_method: "pm_1",
             client_secret: "pi_1_secret_x",
             application_fee_amount: None,
+            routing: None,
         });
         let v = conforms(&pi);
         assert_eq!(v["status"], "requires_confirmation");
@@ -1182,6 +1239,7 @@ mod tests {
                 risk_score: 20,
                 network_transaction_id: "123456789012345",
                 application_fee: None,
+                routing: None,
             });
             let v = conforms(&ch);
             assert_eq!(v["paid"], succeeded);
@@ -1225,6 +1283,7 @@ mod tests {
             risk_score: 20,
             network_transaction_id: "123456789012345",
             application_fee: None,
+            routing: None,
         });
         let re = new_refund(&NewRefund {
             id: "re_1",

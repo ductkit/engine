@@ -181,6 +181,8 @@ async fn detached_payment_method_is_retrievable_but_unlisted() {
             customer: Some(cus.clone()),
             amount: Some(1200),
             succeed: Some(true),
+            pattern: None,
+            recipient: None,
         })
         .unwrap();
     let fresh = only_id(&caused(&m, &pay), ObjectType::PaymentMethod);

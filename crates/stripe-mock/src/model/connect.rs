@@ -2,8 +2,10 @@
 //! external accounts and persons. They arrive with the generators that create these
 //! objects (phase 8, tasks 3 to 8); this file holds the ones built so far: external
 //! accounts (bank accounts and debit cards) and persons of controlled accounts, whose
-//! presence follows ruling R1 (spec section 5.4), and application fees with their refunds.
+//! presence follows ruling R1 (spec section 5.4), application fees with their refunds, and
+//! transfers with the `py_` payments they create.
 
+use crate::model::payments::{AVAILABLE_AFTER_SECS, empty_billing_details, stripe_account_details};
 use crate::stripe::{self, Expandable};
 
 /// The drawn parts of a bank account.
@@ -424,5 +426,181 @@ pub(crate) fn new_fee_refund(
         id: id.to_string(),
         metadata: Some(Some(Default::default())),
         object: stripe::FeeRefundObject::FeeRefund,
+    }
+}
+
+/// The URL of a transfer's reversals list.
+pub(crate) fn transfer_reversals_url(transfer: &str) -> String {
+    format!("/v1/transfers/{transfer}/reversals")
+}
+
+/// The platform's balance transaction for a transfer: `-amount`, no fee, `available` at
+/// once.
+pub(crate) fn new_transfer_balance_transaction(
+    id: &str,
+    created: i64,
+    amount: i64,
+    currency: &str,
+    transfer: &str,
+) -> stripe::BalanceTransaction {
+    stripe::BalanceTransaction {
+        amount: -amount,
+        available_on: created,
+        balance_type: stripe::BalanceTransactionBalanceType::Payments,
+        created,
+        currency: currency.to_string(),
+        description: Some(None),
+        exchange_rate: Some(None),
+        fee: 0,
+        fee_details: Vec::new(),
+        id: id.to_string(),
+        net: -amount,
+        object: stripe::BalanceTransactionObject::BalanceTransaction,
+        reporting_category: "transfer".to_string(),
+        source: Some(Some(Expandable::Id(transfer.to_string()))),
+        status: "available".to_string(),
+        type_: stripe::BalanceTransactionType::Transfer,
+    }
+}
+
+/// The inputs of a transfer.
+pub(crate) struct NewTransfer<'a> {
+    pub id: &'a str,
+    pub created: i64,
+    pub amount: i64,
+    pub currency: &'a str,
+    /// The connected account paid.
+    pub destination: &'a str,
+    /// The `py_` payment the transfer creates in `destination`.
+    pub destination_payment: &'a str,
+    /// The platform charge that funds the transfer.
+    pub source_transaction: &'a str,
+    pub transfer_group: &'a str,
+    pub balance_transaction: &'a str,
+}
+
+/// A transfer of a platform charge's funds to a connected account: nothing reversed, an
+/// empty embedded `reversals` list.
+pub(crate) fn new_transfer(t: &NewTransfer) -> stripe::Transfer {
+    stripe::Transfer {
+        amount: t.amount,
+        amount_reversed: 0,
+        balance_transaction: Some(Some(Expandable::Id(t.balance_transaction.to_string()))),
+        created: t.created,
+        currency: t.currency.to_string(),
+        description: Some(None),
+        destination: Some(Some(Expandable::Id(t.destination.to_string()))),
+        destination_payment: Some(Expandable::Id(t.destination_payment.to_string())),
+        id: t.id.to_string(),
+        livemode: false,
+        metadata: Default::default(),
+        object: stripe::TransferObject::Transfer,
+        reversals: stripe::List {
+            object: stripe::ListObject::List,
+            data: Vec::new(),
+            has_more: false,
+            url: transfer_reversals_url(t.id),
+            total_count: None,
+        },
+        reversed: false,
+        source_transaction: Some(Some(Expandable::Id(t.source_transaction.to_string()))),
+        source_type: Some("card".to_string()),
+        transfer_group: Some(Some(t.transfer_group.to_string())),
+    }
+}
+
+/// The account's balance transaction for a `py_` payment: `+amount`, no fee, `pending`
+/// for [`AVAILABLE_AFTER_SECS`].
+pub(crate) fn new_destination_payment_balance_transaction(
+    id: &str,
+    created: i64,
+    amount: i64,
+    currency: &str,
+    payment: &str,
+) -> stripe::BalanceTransaction {
+    stripe::BalanceTransaction {
+        amount,
+        available_on: created + AVAILABLE_AFTER_SECS,
+        balance_type: stripe::BalanceTransactionBalanceType::Payments,
+        created,
+        currency: currency.to_string(),
+        description: Some(None),
+        exchange_rate: Some(None),
+        fee: 0,
+        fee_details: Vec::new(),
+        id: id.to_string(),
+        net: amount,
+        object: stripe::BalanceTransactionObject::BalanceTransaction,
+        reporting_category: "charge".to_string(),
+        source: Some(Some(Expandable::Id(payment.to_string()))),
+        status: "pending".to_string(),
+        type_: stripe::BalanceTransactionType::Payment,
+    }
+}
+
+/// The inputs of a `py_` payment.
+pub(crate) struct NewDestinationPayment<'a> {
+    pub id: &'a str,
+    pub created: i64,
+    pub amount: i64,
+    pub currency: &'a str,
+    /// The transfer that created it.
+    pub source_transfer: &'a str,
+    pub balance_transaction: &'a str,
+}
+
+/// The `py_` payment a transfer creates in its destination account: a `succeeded`,
+/// captured charge paid from the platform's Stripe account, so with no customer, payment
+/// intent, payment method or outcome.
+pub(crate) fn new_destination_payment(p: &NewDestinationPayment) -> stripe::Charge {
+    stripe::Charge {
+        amount: p.amount,
+        amount_captured: p.amount,
+        amount_refunded: 0,
+        application: Some(None),
+        application_fee: Some(None),
+        application_fee_amount: Some(None),
+        balance_transaction: Some(Some(Expandable::Id(p.balance_transaction.to_string()))),
+        billing_details: empty_billing_details(),
+        calculated_statement_descriptor: Some(None),
+        captured: true,
+        created: p.created,
+        currency: p.currency.to_string(),
+        customer: Some(None),
+        description: Some(None),
+        disputed: false,
+        failure_balance_transaction: Some(None),
+        failure_code: Some(None),
+        failure_message: Some(None),
+        fraud_details: Some(Some(stripe::ChargeFraudDetails {
+            stripe_report: None,
+            user_report: None,
+        })),
+        id: p.id.to_string(),
+        livemode: false,
+        metadata: Default::default(),
+        object: stripe::ChargeObject::Charge,
+        on_behalf_of: Some(None),
+        outcome: Some(None),
+        paid: true,
+        payment_intent: Some(None),
+        payment_method: Some(None),
+        payment_method_details: Some(Some(stripe_account_details())),
+        presentment_details: None,
+        radar_options: None,
+        receipt_email: Some(None),
+        receipt_number: Some(None),
+        receipt_url: Some(None),
+        refunded: false,
+        refunds: None,
+        review: Some(None),
+        shipping: Some(None),
+        source_transfer: Some(Some(Expandable::Id(p.source_transfer.to_string()))),
+        statement_descriptor: Some(None),
+        statement_descriptor_suffix: Some(None),
+        status: stripe::ChargeStatus::Succeeded,
+        transfer: None,
+        transfer_data: Some(None),
+        transfer_group: Some(None),
     }
 }
