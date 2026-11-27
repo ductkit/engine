@@ -422,6 +422,15 @@ async fn list(
     Ok(Json(out))
 }
 
+/// Whether `id` of type `t` exists in `scope` now and is not deleted. Unlike a view, it
+/// draws nothing (no stale read), so a handler can validate before it writes.
+fn exists_now(sim: &Sim, scope: &Scope, t: ObjectType, id: &str) -> bool {
+    sim.engine
+        .scope_store(scope)
+        .get(t, id)
+        .is_some_and(|o| !o.deleted)
+}
+
 /// A write during pagination of a `t` list: on a page after the first, when drawn. It
 /// runs before the view is taken, so this page sees it.
 fn pagination_write(sim: &mut Sim, scope: &Scope, p: &ListParams, t: ObjectType) {
@@ -676,6 +685,10 @@ async fn sub_list(
     let p = parse_list_params(decode(query), &[], &["expand"])?;
     let mut sim = shared.lock();
     ensure_connected(&sim.engine, &scope)?;
+    // Validate before writing: an unknown parent must not trigger a write.
+    if !exists_now(&sim, &scope, sub.parent, id) {
+        return Err(no_such(sub.parent, id));
+    }
     pagination_write(&mut sim, &scope, &p, sub.child);
     let at = stale_at(&mut sim);
     let view = View {
@@ -770,6 +783,10 @@ pub(crate) async fn external_accounts(
     }
     let mut sim = shared.lock();
     ensure_connected(&sim.engine, &scope)?;
+    // Validate before writing: an unknown account must not trigger a write.
+    if !exists_now(&sim, &None, ObjectType::Account, &acct) {
+        return Err(no_such(ObjectType::Account, &acct));
+    }
     pagination_write(&mut sim, &Some(acct.clone()), &p, ObjectType::BankAccount);
     let view = account_view(&mut sim, &acct)?;
     let mut all: Vec<&StoredObject> = [ObjectType::BankAccount, ObjectType::Card]
@@ -829,6 +846,10 @@ pub(crate) async fn persons(
     let p = parse_list_params(decode(query), &[], &["expand"])?;
     let mut sim = shared.lock();
     ensure_connected(&sim.engine, &scope)?;
+    // Validate before writing: an unknown account must not trigger a write.
+    if !exists_now(&sim, &None, ObjectType::Account, &acct) {
+        return Err(no_such(ObjectType::Account, &acct));
+    }
     pagination_write(&mut sim, &Some(acct.clone()), &p, ObjectType::Person);
     let view = account_view(&mut sim, &acct)?;
     let all = view.store().in_creation_order(ObjectType::Person);

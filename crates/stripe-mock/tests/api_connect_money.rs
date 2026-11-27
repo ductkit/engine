@@ -6,8 +6,9 @@ use common::{get, get_with, mock_with};
 use ductkit_stripe_mock::{AccountApi, MockStripe};
 use serde_json::Value;
 
-const CUSTOM: &str =
-    "[accounts]\nconnect = true\naccount_types = { standard = 0.0, express = 0.0, custom = 1.0 }\n";
+/// Standard accounts have no external accounts or persons, so their lists start empty.
+const STANDARD: &str =
+    "[accounts]\nconnect = true\naccount_types = { standard = 1.0, express = 0.0, custom = 0.0 }\n";
 
 async fn json_of(r: reqwest::Response) -> (u16, Value) {
     let s = r.status().as_u16();
@@ -15,7 +16,7 @@ async fn json_of(r: reqwest::Response) -> (u16, Value) {
 }
 
 async fn setup() -> (MockStripe, String) {
-    let m = mock_with(CUSTOM).await;
+    let m = mock_with(STANDARD).await;
     let a = m.connect_account(AccountApi::V1).unwrap();
     (m, a)
 }

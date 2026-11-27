@@ -84,7 +84,7 @@ impl Generators {
 
     /// Follows changes to the set of connected accounts. A new generator starts at
     /// the engine's current time (the connect instant).
-    pub(crate) fn apply(&mut self, engine: &Engine, changes: &[AccountChange]) {
+    pub(crate) fn apply(&mut self, engine: &mut Engine, changes: &[AccountChange]) {
         for change in changes {
             match change {
                 AccountChange::Connected(id) => {
@@ -100,6 +100,10 @@ impl Generators {
                     g.scale_rates(self.scale, now);
                     if !self.enabled {
                         g.set_enabled(false, now);
+                    }
+                    // The account's setup runs in its own scope, once.
+                    if let Some(kind) = engine.account_meta(id).map(|m| m.kind) {
+                        engine.in_scope(Some(id.clone()), |e| g.on_connect(e, kind));
                     }
                     self.connected.push((id.clone(), g));
                 }

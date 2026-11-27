@@ -13,6 +13,7 @@ mod accounts;
 mod billing;
 mod catalog;
 mod checkout;
+mod connect;
 mod mux;
 mod payments;
 mod subscriptions;
@@ -96,6 +97,26 @@ pub enum Action {
     /// Detach the named or a random attached payment method. A named one that is not
     /// attached is an error naming it.
     DetachPaymentMethod { id: Option<String> },
+    /// Add a bank account or debit card (`kind`, drawn when `None`) to the connected
+    /// account whose scope this runs in. A platform scope, or an account the platform does
+    /// not control, is an error naming the scope.
+    CreateExternalAccount { kind: Option<ExternalAccountKind> },
+    /// Delete the named or a random non-default external account of the account. With
+    /// none deletable, or a named one that is the default or unknown, an error naming it.
+    DeleteExternalAccount { id: Option<String> },
+    /// Give the named or a random person of the account a new email and phone.
+    UpdatePerson { id: Option<String> },
+    /// Delete the named or a random person of the account. Deleting the last
+    /// representative sets the account's `requirements`.
+    DeletePerson { id: Option<String> },
+}
+
+/// The kind of an external account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalAccountKind {
+    BankAccount,
+    Card,
 }
 
 /// Generated actions, in tie-break order. New kinds are appended, so existing
@@ -121,6 +142,10 @@ enum ActionKind {
     SavePaymentMethod,
     Checkout,
     PaymentMethodDetach,
+    ExternalAccountCreate,
+    ExternalAccountDelete,
+    PersonUpdate,
+    PersonDelete,
 }
 
 /// A follow-up step of an action.
@@ -272,6 +297,8 @@ impl Ctx {
 pub(crate) struct Generator {
     actions: Vec<Scheduled>,
     ctx: Ctx,
+    /// Draws for the setup of a newly connected controlled account.
+    setup: SimRng,
     /// Draws for actions triggered through `run_action`.
     control: SimRng,
     enabled: bool,
@@ -380,6 +407,26 @@ impl Generator {
                 c.payment_method.detach,
                 "generate.payment_method.detach",
             ),
+            (
+                ActionKind::ExternalAccountCreate,
+                c.external_account.create,
+                "generate.external_account.create",
+            ),
+            (
+                ActionKind::ExternalAccountDelete,
+                c.external_account.delete,
+                "generate.external_account.delete",
+            ),
+            (
+                ActionKind::PersonUpdate,
+                c.person.update,
+                "generate.person.update",
+            ),
+            (
+                ActionKind::PersonDelete,
+                c.person.delete,
+                "generate.person.delete",
+            ),
         ];
         let actions = specs
             .into_iter()
@@ -408,10 +455,22 @@ impl Generator {
                 billing: stream("generate.billing"),
                 payments: stream("generate.payments"),
             },
+            setup: stream("generate.account_setup"),
             control: stream("control.actions"),
             pagination_rng: stream("api.pagination_writes.content"),
             enabled: true,
         }
+    }
+
+    /// Runs once, in the account's scope, right after the account connects. A controlled
+    /// account (Express, Custom or v2, P4) gets its bank account and persons under the
+    /// cause `account_setup`; a Standard account gets nothing and draws nothing.
+    pub(crate) fn on_connect(&mut self, engine: &mut Engine, kind: crate::AccountKind) {
+        if kind == crate::AccountKind::Standard {
+            return;
+        }
+        let cause = engine.begin_action("account_setup");
+        connect::setup(&mut self.setup, engine, &cause, self.ctx.page_size);
     }
 
     /// Removes the queued settlements, in due order: `(available_on, balance
@@ -676,6 +735,35 @@ impl Generator {
                     MockError::InvalidAction("no attached payment method to detach".to_string())
                 })?
             }
+            Action::CreateExternalAccount { kind } => connect::create_external_account(
+                &mut self.control,
+                engine,
+                self.ctx.page_size,
+                kind,
+            )?,
+            Action::DeleteExternalAccount { id } => {
+                connect::delete_external_account(&mut self.control, engine, self.ctx.page_size, id)?
+                    .ok_or_else(|| {
+                        MockError::InvalidAction(format!(
+                            "no non-default external account to delete in {}",
+                            connect::scope_name(engine)
+                        ))
+                    })?
+            }
+            Action::UpdatePerson { id } => connect::update_person(&mut self.control, engine, id)?
+                .ok_or_else(|| {
+                MockError::InvalidAction(format!(
+                    "no person to update in {}",
+                    connect::scope_name(engine)
+                ))
+            })?,
+            Action::DeletePerson { id } => connect::delete_person(&mut self.control, engine, id)?
+                .ok_or_else(|| {
+                MockError::InvalidAction(format!(
+                    "no person to delete in {}",
+                    connect::scope_name(engine)
+                ))
+            })?,
         };
         self.run_due_now(engine);
         Ok(cause)
@@ -735,11 +823,15 @@ impl Generator {
             ObjectType::SubscriptionItem | ObjectType::InvoiceLineItem | ObjectType::Account => {
                 return;
             }
+            // External accounts and persons exist only in accounts the platform controls.
+            ObjectType::BankAccount | ObjectType::Card if connect::controlled(engine) => {
+                &[ActionKind::ExternalAccountCreate]
+            }
+            ObjectType::Person if connect::controlled(engine) => &[ActionKind::PersonUpdate],
             // The write kinds for these arrive with their tasks, so the arms return early
             // until then: Transfer and TransferReversal -> TransferReversal (task 7),
-            // ApplicationFee and FeeRefund -> ApplicationFeeRefund (task 5),
-            // BankAccount and Card -> ExternalAccountCreate (task 3),
-            // Person -> PersonUpdate (task 3). A payout has no write.
+            // ApplicationFee and FeeRefund -> ApplicationFeeRefund (task 5). A payout has
+            // no write.
             ObjectType::Transfer
             | ObjectType::TransferReversal
             | ObjectType::ApplicationFee
@@ -904,6 +996,29 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
         }
         ActionKind::PaymentMethodDetach => {
             payments::detach_action(rng, engine, None).expect("random targets are valid");
+        }
+        // Only the accounts the platform controls have these.
+        ActionKind::ExternalAccountCreate => {
+            if connect::controlled(engine) {
+                connect::create_external_account(rng, engine, ctx.page_size, None)
+                    .expect("a controlled scope");
+            }
+        }
+        ActionKind::ExternalAccountDelete => {
+            if connect::controlled(engine) {
+                connect::delete_external_account(rng, engine, ctx.page_size, None)
+                    .expect("random targets are valid");
+            }
+        }
+        ActionKind::PersonUpdate => {
+            if connect::controlled(engine) {
+                connect::update_person(rng, engine, None).expect("random targets are valid");
+            }
+        }
+        ActionKind::PersonDelete => {
+            if connect::controlled(engine) {
+                connect::delete_person(rng, engine, None).expect("random targets are valid");
+            }
         }
     }
 }

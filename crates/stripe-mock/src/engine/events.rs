@@ -273,9 +273,19 @@ impl Projector {
             stripe::V2CoreEventRelatedObject {
                 id: Some(u.object_id.clone()),
                 type_: name.to_string(),
-                url: u.object_type.api_path(&u.object_id).unwrap_or_else(|| {
-                    panic!("{} has no API path, so it cannot announce events", name)
-                }),
+                // A child of an account lives in that account's scope, so its URL nests
+                // under the scope's account.
+                url: u
+                    .object_type
+                    .api_path(&u.object_id)
+                    .or_else(|| {
+                        u.account
+                            .as_deref()
+                            .and_then(|a| u.object_type.sub_path(a, &u.object_id))
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{} has no API path, so it cannot announce events", name)
+                    }),
             }
         };
         // Presence: none of `context`, `reason`, `snapshot_event`, `changes` and `data` is

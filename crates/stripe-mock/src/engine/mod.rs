@@ -201,12 +201,24 @@ impl Engine {
             AccountApi::V1 => &["account.updated"],
             AccountApi::V2 => &["account.updated", "v2.core.account.updated"],
         };
+        self.update_account_with(id, |a| account::apply_content(a, &content), events)
+    }
+
+    /// Changes a connected account with `f` now, in the platform scope, as an
+    /// `account_update`; `events` announces the change (none for a silent one).
+    pub(crate) fn update_account_with(
+        &mut self,
+        id: &str,
+        f: impl FnOnce(&mut stripe::Account),
+        events: &[&str],
+    ) -> Result<(), MockError> {
+        self.connected_api(id)?;
         let cause = self.begin_action("account_update");
         self.in_scope(None, |e| {
             e.update_obj(
                 ObjectType::Account,
                 id,
-                |a: &mut stripe::Account| account::apply_content(a, &content),
+                f,
                 cause,
                 ChangeKind::Updated,
                 events,
@@ -593,7 +605,6 @@ impl Engine {
         self.stores.entry(self.scope.clone()).or_default()
     }
 
-    #[cfg(test)]
     pub(crate) fn scope(&self) -> &Scope {
         &self.scope
     }

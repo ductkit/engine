@@ -380,6 +380,28 @@ pub struct ChurnConfig {
     pub invoice: UpdateChurn,
     pub account: UpdateChurn,
     pub payment_method: PaymentMethodChurn,
+    /// Persons of controlled connected accounts (needs `accounts.connect`).
+    pub person: PersonChurn,
+    /// External accounts of controlled connected accounts (needs `accounts.connect`).
+    pub external_account: ExternalAccountChurn,
+}
+
+/// Person churn on controlled accounts: updating a person's contact details, and
+/// deleting one.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersonChurn {
+    pub update: f64,
+    pub delete: f64,
+}
+
+/// External-account churn on controlled accounts: adding a bank account or card, and
+/// deleting a non-default one.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExternalAccountChurn {
+    pub create: f64,
+    pub delete: f64,
 }
 
 /// Payment method churn: detaching a random attached payment method.
@@ -518,11 +540,23 @@ impl Config {
             ("churn.invoice.update", ch.invoice.update),
             ("churn.account.update", ch.account.update),
             ("churn.payment_method.detach", ch.payment_method.detach),
+            ("churn.person.update", ch.person.update),
+            ("churn.person.delete", ch.person.delete),
+            ("churn.external_account.create", ch.external_account.create),
+            ("churn.external_account.delete", ch.external_account.delete),
         ] {
             check_rate(name, rate)?;
         }
-        if ch.account.update != 0.0 && !self.accounts.connect {
-            return err("`churn.account.update` needs `accounts.connect = true`".to_string());
+        for (name, rate) in [
+            ("churn.account.update", ch.account.update),
+            ("churn.person.update", ch.person.update),
+            ("churn.person.delete", ch.person.delete),
+            ("churn.external_account.create", ch.external_account.create),
+            ("churn.external_account.delete", ch.external_account.delete),
+        ] {
+            if rate != 0.0 && !self.accounts.connect {
+                return err(format!("`{name}` needs `accounts.connect = true`"));
+            }
         }
         if !(1..=100).contains(&self.payloads.nested_list_page_size) {
             return err(format!(
@@ -1519,6 +1553,79 @@ update = 0.5",
 connect = true
 [churn.account]
 update = 0.5"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn churn_keys_default_to_zero() {
+        let c = Config::default().churn;
+        assert_eq!((c.person.update, c.person.delete), (0.0, 0.0));
+        assert_eq!(
+            (c.external_account.create, c.external_account.delete),
+            (0.0, 0.0)
+        );
+        let c = Config::from_toml_str(
+            "[accounts]
+connect = true
+[churn.person]
+delete = 0.25
+[churn.external_account]
+create = 0.5",
+        )
+        .unwrap()
+        .churn;
+        assert_eq!((c.person.update, c.person.delete), (0.0, 0.25));
+        assert_eq!(
+            (c.external_account.create, c.external_account.delete),
+            (0.5, 0.0)
+        );
+    }
+
+    #[test]
+    fn person_and_external_account_churn_need_connect() {
+        for (section, key) in [
+            ("person", "update"),
+            ("person", "delete"),
+            ("external_account", "create"),
+            ("external_account", "delete"),
+        ] {
+            let name = format!("churn.{section}.{key}");
+            let msg = Config::from_toml_str(&format!(
+                "[churn.{section}]
+{key} = 0.5"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                msg.contains(&name) && msg.contains("accounts.connect = true"),
+                "{name}: {msg}"
+            );
+            assert!(
+                Config::from_toml_str(&format!(
+                    "[accounts]
+connect = true
+[churn.{section}]
+{key} = 0.5"
+                ))
+                .is_ok()
+            );
+            let msg = Config::from_toml_str(&format!(
+                "[accounts]
+connect = true
+[churn.{section}]
+{key} = -1.0"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(msg.contains(&name), "{msg}");
+        }
+        // A rate of 0 needs nothing.
+        assert!(
+            Config::from_toml_str(
+                "[churn.person]
+update = 0.0"
             )
             .is_ok()
         );
