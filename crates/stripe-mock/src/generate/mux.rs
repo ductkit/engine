@@ -20,9 +20,9 @@ pub(crate) struct Generators {
     accounts: AccountsGenerator,
     /// In connection order.
     connected: Vec<(String, Generator)>,
-    /// Settlements of disconnected accounts: `(available_on, seq)` to `(account,
+    /// Settlements of disconnected accounts: `(available_on, seq)` to `(scope,
     /// balance transaction, cause)`. Ties run in hand-over order.
-    orphaned: BTreeMap<(SimTime, u64), (String, String, Cause)>,
+    orphaned: BTreeMap<(SimTime, u64), (Scope, String, Cause)>,
     orphaned_seq: u64,
     /// Builds the generators of accounts connected later.
     config: Config,
@@ -112,9 +112,9 @@ impl Generators {
                         continue;
                     };
                     let (_, mut g) = self.connected.remove(i);
-                    for (at, txn, cause) in g.take_settlements() {
+                    for (at, scope, txn, cause) in g.take_settlements(&Some(id.clone())) {
                         self.orphaned
-                            .insert((at, self.orphaned_seq), (id.clone(), txn, cause));
+                            .insert((at, self.orphaned_seq), (scope, txn, cause));
                         self.orphaned_seq += 1;
                     }
                 }
@@ -164,13 +164,11 @@ impl Generators {
                     self.apply(engine, &changes);
                 }
                 usize::MAX => {
-                    let Some((_, (acct, txn, cause))) = self.orphaned.pop_first() else {
+                    let Some((_, (scope, txn, cause))) = self.orphaned.pop_first() else {
                         unreachable!("an orphaned settlement is due");
                     };
                     engine.set_now(due);
-                    engine.in_scope(Some(acct), |e| {
-                        super::payments::make_available(e, &txn, &cause)
-                    });
+                    engine.in_scope(scope, |e| super::payments::make_available(e, &txn, &cause));
                 }
                 i => {
                     let (id, g) = &mut self.connected[i - 2];
@@ -256,5 +254,66 @@ impl Generators {
             .find(|(a, _)| a == id)
             .map(|(_, g)| g)
             .ok_or_else(|| MockError::UnknownAccount(id.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::payments::new_charge_balance_transaction;
+
+    fn status(e: &mut Engine, acct: &str, id: &str) -> String {
+        e.in_scope(Some(acct.to_string()), |e| {
+            e.latest(ObjectType::BalanceTransaction, id).unwrap().state["status"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+    }
+
+    #[test]
+    fn foreign_scope_settlement_runs_in_its_scope() {
+        let config = Config::from_toml_str(
+            "[accounts]
+connect = true
+",
+        )
+        .unwrap();
+        let streams = RngStreams::new(config.seed);
+        let mut engine = Engine::new(SimTime(0), &config, &streams);
+        let mut gens = Generators::new(&config, &streams, SimTime(0));
+        gens.set_enabled(false, SimTime(0));
+        let acct = gens.connect_account(&mut engine, AccountApi::V1);
+
+        let txn = new_charge_balance_transaction("txn_foreign", 0, 1000, "usd", "ch_foreign");
+        let cause = engine.begin_action("test");
+        engine.in_scope(Some(acct.clone()), |e| {
+            e.create_obj(
+                ObjectType::BalanceTransaction,
+                "txn_foreign".to_string(),
+                &txn,
+                cause.clone(),
+                &[],
+            );
+        });
+        let at = SimTime(txn.available_on * 1000);
+        gens.platform.ctx.schedule_settlement(
+            at,
+            Some(Some(acct.clone())),
+            "txn_foreign".into(),
+            cause,
+        );
+        gens.disconnect_account(&mut engine, &acct).unwrap();
+        let events = engine.events().all().len();
+
+        gens.run_until(&mut engine, SimTime(at.0 - 1));
+        assert_eq!(status(&mut engine, &acct, "txn_foreign"), "pending");
+        gens.run_until(&mut engine, at);
+        assert_eq!(status(&mut engine, &acct, "txn_foreign"), "available");
+        assert_eq!(
+            engine.events().all().len(),
+            events,
+            "settlement emits no event"
+        );
     }
 }

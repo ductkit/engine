@@ -29,7 +29,7 @@ pub use payments::DisputeOutcome;
 
 use std::collections::BTreeMap;
 
-use crate::engine::{Cause, ChangeKind, Engine};
+use crate::engine::{Cause, ChangeKind, Engine, Scope};
 use crate::model::catalog::PriceSpec;
 use crate::model::customer::{self, apply_update, random_new_customer, random_update};
 use crate::rng::{RngStreams, SimRng};
@@ -248,7 +248,7 @@ pub(crate) struct Ctx {
     queue: BTreeMap<(SimTime, u64), (Continuation, Cause)>,
     /// Balance transactions to make available, at their `available_on`. Stripe's
     /// settlement clock, not a business action: it runs while generation is off too.
-    settlements: BTreeMap<(SimTime, u64), (String, Cause)>,
+    settlements: BTreeMap<(SimTime, u64), (Option<Scope>, String, Cause)>,
     next_seq: u64,
     lifecycle: SimRng,
     /// Draws made inside billing flows and continuations: invoice and line IDs,
@@ -266,9 +266,18 @@ impl Ctx {
         self.next_seq += 1;
     }
 
-    /// Queues the balance transaction `id` to become available at `at`.
-    pub(crate) fn schedule_settlement(&mut self, at: SimTime, id: String, cause: Cause) {
-        self.settlements.insert((at, self.next_seq), (id, cause));
+    /// Queues the balance transaction `id` to become available at `at`. `scope`
+    /// `None` is the generator's own scope; `Some(s)` is scope `s` (`Some(None)` is
+    /// the platform).
+    pub(crate) fn schedule_settlement(
+        &mut self,
+        at: SimTime,
+        scope: Option<Scope>,
+        id: String,
+        cause: Cause,
+    ) {
+        self.settlements
+            .insert((at, self.next_seq), (scope, id, cause));
         self.next_seq += 1;
     }
 
@@ -474,12 +483,14 @@ impl Generator {
     }
 
     /// Removes the queued settlements, in due order: `(available_on, balance
-    /// transaction, cause)`. A disconnected account's generator hands them on so they
-    /// still settle.
-    pub(crate) fn take_settlements(&mut self) -> Vec<(SimTime, String, Cause)> {
+    /// transaction, cause)`, each scope resolved (`own` is this generator's scope). A
+    /// disconnected account's generator hands them on so they still settle.
+    pub(crate) fn take_settlements(&mut self, own: &Scope) -> Vec<(SimTime, Scope, String, Cause)> {
         std::mem::take(&mut self.ctx.settlements)
             .into_iter()
-            .map(|((at, _), (id, cause))| (at, id, cause))
+            .map(|((at, _), (scope, id, cause))| {
+                (at, scope.unwrap_or_else(|| own.clone()), id, cause)
+            })
             .collect()
     }
 
@@ -605,11 +616,15 @@ impl Generator {
                         .all(|d| at <= d)
                         && self.ctx.next_due().is_none_or(|c| at <= c);
                 if before_others {
-                    let Some(((at, _), (id, cause))) = self.ctx.settlements.pop_first() else {
+                    let Some(((at, _), (scope, id, cause))) = self.ctx.settlements.pop_first()
+                    else {
                         unreachable!("a settlement is due");
                     };
                     engine.set_now(at);
-                    payments::make_available(engine, &id, &cause);
+                    match scope {
+                        None => payments::make_available(engine, &id, &cause),
+                        Some(s) => engine.in_scope(s, |e| payments::make_available(e, &id, &cause)),
+                    }
                     continue;
                 }
             }

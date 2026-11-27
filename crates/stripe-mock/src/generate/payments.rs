@@ -196,7 +196,12 @@ fn confirm(
             cause.clone(),
             &[],
         );
-        ctx.schedule_settlement(SimTime(txn.available_on * 1000), id.clone(), cause.clone());
+        ctx.schedule_settlement(
+            SimTime(txn.available_on * 1000),
+            None,
+            id.clone(),
+            cause.clone(),
+        );
         id
     });
     let ch = new_charge(&NewCharge {
