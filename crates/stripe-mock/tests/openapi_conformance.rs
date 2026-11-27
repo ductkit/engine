@@ -7,7 +7,7 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use common::{Receiver, assert_conforms, mock_with};
+use common::{Receiver, assert_conforms, expected_sweeps, mock_with};
 use ductkit_stripe_mock::stripe::{check_payload, schema_fields};
 use ductkit_stripe_mock::{ChangeKind, MockStripe, ObjectType, StateUpdate, expand_paths};
 use serde_json::Value;
@@ -1206,58 +1206,6 @@ async fn payment_objects_are_consistent() {
     ] {
         assert!(n > 5, "only {n} {what}");
     }
-}
-
-/// Recomputes, from the truth log alone, which balance transactions each payout swept: in
-/// its scope and currency, `available` when the payout was created, not of type `payout`,
-/// and not swept by an earlier payout (spec section 5.5). Payout ID to (scope, members).
-fn expected_sweeps(log: &[StateUpdate]) -> BTreeMap<String, (Option<String>, Vec<String>)> {
-    // Per scope: balance transaction ID to (currency, type, status), and creation order.
-    type BtInfo = (String, String, String);
-    let mut bts: BTreeMap<Option<String>, BTreeMap<String, BtInfo>> = BTreeMap::new();
-    let mut order: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
-    let mut swept: BTreeSet<(Option<String>, String)> = BTreeSet::new();
-    let mut out = BTreeMap::new();
-    for u in log {
-        match u.object_type {
-            ObjectType::BalanceTransaction => {
-                let s = &u.state;
-                let entry = (
-                    s["currency"].as_str().unwrap().to_string(),
-                    s["type"].as_str().unwrap().to_string(),
-                    s["status"].as_str().unwrap().to_string(),
-                );
-                let scope = bts.entry(u.account.clone()).or_default();
-                if scope.insert(u.object_id.clone(), entry).is_none() {
-                    order
-                        .entry(u.account.clone())
-                        .or_default()
-                        .push(u.object_id.clone());
-                }
-            }
-            ObjectType::Payout if u.version == 1 => {
-                let currency = u.state["currency"].as_str().unwrap();
-                let scope = &bts[&u.account];
-                let members: Vec<String> = order[&u.account]
-                    .iter()
-                    .filter(|id| {
-                        let (c, t, s) = &scope[*id];
-                        c == currency
-                            && t != "payout"
-                            && s == "available"
-                            && !swept.contains(&(u.account.clone(), (*id).clone()))
-                    })
-                    .cloned()
-                    .collect();
-                for id in &members {
-                    swept.insert((u.account.clone(), id.clone()));
-                }
-                out.insert(u.object_id.clone(), (u.account.clone(), members));
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 /// Every balance transaction `GET /v1/balance_transactions?payout=` lists in `scope`.
