@@ -179,15 +179,15 @@ Endpoints: retrieve and list for each type, plus the sub-lists above. `balance_t
 | `transfer_reversal` | `trr_` | none | child |
 | `application_fee` | `fee_` | **refund** | `fee_refund` children (`/v1/application_fees/{id}/refunds`); lives in the platform scope, describes connected-account charges |
 | `fee_refund` | `fr_` | none | child |
-| `payout` | `po_` | `canceled` / `failed` | own lifecycle (`pending → in_transit → paid`); creates balance transactions; runs on connected accounts too |
-| external account: `bank_account`, `card` | `ba_`, `card_` | **hard delete** | polymorphic list (`/v1/accounts/{id}/external_accounts`); `account.external_account.*` events |
+| `payout` | `po_` | `failed` (as built, ruling P5: `canceled` is not generated, as Stripe cancels only manual payouts) | own lifecycle (`pending → in_transit → paid`); creates balance transactions; runs on connected accounts too |
+| external account: `bank_account`, `card` | `ba_`, `card_` | **hard delete** | polymorphic list (`/v1/accounts/{id}/external_accounts`); `account.external_account.*` events; as built, only on accounts the platform controls (ruling P4) |
 | `person` | `person_` | **hard delete** | sub-list only (`/v1/accounts/{id}/persons`); `person.*` events; changes `account.requirements` |
 
 **Connect charge patterns** (decided by the user: patterns apply to platform payments).
 - **Connected accounts keep direct charges.** Each connected account's generator keeps creating its own customers, invoices and payments in its own scope, which is a direct charge by construction. New config `accounts.application_fee = { probability, percent }` (default `{ probability = 0.0, percent = 10.0 }`) sets how often such a charge carries an `application_fee`, which lives on the platform.
 - **The platform's own payments can route money to a connected account.** New config `accounts.platform_payments = { own, destination, separate }` is a mix that sums to 1 and defaults to `{ own = 1.0 }`. For each platform payment (invoice payment, `one_off_payment` and `checkout` alike), a pattern is drawn, and for a non-`own` pattern a random connected account is drawn as the recipient:
   - **own:** a plain platform charge, as without Connect.
-  - **destination:** the charge carries `transfer_data.destination`. A `transfer` goes to the account, and a `py_` payment with its balance transaction lands in the account's scope.
+  - **destination:** the charge carries `transfer_data.destination`. A `transfer` goes to the account, and a `py_` payment with its balance transaction lands in the account's scope. As built, the `py_` payment is never refunded or disputed on its own: its money comes back only through a reversal of the transfer (a `pyr_` refund).
   - **separate:** the charge carries a `transfer_group`. Later, after a drawn delay, an independent `transfer` with the same group goes to the account.
 - **Symmetry holds.** Platform and connected accounts keep identical coverage of business actions. The only scope-specific objects are the transfers and `py_` payments caused by platform payments, and the application fees caused by connected-account charges.
 - **With `connect = false`,** `platform_payments` other than `{ own = 1.0 }` and `application_fee.probability > 0` are config errors.
@@ -195,7 +195,7 @@ Endpoints: retrieve and list for each type, plus the sub-lists above. `balance_t
 
 Each pattern's objects land in the right scope, and events go to the right destinations (spec section 5.4 rules unchanged).
 
-New actions: `payout` (a natural daily schedule per account, like `renew_subscription_cycle = "natural"`), `transfer_reversal`, `application_fee_refund`, `[churn.person] update/delete` and `[churn.external_account] create/delete`.
+New actions: `payout` (a natural daily schedule per account; as built, the mode `actions.payout = "off" | "daily"`, ruling P5), `transfer_reversal`, `application_fee_refund`, `[churn.person] update/delete` and `[churn.external_account] create/delete`.
 
 **Group 3: billing extras (phase 9)**
 

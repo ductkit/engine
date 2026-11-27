@@ -533,11 +533,19 @@ pub(crate) fn make_available(engine: &mut Engine, id: &str, cause: &Cause) {
     }
 }
 
-/// What is left to refund on `charge`: `None` unless it `succeeded` with something left
-/// and no chargeback blocks it (a dispute with `is_charge_refundable: false`).
+/// Whether `state` is a `py_` payment: a transfer's payment into its destination account.
+/// Its money comes back only by reversing the transfer, which refunds it with a `pyr_`; it
+/// is never refunded or disputed on its own.
+fn is_destination_payment(state: &serde_json::Value) -> bool {
+    state["source_transfer"].is_string()
+}
+
+/// What is left to refund on `charge`: `None` unless it `succeeded` with something left,
+/// is not a `py_` payment, and no chargeback blocks it (a dispute with
+/// `is_charge_refundable: false`).
 fn refundable(engine: &Engine, charge: &str) -> Option<i64> {
     let c = engine.latest(ObjectType::Charge, charge)?;
-    if c.state["status"] != "succeeded" {
+    if c.state["status"] != "succeeded" || is_destination_payment(&c.state) {
         return None;
     }
     if c.state["disputed"] == true {
@@ -775,8 +783,8 @@ pub(crate) fn refund_action(
             }
             let Some(left) = refundable(engine, &id) else {
                 return Err(MockError::InvalidAction(format!(
-                    "charge {id} cannot be refunded: it did not succeed, is fully refunded or \
-                     has a chargeback"
+                    "charge {id} cannot be refunded: it did not succeed, is fully refunded, \
+                     has a chargeback or is a destination payment (reverse its transfer)"
                 )));
             };
             (id, left)
@@ -841,11 +849,13 @@ const REVIEW_AFTER_MS: (i64, i64) = (2 * DAY_MS, 7 * DAY_MS);
 const CLOSE_AFTER_MS: (i64, i64) = (7 * DAY_MS, 60 * DAY_MS);
 
 /// Whether `charge` can be disputed: it `succeeded`, has a non-zero amount, nothing
-/// refunded and no dispute yet.
+/// refunded and no dispute yet, and is not a `py_` payment (paid from the platform's
+/// Stripe balance, not by a card).
 fn disputable(engine: &Engine, charge: &str) -> bool {
     engine.latest(ObjectType::Charge, charge).is_some_and(|c| {
         let s = &c.state;
         s["status"] == "succeeded"
+            && !is_destination_payment(s)
             && s["amount"].as_i64().is_some_and(|a| a > 0)
             && s["amount_refunded"] == 0
             && s["disputed"] == false
@@ -1016,8 +1026,8 @@ pub(crate) fn dispute_action(
             }
             if !disputable(engine, &id) {
                 return Err(MockError::InvalidAction(format!(
-                    "charge {id} cannot be disputed: it did not succeed, is refunded or is \
-                     already disputed"
+                    "charge {id} cannot be disputed: it did not succeed, is refunded, is \
+                     already disputed or is a destination payment (reverse its transfer)"
                 )));
             }
             id

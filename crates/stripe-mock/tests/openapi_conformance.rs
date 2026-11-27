@@ -12,29 +12,39 @@ use ductkit_stripe_mock::stripe::{check_payload, schema_fields};
 use ductkit_stripe_mock::{ChangeKind, MockStripe, ObjectType, StateUpdate, expand_paths};
 use serde_json::Value;
 
-/// Every action and churn rate above zero, the new phase-7 ones included. Rates are low so
-/// that 30 days of history in four scopes stay quick to serve and check in a debug build.
+/// Every action and churn rate above zero, the phase-7 and phase-8 ones included, with daily
+/// payouts of which a fifth fail. Rates are low so that 30 days of history in four scopes
+/// stay quick to serve and check in a debug build.
 const BUSY_RATES: &str = "[actions]\n\
     new_customer = 0.4\nstart_subscription = 0.15\ncancel_subscription = 0.03\n\
     catalog_change = 0.05\none_off_invoice = 0.1\none_off_payment = 0.3\nrefund = 0.05\n\
     dispute = 0.04\nsave_payment_method = 0.1\ncheckout = 0.15\n\
+    application_fee_refund = 0.05\ntransfer_reversal = 0.05\n\
     payment_failure_probability = 0.3\n\
+    payout = \"daily\"\npayout_failure_probability = 0.2\n\
     [churn.customer]\nupdate = 0.1\ndelete = 0.02\n\
     [churn.product]\nupdate = 0.02\narchive = 0.01\n\
     [churn.price]\nupdate = 0.02\narchive = 0.01\n\
     [churn.subscription]\nupdate = 0.05\n\
     [churn.invoice]\nupdate = 0.05\n\
     [churn.account]\nupdate = 0.02\n\
-    [churn.payment_method]\ndetach = 0.02\n";
+    [churn.payment_method]\ndetach = 0.02\n\
+    [churn.person]\nupdate = 0.02\ndelete = 0.005\n\
+    [churn.external_account]\ncreate = 0.02\ndelete = 0.01\n";
 
 /// The busy run's config: seed 7, three initial connected accounts (half v1, half v2),
-/// 30 days of history, one snapshot and one thin destination taking every event.
+/// every Connect charge pattern, application fees on half the connected accounts'
+/// payments, 30 days of history, one snapshot and one thin destination taking every event.
+/// Accounts disconnect slowly enough that controlled ones stay connected, so their external
+/// accounts and persons are reachable.
 fn busy_config(snap: &str, thin: &str) -> String {
     format!(
         "seed = 7\n\
          [accounts]\nconnect = true\n\
-         connected_accounts = {{ initial = 3, connect_rate = 0.004, deauthorize_rate = 0.002 }}\n\
+         connected_accounts = {{ initial = 3, connect_rate = 0.004, deauthorize_rate = 0.001 }}\n\
          account_api = {{ v1 = 0.5, v2 = 0.5 }}\n\
+         platform_payments = {{ own = 0.4, destination = 0.3, separate = 0.3 }}\n\
+         application_fee = {{ probability = 0.5, percent = 10.0 }}\n\
          [history]\nduration = \"30d\"\n\
          {BUSY_RATES}\
          [[destinations]]\nname = \"snap\"\nurl = \"{snap}\"\npayload = \"snapshot\"\n\
@@ -52,12 +62,18 @@ async fn busy_run(snap: &Receiver, thin: &Receiver) -> MockStripe {
     m
 }
 
-/// What the served payloads showed: how often each `object` appeared, and each
-/// `(object, status)` pair, nested objects included.
+/// The boolean fields whose `true` [`Served`] records: a fully reversed transfer, a fully
+/// refunded charge or application fee.
+const FLAGS: [&str; 2] = ["reversed", "refunded"];
+
+/// What the served payloads showed: how often each `object` appeared, each
+/// `(object, status)` pair and each `(object, flag)` seen `true` ([`FLAGS`]), nested
+/// objects included.
 #[derive(Default)]
 struct Served {
     objects: BTreeMap<String, usize>,
     statuses: BTreeSet<(String, String)>,
+    flags: BTreeSet<(String, String)>,
 }
 
 impl Served {
@@ -68,6 +84,11 @@ impl Served {
                     *self.objects.entry(object.clone()).or_default() += 1;
                     if let Some(Value::String(status)) = o.get("status") {
                         self.statuses.insert((object.clone(), status.clone()));
+                    }
+                    for flag in FLAGS {
+                        if o.get(flag) == Some(&Value::Bool(true)) {
+                            self.flags.insert((object.clone(), flag.to_string()));
+                        }
                     }
                 }
                 o.values().for_each(|c| self.record(c));
@@ -197,12 +218,29 @@ fn id_of(v: &Value) -> String {
 }
 
 /// The latest truth-log entry of every object, keyed by `(scope, type, id)`.
-fn latest(m: &MockStripe) -> BTreeMap<(Option<String>, ObjectType, String), StateUpdate> {
+type Truth = BTreeMap<(Option<String>, ObjectType, String), StateUpdate>;
+
+/// The truth state at the end of the truth log.
+fn latest(m: &MockStripe) -> Truth {
     let mut out = BTreeMap::new();
     for u in m.truth_log() {
         out.insert((u.account.clone(), u.object_type, u.object_id.clone()), u);
     }
     out
+}
+
+/// The live objects of type `t` in `scope`, by ID.
+fn live_in<'a>(
+    truth: &'a Truth,
+    scope: &'a Option<String>,
+    t: ObjectType,
+) -> impl Iterator<Item = (&'a String, &'a Value)> + 'a {
+    truth
+        .iter()
+        .filter(move |((acct, ty, _), u)| {
+            acct == scope && *ty == t && u.kind != ChangeKind::Deleted
+        })
+        .map(|((_, _, id), u)| (id, &u.state))
 }
 
 /// The top-level list paths of a scope (no parent filter needed).
@@ -220,6 +258,9 @@ const LISTS: &[&str] = &[
     "/v1/setup_intents",
     "/v1/checkout/sessions",
     "/v1/invoice_payments",
+    "/v1/transfers",
+    "/v1/application_fees",
+    "/v1/payouts",
 ];
 
 /// The value at a dotted `path` of `v`, stepping into the first item of a `data` array.
@@ -236,13 +277,47 @@ fn at_path<'a>(v: &'a Value, path: &str) -> &'a Value {
     cur
 }
 
-/// Lists, retrieves, expansions and events of one scope (`None`: the platform).
+/// Where an object of `t` in `scope` is retrieved: its path, and the scope the request
+/// names. A transfer reversal or fee refund nests under its parent; an external account or
+/// person lives in its account's scope but is retrieved by the platform under
+/// `/v1/accounts/{acct}/…` (account endpoints refuse a `Stripe-Account` header). `None`
+/// for line items.
+fn retrieve_at(
+    t: ObjectType,
+    id: &str,
+    state: &Value,
+    scope: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    if let Some(path) = t.api_path(id) {
+        return Some((path, scope.map(String::from)));
+    }
+    let parent = match t {
+        ObjectType::TransferReversal => state["transfer"].as_str()?,
+        ObjectType::FeeRefund => state["fee"].as_str()?,
+        ObjectType::BankAccount | ObjectType::Card | ObjectType::Person => {
+            return Some((t.sub_path(scope?, id)?, None));
+        }
+        _ => return None,
+    };
+    Some((t.sub_path(parent, id)?, scope.map(String::from)))
+}
+
+/// What `check_scope` needs beyond the scope: the truth state, and the accounts still
+/// connected (a disconnected account's objects are out of reach of cross-scope expansion).
+struct Ctx<'a> {
+    truth: &'a Truth,
+    connected: BTreeSet<String>,
+}
+
+/// Lists, sub-lists, retrieves, expansions and events of one scope (`None`: the platform).
 async fn check_scope(
     m: &MockStripe,
     served: &mut Served,
-    truth: &BTreeMap<(Option<String>, ObjectType, String), StateUpdate>,
+    ctx: &Ctx<'_>,
     scope: Option<&str>,
 ) -> BTreeSet<(ObjectType, &'static str)> {
+    let truth = ctx.truth;
+    let owner = scope.map(String::from);
     let mut expanded = BTreeSet::new();
     let mut listed: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
     for path in LISTS {
@@ -285,9 +360,67 @@ async fn check_scope(
         .await;
     }
 
-    // Every object by ID: live ones, and a deleted customer's stub.
-    let owner = scope.map(String::from);
-    let mut paths = Vec::new();
+    // Every child type through its parent's sub-list: together the sub-lists hold exactly
+    // the scope's live children of that type.
+    let mut children: BTreeMap<ObjectType, BTreeSet<String>> = BTreeMap::new();
+    for (list, sub, t) in [
+        ("/v1/transfers", "reversals", ObjectType::TransferReversal),
+        ("/v1/application_fees", "refunds", ObjectType::FeeRefund),
+    ] {
+        for parent in &listed[list] {
+            let path = format!("{list}/{}/{sub}", id_of(parent));
+            for o in walk_v1(m, served, &path, scope).await {
+                assert!(
+                    children.entry(t).or_default().insert(id_of(&o)),
+                    "{path}: {} listed twice",
+                    o["id"]
+                );
+            }
+        }
+    }
+    // An account's external accounts and persons, listed by the platform.
+    if let Some(acct) = scope {
+        for (sub, types) in [
+            (
+                "external_accounts",
+                &[ObjectType::BankAccount, ObjectType::Card][..],
+            ),
+            ("persons", &[ObjectType::Person][..]),
+        ] {
+            let path = format!("/v1/accounts/{acct}/{sub}");
+            for o in walk_v1(m, served, &path, None).await {
+                let t = *types
+                    .iter()
+                    .find(|t| o["object"] == t.as_str())
+                    .unwrap_or_else(|| panic!("{path}: {}", o["object"]));
+                assert!(
+                    children.entry(t).or_default().insert(id_of(&o)),
+                    "{path}: {} listed twice",
+                    o["id"]
+                );
+            }
+        }
+    }
+    for t in [
+        ObjectType::TransferReversal,
+        ObjectType::FeeRefund,
+        ObjectType::BankAccount,
+        ObjectType::Card,
+        ObjectType::Person,
+    ] {
+        let want: BTreeSet<String> = live_in(truth, &owner, t)
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(
+            children.remove(&t).unwrap_or_default(),
+            want,
+            "{t:?} sub-lists in {scope:?}"
+        );
+    }
+
+    // Every object by ID, children through `sub_path`: live ones, and a deleted customer's
+    // stub.
+    let (mut paths, mut platform_paths) = (Vec::new(), Vec::new());
     for ((acct, t, id), u) in truth.range((owner.clone(), ObjectType::Customer, String::new())..) {
         if *acct != owner {
             break;
@@ -297,14 +430,17 @@ async fn check_scope(
         {
             continue;
         }
-        if let Some(path) = t.api_path(id) {
-            paths.push(path);
+        match retrieve_at(*t, id, &u.state, scope) {
+            Some((path, None)) if scope.is_some() => platform_paths.push(path),
+            Some((path, _)) => paths.push(path),
+            None => {}
         }
     }
     fetch_all(m, served, paths, scope).await;
+    fetch_all(m, served, platform_paths, None).await;
 
     // Every allowed expand path, once per type, on an object where the path leads somewhere;
-    // the list form too, on the lists that need no parent.
+    // the list form too, on the lists and sub-lists.
     for ((acct, t, id), u) in truth.range((owner.clone(), ObjectType::Customer, String::new())..) {
         if *acct != owner {
             break;
@@ -313,26 +449,33 @@ async fn check_scope(
             continue;
         }
         for path in expand_paths(*t) {
-            if !expands(*t, &u.state, path) || expanded.contains(&(*t, *path)) {
+            if !expands(ctx, &owner, *t, &u.state, path) || expanded.contains(&(*t, *path)) {
                 continue;
             }
-            let base = t.api_path(id).unwrap();
-            let v = fetch(m, served, &format!("{base}?expand[]={path}"), scope).await;
-            assert!(
-                at_path(&v, path).is_object(),
-                "{base} expand {path}: {}",
-                at_path(&v, path)
-            );
-            if let Some(list) = LISTS
+            let (base, at) = retrieve_at(*t, id, &u.state, scope).unwrap();
+            let v = fetch(m, served, &format!("{base}?expand[]={path}"), at.as_deref()).await;
+            let got = at_path(&v, path);
+            assert!(got.is_object(), "{base} expand {path}: {got}");
+            // An ID expands to the object it names, from whichever scope holds it (P2).
+            if let Some(want) = id_at(&u.state, path) {
+                assert_eq!(got["id"], want, "{base} expand {path}");
+            }
+            let collection = base.rsplit_once('/').map(|(c, _)| c).unwrap();
+            let list = match LISTS
                 .iter()
-                .find(|l| l.split('?').next() == base.rsplit_once('/').map(|(c, _)| c))
+                .find(|l| l.split('?').next() == Some(collection))
             {
+                Some(l) => Some(l.to_string()),
+                None if t.api_path(id).is_none() => Some(collection.to_string()),
+                None => None,
+            };
+            if let Some(list) = list {
                 let sep = if list.contains('?') { '&' } else { '?' };
                 fetch(
                     m,
                     served,
                     &format!("{list}{sep}limit=3&expand[]=data.{path}"),
-                    scope,
+                    at.as_deref(),
                 )
                 .await;
             }
@@ -352,35 +495,80 @@ const INCLUDABLE: [(ObjectType, &str); 2] = [
     (ObjectType::Invoice, "payments"),
 ];
 
-/// Whether expanding `path` on a `t` in `state` serves an object: an includable list, or
-/// a field holding an ID.
-fn expands(t: ObjectType, state: &Value, path: &str) -> bool {
-    INCLUDABLE.contains(&(t, path)) || names_an_id(state, path)
-}
-
-/// Whether the field `path` names in `state` holds an ID, so expanding it serves an object.
-fn names_an_id(state: &Value, path: &str) -> bool {
+/// The ID the field `path` names in `state`, if it holds one.
+fn id_at<'a>(state: &'a Value, path: &str) -> Option<&'a str> {
     let (parent, target) = path.rsplit_once('.').unwrap_or(("", path));
     let holder = if parent.is_empty() {
         state
     } else {
         at_path(state, parent)
     };
-    holder[target].is_string()
+    holder[target].as_str()
+}
+
+/// The scope the object at `path` of `t`'s `state` (in `scope`) lives in: the cross-scope
+/// paths of phase 8 ruling P2, else the object's own scope. `None` is the platform.
+fn target_scope(
+    truth: &Truth,
+    scope: &Option<String>,
+    t: ObjectType,
+    state: &Value,
+    path: &str,
+) -> Option<String> {
+    let account = |v: &Value| v.as_str().map(String::from);
+    match (t, path) {
+        (ObjectType::Transfer, "destination_payment") => account(&state["destination"]),
+        (ObjectType::TransferReversal, "destination_payment_refund") => {
+            let transfer = state["transfer"].as_str().unwrap().to_string();
+            account(&truth[&(scope.clone(), ObjectType::Transfer, transfer)].state["destination"])
+        }
+        (ObjectType::ApplicationFee, "charge") => account(&state["account"]),
+        (ObjectType::Charge, "application_fee" | "source_transfer")
+        | (ObjectType::Refund, "source_transfer_reversal")
+        | (ObjectType::BankAccount | ObjectType::Card, "account") => None,
+        _ => scope.clone(),
+    }
+}
+
+/// Whether expanding `path` on a `t` in `state` (in `scope`) serves an object: an includable
+/// list, or a field holding an ID whose scope is in reach (a disconnected account's objects
+/// stay IDs). A payout's `destination` expands only where a store holds that bank account:
+/// the platform's and Standard accounts' payouts name one no store holds (P4).
+fn expands(ctx: &Ctx, scope: &Option<String>, t: ObjectType, state: &Value, path: &str) -> bool {
+    if INCLUDABLE.contains(&(t, path)) {
+        return true;
+    }
+    let Some(id) = id_at(state, path) else {
+        return false;
+    };
+    // A disconnected account stays its ID, wherever it is named.
+    if id.starts_with("acct_") && !ctx.connected.contains(id) {
+        return false;
+    }
+    let target = target_scope(ctx.truth, scope, t, state, path);
+    if let Some(acct) = &target
+        && !ctx.connected.contains(acct)
+    {
+        return false;
+    }
+    if (t, path) == (ObjectType::Payout, "destination") {
+        return ctx
+            .truth
+            .get(&(target, ObjectType::BankAccount, id.to_string()))
+            .is_some_and(|u| u.kind != ChangeKind::Deleted);
+    }
+    true
 }
 
 /// The `(type, path)` pairs of `scope` that some live object can expand.
-fn expandable_in(
-    truth: &BTreeMap<(Option<String>, ObjectType, String), StateUpdate>,
-    scope: &Option<String>,
-) -> BTreeSet<(ObjectType, &'static str)> {
-    truth
+fn expandable_in(ctx: &Ctx, scope: &Option<String>) -> BTreeSet<(ObjectType, &'static str)> {
+    ctx.truth
         .iter()
         .filter(|((acct, _, _), u)| acct == scope && u.kind != ChangeKind::Deleted)
         .flat_map(|((_, t, _), u)| {
             expand_paths(*t)
                 .iter()
-                .filter(|p| expands(*t, &u.state, p))
+                .filter(|p| expands(ctx, scope, *t, &u.state, p))
                 .map(|p| (*t, *p))
         })
         .collect()
@@ -432,9 +620,13 @@ async fn busy_connect_run_conforms() {
             .filter(|a| a.connected)
             .map(|a| Some(a.id.clone())),
     );
+    let ctx = Ctx {
+        truth: &truth,
+        connected: scopes.iter().flatten().cloned().collect(),
+    };
     let mut expanded = BTreeMap::new();
     for scope in &scopes {
-        let done = check_scope(&m, &mut served, &truth, scope.as_deref()).await;
+        let done = check_scope(&m, &mut served, &ctx, scope.as_deref()).await;
         expanded.insert(scope.clone(), done);
     }
 
@@ -449,10 +641,8 @@ async fn busy_connect_run_conforms() {
         served.record(&v);
     }
 
-    for t in ObjectType::ALL
-        .into_iter()
-        .filter(|t| !NOT_YET_GENERATED.contains(t))
-    {
+    assert_eq!(ObjectType::ALL.len(), 25);
+    for t in ObjectType::ALL {
         assert!(
             served.objects.contains_key(t.as_str()),
             "{t:?} never served; served: {:?}",
@@ -473,6 +663,10 @@ async fn busy_connect_run_conforms() {
         ("checkout.session", "expired"),
         ("balance_transaction", "pending"),
         ("balance_transaction", "available"),
+        ("payout", "pending"),
+        ("payout", "in_transit"),
+        ("payout", "paid"),
+        ("payout", "failed"),
     ];
     for (object, status) in want {
         assert!(
@@ -491,13 +685,28 @@ async fn busy_connect_run_conforms() {
         "no closed dispute served: {:?}",
         served.statuses
     );
-    // Each scope expanded every path it holds an object for. On the platform that is every
-    // allowed path, except those whose field the mock never sets.
+    for (object, flag) in [("transfer", "reversed"), ("application_fee", "refunded")] {
+        assert!(
+            served
+                .flags
+                .contains(&(object.to_string(), flag.to_string())),
+            "no {object} with {flag}: true served; served: {:?}",
+            served.flags
+        );
+    }
+    // External accounts of both objects.
+    for object in ["bank_account", "card"] {
+        assert!(
+            served.objects.get(object).is_some_and(|n| *n > 0),
+            "{object}"
+        );
+    }
+
+    // Each scope expanded every path it holds an object for.
     for scope in &scopes {
-        assert_eq!(expanded[scope], expandable_in(&truth, scope), "{scope:?}");
+        assert_eq!(expanded[scope], expandable_in(&ctx, scope), "{scope:?}");
         assert!(!expanded[scope].is_empty(), "{scope:?} expanded nothing");
     }
-    let platform = &expanded[&None];
     let never_set = [
         // The mock sets no default payment method on subscriptions, invoices or customers:
         // payments use the customer's newest attached card.
@@ -512,24 +721,48 @@ async fn busy_connect_run_conforms() {
         (ObjectType::Refund, "failure_balance_transaction"),
         // Checkout sessions run in payment or subscription mode, never setup mode.
         (ObjectType::CheckoutSession, "setup_intent"),
-        // Nothing sets these until the Connect money generators land (phase 8, tasks 3 to
-        // 8; task 9 removes these entries).
-        (ObjectType::Charge, "transfer"),
+        // Only a refund of a destination charge that reverses its transfer sets these; the
+        // mock's refunds never reverse a transfer (reversals are their own action).
+        (ObjectType::Refund, "transfer_reversal"),
+        (ObjectType::TransferReversal, "source_refund"),
+        // Only for fees taken outside a charge (`originating_transaction` stays `null`).
+        (ObjectType::ApplicationFee, "originating_transaction"),
+        // Payout fees, reversals of payouts and instant payouts are not generated (P5).
+        (ObjectType::Payout, "application_fee"),
+        (ObjectType::Payout, "original_payout"),
+        (ObjectType::Payout, "reversed_by"),
+        // An account's external account belongs to no customer.
+        (ObjectType::BankAccount, "customer"),
+        (ObjectType::Card, "customer"),
+    ];
+    // Paths whose objects live only in connected accounts: direct charges' fees, `py_`
+    // payments and `pyr_` refunds, external accounts, and the controlled accounts' payout
+    // destinations (the platform's name a bank account no store holds, P4).
+    let accounts_only = [
         (ObjectType::Charge, "application_fee"),
         (ObjectType::Charge, "source_transfer"),
-        (ObjectType::Charge, "transfer_data.destination"),
         (ObjectType::Refund, "source_transfer_reversal"),
-        (ObjectType::Refund, "transfer_reversal"),
+        (ObjectType::BankAccount, "account"),
+        (ObjectType::Card, "account"),
+        (ObjectType::Payout, "destination"),
     ];
-    for t in ObjectType::ALL
-        .into_iter()
-        .filter(|t| !NOT_YET_GENERATED.contains(t))
-    {
+    // On the platform that is every allowed path, except those whose field the mock never
+    // sets and those that only connected accounts hold; across scopes, every path but the
+    // never-set ones.
+    let platform = &expanded[&None];
+    let anywhere: BTreeSet<(ObjectType, &str)> = expanded.values().flatten().copied().collect();
+    for t in ObjectType::ALL {
         for path in expand_paths(t) {
+            let pair = (t, *path);
             assert_eq!(
-                platform.contains(&(t, *path)),
-                !never_set.contains(&(t, *path)),
-                "{t:?} expand {path}"
+                platform.contains(&pair),
+                !never_set.contains(&pair) && !accounts_only.contains(&pair),
+                "{t:?} expand {path} on the platform"
+            );
+            assert_eq!(
+                anywhere.contains(&pair),
+                !never_set.contains(&pair),
+                "{t:?} expand {path} in any scope"
             );
         }
     }
@@ -561,8 +794,6 @@ fn excluded(t: ObjectType, o: &Value) -> Vec<&'static str> {
             "radar_options",
             // Includable-only: served with `expand[]=refunds`.
             "refunds",
-            // Destination charges only (the field's own description): phase 8.
-            "transfer",
         ],
         ObjectType::CheckoutSession => vec![
             // Only when the session was created with it (Ruling, Task 12).
@@ -652,8 +883,9 @@ fn excluded(t: ObjectType, o: &Value) -> Vec<&'static str> {
         | ObjectType::Dispute
         | ObjectType::BalanceTransaction
         | ObjectType::InvoicePayment
-        // Nothing generates the Connect money objects yet (phase 8, tasks 3 to 8), so
-        // there is nothing to skip.
+        // Phase 8: every documented field is present (a value or `null`) on each, so none
+        // is excluded. `application_fee.refunds` and `transfer.reversals` are required
+        // embedded lists, not includable ones.
         | ObjectType::Transfer
         | ObjectType::TransferReversal
         | ObjectType::ApplicationFee
@@ -668,21 +900,19 @@ fn excluded(t: ObjectType, o: &Value) -> Vec<&'static str> {
     if t == ObjectType::Account && o["controller"]["is_controller"] != true {
         out.push("external_accounts");
     }
+    // Destination charges only (the field's own description): not on the platform's own
+    // or separate charges, direct charges or `py_` payments. Not nullable, so absent too on
+    // a destination charge that moved no money: a failed one (P7).
+    if t == ObjectType::Charge && (o["transfer_data"].is_null() || o["status"] != "succeeded") {
+        out.push("transfer");
+    }
+    // A `pyr_` refunds a `py_` payment, paid from the platform's Stripe balance: the
+    // per-method `destination_details` has no type for that, and is not nullable.
+    if t == ObjectType::Refund && o["id"].as_str().is_some_and(|id| id.starts_with("pyr_")) {
+        out.push("destination_details");
+    }
     out
 }
-
-/// Connect money types that no generator creates yet (phase 8, tasks 3 to 8 add them, and
-/// task 9 drops this list).
-const NOT_YET_GENERATED: [ObjectType; 8] = [
-    ObjectType::Transfer,
-    ObjectType::TransferReversal,
-    ObjectType::ApplicationFee,
-    ObjectType::FeeRefund,
-    ObjectType::Payout,
-    ObjectType::BankAccount,
-    ObjectType::Card,
-    ObjectType::Person,
-];
 
 /// A payment method carries the hash of its own `type` only (`card` for the mock's cards).
 const PAYMENT_METHOD_TYPE_HASHES: &[&str] = &[
@@ -746,92 +976,144 @@ const PAYMENT_METHOD_TYPE_HASHES: &[&str] = &[
     "zip",
 ];
 
+/// The first page (up to 100) of `path` in `scope`, each object filed under its type.
+async fn first_page(
+    m: &MockStripe,
+    served: &mut Served,
+    objects: &mut BTreeMap<ObjectType, Vec<Value>>,
+    path: &str,
+    scope: Option<&str>,
+) -> Vec<Value> {
+    let sep = if path.contains('?') { '&' } else { '?' };
+    let page = fetch(m, served, &format!("{path}{sep}limit=100"), scope).await;
+    let data = page["data"].as_array().unwrap().clone();
+    for o in &data {
+        let t = ObjectType::ALL
+            .into_iter()
+            .find(|t| o["object"] == t.as_str())
+            .unwrap_or_else(|| panic!("unknown object {}", o["object"]));
+        objects.entry(t).or_default().push(o.clone());
+    }
+    data
+}
+
 #[tokio::test]
 async fn served_objects_carry_their_documented_fields() {
     let m = mock_with(
         "seed = 7\n\
          [accounts]\nconnect = true\nconnected_accounts = { initial = 6 }\n\
+         platform_payments = { own = 0.4, destination = 0.3, separate = 0.3 }\n\
+         application_fee = { probability = 0.5, percent = 10.0 }\n\
          [actions]\nnew_customer = 6.0\nstart_subscription = 3.0\ncatalog_change = 0.5\n\
          one_off_invoice = 2.0\none_off_payment = 6.0\nrefund = 2.0\ndispute = 1.0\n\
-         save_payment_method = 2.0\ncheckout = 3.0\npayment_failure_probability = 0.3\n",
+         save_payment_method = 2.0\ncheckout = 3.0\npayment_failure_probability = 0.3\n\
+         application_fee_refund = 2.0\ntransfer_reversal = 2.0\n\
+         payout = \"daily\"\npayout_failure_probability = 0.3\n\
+         [churn.person]\nupdate = 0.5\n\
+         [churn.external_account]\ncreate = 0.5\n",
     )
     .await;
-    m.step(Duration::from_secs(86_400)).await.unwrap();
+    // Past the first payouts' arrival, so paid and failed ones are served too.
+    m.step(Duration::from_secs(3 * 86_400)).await.unwrap();
     m.quiesce().await.unwrap();
     let mut served = Served::default();
     let mut objects: BTreeMap<ObjectType, Vec<Value>> = BTreeMap::new();
     for path in LISTS {
-        let page = fetch(
-            &m,
-            &mut served,
-            &format!(
-                "{path}{}limit=100",
-                if path.contains('?') { '&' } else { '?' }
-            ),
-            None,
-        )
-        .await;
-        for o in page["data"].as_array().unwrap() {
-            let t = ObjectType::ALL
-                .into_iter()
-                .find(|t| o["object"] == t.as_str())
-                .unwrap();
-            objects.entry(t).or_default().push(o.clone());
-        }
+        first_page(&m, &mut served, &mut objects, path, None).await;
     }
     let subs = objects[&ObjectType::Subscription].clone();
     for s in subs.iter().take(5) {
-        let page = fetch(
-            &m,
-            &mut served,
-            &format!("/v1/subscription_items?subscription={}", id_of(s)),
-            None,
-        )
-        .await;
-        objects
-            .entry(ObjectType::SubscriptionItem)
-            .or_default()
-            .extend(page["data"].as_array().unwrap().iter().cloned());
+        let path = format!("/v1/subscription_items?subscription={}", id_of(s));
+        first_page(&m, &mut served, &mut objects, &path, None).await;
     }
     let invoices = objects[&ObjectType::Invoice].clone();
     for i in invoices.iter().take(5) {
-        let page = fetch(
-            &m,
-            &mut served,
-            &format!("/v1/invoices/{}/lines", id_of(i)),
-            None,
-        )
-        .await;
-        objects
-            .entry(ObjectType::InvoiceLineItem)
-            .or_default()
-            .extend(page["data"].as_array().unwrap().iter().cloned());
+        let path = format!("/v1/invoices/{}/lines", id_of(i));
+        first_page(&m, &mut served, &mut objects, &path, None).await;
     }
     let customers = objects[&ObjectType::Customer].clone();
     for c in &customers {
-        let page = fetch(
+        let path = format!("/v1/customers/{}/payment_methods", id_of(c));
+        first_page(&m, &mut served, &mut objects, &path, None).await;
+    }
+    // The children of the platform's transfers and fees, through the sub-lists of ten
+    // reversed transfers and ten refunded fees (most have none, so every page is searched).
+    let mut reversed = Vec::new();
+    for (list, sub, field) in [
+        ("/v1/transfers", "reversals", "amount_reversed"),
+        ("/v1/application_fees", "refunds", "amount_refunded"),
+    ] {
+        let parents: Vec<Value> = walk_v1(&m, &mut served, list, None)
+            .await
+            .into_iter()
+            .filter(|p| p[field].as_i64().unwrap() > 0)
+            .take(10)
+            .collect();
+        for p in &parents {
+            let path = format!("{list}/{}/{sub}", id_of(p));
+            first_page(&m, &mut served, &mut objects, &path, None).await;
+        }
+        if sub == "reversals" {
+            reversed = parents;
+        }
+    }
+    // The `py_` payments of those transfers and their `pyr_` refunds, in the destination's
+    // scope (an ordinary page of an account's charges or refunds may hold none).
+    for t in &reversed {
+        let (acct, py) = (t["destination"].as_str(), t["destination_payment"].as_str());
+        let path = format!("/v1/refunds?charge={}", py.unwrap());
+        first_page(&m, &mut served, &mut objects, &path, acct).await;
+        let p = fetch(
             &m,
             &mut served,
-            &format!("/v1/customers/{}/payment_methods", id_of(c)),
-            None,
+            &format!("/v1/charges/{}", py.unwrap()),
+            acct,
         )
         .await;
-        objects
-            .entry(ObjectType::PaymentMethod)
-            .or_default()
-            .extend(page["data"].as_array().unwrap().iter().cloned());
+        objects.entry(ObjectType::Charge).or_default().push(p);
     }
-    let accounts = fetch(&m, &mut served, "/v1/accounts?limit=100", None).await;
-    objects.insert(
-        ObjectType::Account,
-        accounts["data"].as_array().unwrap().clone(),
+    let accounts = first_page(&m, &mut served, &mut objects, "/v1/accounts", None).await;
+    // Each connected account's external accounts and persons, and the payments, refunds and
+    // payouts in its scope: direct charges, `py_` payments and their `pyr_` refunds.
+    for a in &accounts {
+        let acct = id_of(a);
+        for sub in ["external_accounts", "persons"] {
+            first_page(
+                &m,
+                &mut served,
+                &mut objects,
+                &format!("/v1/accounts/{acct}/{sub}"),
+                None,
+            )
+            .await;
+        }
+        for path in ["/v1/charges", "/v1/refunds", "/v1/payouts"] {
+            first_page(&m, &mut served, &mut objects, path, Some(&acct)).await;
+        }
+    }
+    let ids = |t: ObjectType| -> Vec<String> {
+        objects
+            .get(&t)
+            .map_or(Vec::new(), |l| l.iter().map(id_of).collect())
+    };
+    assert!(
+        ids(ObjectType::Charge)
+            .iter()
+            .any(|id| id.starts_with("py_"))
+    );
+    assert!(
+        ids(ObjectType::Refund)
+            .iter()
+            .any(|id| id.starts_with("pyr_"))
+    );
+    assert!(
+        ids(ObjectType::Refund)
+            .iter()
+            .any(|id| id.starts_with("re_"))
     );
 
     let mut failures = Vec::new();
-    for t in ObjectType::ALL
-        .into_iter()
-        .filter(|t| !NOT_YET_GENERATED.contains(t))
-    {
+    for t in ObjectType::ALL {
         let schema = t.as_str();
         let list = objects.get(&t).cloned().unwrap_or_default();
         assert!(!list.is_empty(), "no {t:?} served");
@@ -926,6 +1208,232 @@ async fn payment_objects_are_consistent() {
     }
 }
 
+/// Recomputes, from the truth log alone, which balance transactions each payout swept: in
+/// its scope and currency, `available` when the payout was created, not of type `payout`,
+/// and not swept by an earlier payout (spec section 5.5). Payout ID to (scope, members).
+fn expected_sweeps(log: &[StateUpdate]) -> BTreeMap<String, (Option<String>, Vec<String>)> {
+    // Per scope: balance transaction ID to (currency, type, status), and creation order.
+    type BtInfo = (String, String, String);
+    let mut bts: BTreeMap<Option<String>, BTreeMap<String, BtInfo>> = BTreeMap::new();
+    let mut order: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+    let mut swept: BTreeSet<(Option<String>, String)> = BTreeSet::new();
+    let mut out = BTreeMap::new();
+    for u in log {
+        match u.object_type {
+            ObjectType::BalanceTransaction => {
+                let s = &u.state;
+                let entry = (
+                    s["currency"].as_str().unwrap().to_string(),
+                    s["type"].as_str().unwrap().to_string(),
+                    s["status"].as_str().unwrap().to_string(),
+                );
+                let scope = bts.entry(u.account.clone()).or_default();
+                if scope.insert(u.object_id.clone(), entry).is_none() {
+                    order
+                        .entry(u.account.clone())
+                        .or_default()
+                        .push(u.object_id.clone());
+                }
+            }
+            ObjectType::Payout if u.version == 1 => {
+                let currency = u.state["currency"].as_str().unwrap();
+                let scope = &bts[&u.account];
+                let members: Vec<String> = order[&u.account]
+                    .iter()
+                    .filter(|id| {
+                        let (c, t, s) = &scope[*id];
+                        c == currency
+                            && t != "payout"
+                            && s == "available"
+                            && !swept.contains(&(u.account.clone(), (*id).clone()))
+                    })
+                    .cloned()
+                    .collect();
+                for id in &members {
+                    swept.insert((u.account.clone(), id.clone()));
+                }
+                out.insert(u.object_id.clone(), (u.account.clone(), members));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Every balance transaction `GET /v1/balance_transactions?payout=` lists in `scope`.
+async fn swept_by(m: &MockStripe, payout: &str, scope: Option<&str>) -> Vec<String> {
+    let headers = scope_headers(scope, false);
+    let mut out = Vec::new();
+    let mut after = String::new();
+    loop {
+        let path = format!("/v1/balance_transactions?payout={payout}&limit=100{after}");
+        let (status, page) = get_json(m, &path, &headers).await;
+        assert_eq!(status, 200, "{path} in {scope:?}: {page}");
+        let data = page["data"].as_array().unwrap();
+        out.extend(data.iter().map(id_of));
+        if page["has_more"] != true {
+            return out;
+        }
+        after = format!("&starting_after={}", out.last().unwrap());
+    }
+}
+
+/// Review Focus 1 of phase 8: money adds up across scopes, over the busy run's truth state.
+#[tokio::test]
+async fn money_moves_consistently() {
+    let snap = Receiver::start(|_| (200, Duration::ZERO));
+    let thin = Receiver::start(|_| (200, Duration::ZERO));
+    let m = busy_run(&snap, &thin).await;
+    let log = m.truth_log();
+    let truth = latest(&m);
+    let state = |scope: &Option<String>, t: ObjectType, id: &str| -> &Value {
+        &truth
+            .get(&(scope.clone(), t, id.to_string()))
+            .unwrap_or_else(|| panic!("{t:?} {id} not in {scope:?}"))
+            .state
+    };
+    let platform: Option<String> = None;
+
+    // A transfer moves its `py_` payment's amount, and its reversals are the payment's
+    // refunds: `amount_reversed` is the sum of its reversals and the payment's
+    // `amount_refunded`.
+    let (mut transfers, mut reversed) = (0, 0);
+    for (id, tr) in live_in(&truth, &platform, ObjectType::Transfer) {
+        let dest = tr["destination"].as_str().map(String::from);
+        assert!(dest.is_some(), "{id}");
+        let py_id = tr["destination_payment"].as_str().unwrap();
+        assert!(py_id.starts_with("py_"), "{id}: {py_id}");
+        let py = state(&dest, ObjectType::Charge, py_id);
+        assert_eq!(tr["amount"], py["amount"], "{id} vs {py_id}");
+        assert_eq!(py["source_transfer"], id.as_str(), "{py_id}");
+        let reversals: i64 = live_in(&truth, &platform, ObjectType::TransferReversal)
+            .filter(|(_, r)| r["transfer"] == id.as_str())
+            .map(|(_, r)| r["amount"].as_i64().unwrap())
+            .sum();
+        assert_eq!(tr["amount_reversed"], reversals, "{id}");
+        assert_eq!(
+            tr["amount_reversed"], py["amount_refunded"],
+            "{id} vs {py_id}"
+        );
+        transfers += 1;
+        reversed += usize::from(reversals > 0);
+    }
+
+    // An application fee is its charge's `application_fee_amount`, and part of the `fee` of
+    // that charge's balance transaction.
+    let mut fees = 0;
+    for (id, fee) in live_in(&truth, &platform, ObjectType::ApplicationFee) {
+        let acct = fee["account"].as_str().map(String::from);
+        let ch_id = fee["charge"].as_str().unwrap();
+        let ch = state(&acct, ObjectType::Charge, ch_id);
+        assert_eq!(
+            fee["amount"], ch["application_fee_amount"],
+            "{id} vs {ch_id}"
+        );
+        assert_eq!(ch["application_fee"], id.as_str(), "{ch_id}");
+        let bt_id = ch["balance_transaction"].as_str().unwrap();
+        let bt = state(&acct, ObjectType::BalanceTransaction, bt_id);
+        let details = bt["fee_details"].as_array().unwrap();
+        let of_fee: Vec<&Value> = details
+            .iter()
+            .filter(|d| d["type"] == "application_fee")
+            .collect();
+        assert_eq!(of_fee.len(), 1, "{bt_id}: {details:?}");
+        assert_eq!(of_fee[0]["amount"], fee["amount"], "{bt_id} vs {id}");
+        let total: i64 = details.iter().map(|d| d["amount"].as_i64().unwrap()).sum();
+        assert_eq!(bt["fee"], total, "{bt_id}");
+        let refunds: i64 = live_in(&truth, &platform, ObjectType::FeeRefund)
+            .filter(|(_, r)| r["fee"] == id.as_str())
+            .map(|(_, r)| r["amount"].as_i64().unwrap())
+            .sum();
+        assert_eq!(fee["amount_refunded"], refunds, "{id}");
+        fees += 1;
+    }
+
+    // A payout's amount is the sum of the `net` of what it swept, which is above 0 (no
+    // payout for a balance at or below 0), and no balance transaction is swept twice. Where
+    // the scope is still reachable, `?payout=` lists exactly those.
+    let connected: BTreeSet<String> = m
+        .accounts()
+        .into_iter()
+        .filter(|a| a.connected)
+        .map(|a| a.id)
+        .collect();
+    let expected = expected_sweeps(&log);
+    let mut seen: BTreeSet<(Option<String>, String)> = BTreeSet::new();
+    let (mut payout_scopes, mut failed, mut listed) = (BTreeSet::new(), 0, 0);
+    for (po, (scope, members)) in &expected {
+        let p = state(scope, ObjectType::Payout, po);
+        let sum: i64 = members
+            .iter()
+            .map(|id| {
+                state(scope, ObjectType::BalanceTransaction, id)["net"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .sum();
+        assert!(sum > 0, "{po} in {scope:?}: swept {sum}");
+        assert_eq!(p["amount"], sum, "{po} in {scope:?}");
+        for id in members {
+            assert!(
+                seen.insert((scope.clone(), id.clone())),
+                "{id} in two payouts"
+            );
+        }
+        if scope.as_ref().is_none_or(|a| connected.contains(a)) {
+            let mut got = swept_by(&m, po, scope.as_deref()).await;
+            got.sort();
+            let mut want = members.clone();
+            want.sort();
+            assert_eq!(got, want, "{po} in {scope:?}");
+            listed += 1;
+        }
+        payout_scopes.insert(scope.clone());
+        failed += usize::from(p["status"] == "failed");
+    }
+    // Every payout in truth was accounted for.
+    let all_payouts: BTreeSet<&String> = truth
+        .keys()
+        .filter(|(_, t, _)| *t == ObjectType::Payout)
+        .map(|(_, _, id)| id)
+        .collect();
+    assert_eq!(all_payouts, expected.keys().collect());
+
+    // Per scope and currency, the sum of every balance transaction's `net` equals the sum
+    // over those neither swept nor `type: payout`.
+    let mut all: BTreeMap<(Option<String>, String), i64> = BTreeMap::new();
+    let mut open: BTreeMap<(Option<String>, String), i64> = BTreeMap::new();
+    for ((scope, t, id), u) in &truth {
+        if *t != ObjectType::BalanceTransaction {
+            continue;
+        }
+        let key = (
+            scope.clone(),
+            u.state["currency"].as_str().unwrap().to_string(),
+        );
+        let n = u.state["net"].as_i64().unwrap();
+        *all.entry(key.clone()).or_default() += n;
+        let counted = open.entry(key).or_default();
+        if u.state["type"] != "payout" && !seen.contains(&(scope.clone(), id.clone())) {
+            *counted += n;
+        }
+    }
+    assert_eq!(all, open);
+
+    // Each relation is exercised, not vacuously true.
+    for (what, n, min) in [
+        ("transfers", transfers, 5),
+        ("reversed transfers", reversed, 1),
+        ("application fees", fees, 5),
+        ("payouts", expected.len(), 5),
+        ("failed payouts", failed, 1),
+        ("payouts listed by `?payout=`", listed, 5),
+        ("scopes with payouts", payout_scopes.len(), 2),
+    ] {
+        assert!(n >= min, "only {n} {what}");
+    }
+}
+
 /// One full pagination of `path` (listing `t`), 10 per page: the IDs in order, and how
 /// many served objects differed from the live state the moment their page was served (a
 /// stale read: an older version, or an object missing from the live view's newest page).
@@ -966,44 +1474,66 @@ async fn paginate_ids(m: &MockStripe, path: &str, t: ObjectType) -> (Vec<String>
 
 #[tokio::test]
 async fn payment_lists_survive_faults() {
-    let m = mock_with(
-        "seed = 7
-         [actions]
-new_customer = 4.0
-one_off_payment = 60.0
-refund = 4.0
-         payment_failure_probability = 0.3
-         [api]
-stale_read = { probability = 0.5, max_lag = \"5s\" }
-         pagination_writes = { probability = 1.0 }
-",
-    )
-    .await;
-    m.step(Duration::from_secs(3600)).await.unwrap();
-    let mut stale = 0;
-    for round in 0..10 {
-        assert!(m.generation_enabled());
-        for (path, t) in [
-            ("/v1/charges", ObjectType::Charge),
-            ("/v1/payment_intents", ObjectType::PaymentIntent),
-        ] {
-            let before = m.truth_log().len();
-            let (ids, s) = paginate_ids(&m, path, t).await;
-            stale += s;
-            assert!(ids.len() > 20, "{path}: {} ids", ids.len());
-            // Every cursor page ran a pagination write first.
-            assert!(
-                m.truth_log().len() > before,
-                "{path} round {round}: no pagination write"
-            );
-            let unique: BTreeSet<&String> = ids.iter().collect();
-            assert_eq!(
-                unique.len(),
-                ids.len(),
-                "{path} round {round}: an ID listed twice"
-            );
+    let faults = "[api]\n\
+        stale_read = { probability = 0.5, max_lag = \"5s\" }\n\
+        pagination_writes = { probability = 1.0 }\n";
+    // Payments: an hour of busy one-off payments. Connect money: platform payments routed to
+    // three accounts over 25 days of history with daily payouts, so the platform holds many
+    // transfers and payouts. A payout has no pagination write (spec section 7.4).
+    let runs = [
+        (
+            format!(
+                "seed = 7\n\
+                 [actions]\nnew_customer = 4.0\none_off_payment = 60.0\nrefund = 4.0\n\
+                 payment_failure_probability = 0.3\n{faults}"
+            ),
+            vec![
+                ("/v1/charges", ObjectType::Charge, true),
+                ("/v1/payment_intents", ObjectType::PaymentIntent, true),
+            ],
+        ),
+        (
+            format!(
+                "seed = 7\n\
+                 [accounts]\nconnect = true\nconnected_accounts = {{ initial = 3 }}\n\
+                 platform_payments = {{ own = 0.5, destination = 0.25, separate = 0.25 }}\n\
+                 [history]\nduration = \"25d\"\n\
+                 [actions]\nnew_customer = 0.5\none_off_payment = 0.5\ntransfer_reversal = 0.1\n\
+                 payout = \"daily\"\npayout_failure_probability = 0.2\n{faults}"
+            ),
+            vec![
+                ("/v1/transfers", ObjectType::Transfer, true),
+                ("/v1/payouts", ObjectType::Payout, false),
+            ],
+        ),
+    ];
+    for (config, lists) in runs {
+        let m = mock_with(&config).await;
+        m.step(Duration::from_secs(3600)).await.unwrap();
+        let mut stale = 0;
+        for round in 0..10 {
+            assert!(m.generation_enabled());
+            for (path, t, writes) in &lists {
+                let before = m.truth_log().len();
+                let (ids, s) = paginate_ids(&m, path, *t).await;
+                stale += s;
+                assert!(ids.len() > 20, "{path}: {} ids", ids.len());
+                // Every cursor page ran a pagination write first, where the type has one.
+                if *writes {
+                    assert!(
+                        m.truth_log().len() > before,
+                        "{path} round {round}: no pagination write"
+                    );
+                }
+                let unique: BTreeSet<&String> = ids.iter().collect();
+                assert_eq!(
+                    unique.len(),
+                    ids.len(),
+                    "{path} round {round}: an ID listed twice"
+                );
+            }
+            m.step(Duration::from_secs(60)).await.unwrap();
         }
-        m.step(Duration::from_secs(60)).await.unwrap();
+        assert!(stale > 0, "{lists:?}: no stale read observed");
     }
-    assert!(stale > 0, "no stale read observed");
 }

@@ -151,7 +151,8 @@ fn type_of_id(id: &str) -> Option<ObjectType> {
 }
 
 /// The object an ID names, as expansion shows it: a deleted customer is its
-/// stub, other deleted objects are `null`, unknown IDs stay strings.
+/// stub, other deleted objects are `null`, unknown IDs and disconnected accounts stay
+/// strings.
 fn lookup(view: &View, id: &str, foreign: Option<Scope>) -> Option<Value> {
     let t = type_of_id(id)?;
     // A foreign scope is read at the view's own time; an account that has disconnected is
@@ -173,6 +174,12 @@ fn lookup(view: &View, id: &str, foreign: Option<Scope>) -> Option<Value> {
         None => view,
     };
     let u = view.state(view.store().get(t, id)?)?;
+    // A disconnected account is out of the platform's reach like its scope (above), so it
+    // stays an ID: no field naming an account (`transfer.destination`,
+    // `transfer_data.destination`, `application_fee.account`) is nullable.
+    if u.kind == ChangeKind::Deleted && t == ObjectType::Account {
+        return None;
+    }
     if u.kind == ChangeKind::Deleted && t != ObjectType::Customer {
         return Some(Value::Null);
     }

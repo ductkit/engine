@@ -973,3 +973,79 @@ async fn transfers_to_disconnected_accounts_are_not_reversed() {
             .all(|u| u.object_type != ObjectType::TransferReversal)
     );
 }
+
+/// Regression (phase 8, Task 9): a `py_` payment's money is returned only by reversing its
+/// transfer. The account's own refunds and disputes never pick it, and a control refund or
+/// dispute naming it is a 409, so `amount_refunded` never runs past the transfer's
+/// `amount_reversed`.
+#[tokio::test]
+async fn destination_payments_are_not_refunded_or_disputed_directly() {
+    let (m, acct, tr, py) = transfer_setup(1000).await;
+    let a = m.account(&acct);
+    let msg = invalid_action(a.run_action(Action::Refund {
+        charge: Some(py.clone()),
+        amount: None,
+    }));
+    assert!(msg.contains(&py) && msg.contains("reverse"), "{msg}");
+    let msg = invalid_action(a.run_action(Action::Dispute {
+        charge: Some(py.clone()),
+        outcome: None,
+    }));
+    assert!(msg.contains(&py) && msg.contains("reverse"), "{msg}");
+    // With the `py_` payment the account's only charge, random ones find nothing to do.
+    let r = a.run_action(Action::Refund {
+        charge: None,
+        amount: None,
+    });
+    assert!(r.is_err(), "{r:?}");
+    let r = a.run_action(Action::Dispute {
+        charge: None,
+        outcome: None,
+    });
+    assert!(r.is_err(), "{r:?}");
+    let p = json_as(&m, &format!("/v1/charges/{py}"), &acct).await;
+    assert_eq!(p["amount_refunded"], 0);
+    assert_eq!(p["disputed"], false);
+    // Reversing the transfer still refunds it.
+    m.run_action(reverse(&tr, Some(400))).unwrap();
+    let p = json_as(&m, &format!("/v1/charges/{py}"), &acct).await;
+    assert_eq!(p["amount_refunded"], 400);
+}
+
+/// Regression (phase 8, Task 9): an account that disconnected is out of the platform's
+/// reach, so a destination charge's `transfer_data.destination` and a transfer's
+/// `destination` stay its ID when expanded (they are not nullable), as a cross-scope
+/// expansion into it does.
+#[tokio::test]
+async fn disconnected_destination_expands_to_its_id() {
+    let (m, acct, tr, _py) = transfer_setup(1000).await;
+    let t = json(&m, &format!("/v1/transfers/{tr}")).await;
+    let ch = t["source_transaction"].as_str().unwrap().to_string();
+    // While connected, both expand to the account.
+    let v = json(&m, &format!("/v1/transfers/{tr}?expand[]=destination")).await;
+    assert_eq!(v["destination"]["id"], acct.as_str());
+    let v = json(
+        &m,
+        &format!("/v1/charges/{ch}?expand[]=transfer_data.destination"),
+    )
+    .await;
+    assert_eq!(v["transfer_data"]["destination"]["id"], acct.as_str());
+    m.disconnect_account(&acct).unwrap();
+    let v = json(&m, &format!("/v1/transfers/{tr}?expand[]=destination")).await;
+    common::assert_conforms(&v);
+    assert_eq!(v["destination"], acct.as_str());
+    let v = json(
+        &m,
+        &format!("/v1/charges/{ch}?expand[]=transfer_data.destination"),
+    )
+    .await;
+    common::assert_conforms(&v);
+    assert_eq!(v["transfer_data"]["destination"], acct.as_str());
+    let v = json(
+        &m,
+        "/v1/charges?limit=3&expand[]=data.transfer_data.destination",
+    )
+    .await;
+    common::assert_conforms(&v);
+    assert_eq!(v["data"][0]["transfer_data"]["destination"], acct.as_str());
+}
