@@ -310,9 +310,21 @@ fn matches(
         ObjectType::Refund | ObjectType::Dispute => {
             eq("charge", "charge") && eq("payment_intent", "payment_intent")
         }
-        // Payouts are not modelled, so a `payout` filter matches nothing.
+        // `payout` lists what that payout swept (phase 8 ruling P5), once the payout
+        // exists in this view.
         ObjectType::BalanceTransaction => {
-            eq("type", "type") && eq("source", "source") && !f.contains_key("payout")
+            eq("type", "type")
+                && eq("source", "source")
+                && f.get("payout").is_none_or(|po| {
+                    view.store()
+                        .get(ObjectType::Payout, po)
+                        .and_then(|p| view.state(p))
+                        .is_some()
+                        && view
+                            .engine
+                            .payout_members(&view.scope, po)
+                            .contains(&o.latest.object_id)
+                })
         }
         // The children index keeps a detached payment method under the customer it was
         // created for, so the state shown must still name that customer.

@@ -137,6 +137,10 @@ pub enum Action {
         transfer: Option<String>,
         amount: Option<i64>,
     },
+    /// Pay out every currency of the scope's available balance now, as the midnight run of
+    /// `actions.payout = "daily"` does, whatever that setting. Control-only. With no
+    /// balance above 0, an error naming the scope.
+    Payout,
 }
 
 /// The kind of an external account.
@@ -263,6 +267,39 @@ pub(crate) enum Continuation {
         account: String,
         group: String,
     },
+    /// The scope's midnight payout run (`actions.payout = "daily"`); it queues the next one.
+    /// Each run begins its own `payout` cause, so the queued cause is unused.
+    PayoutDue,
+    /// A payout goes `in_transit`, an hour after its creation.
+    PayoutInTransit {
+        id: String,
+    },
+    /// A payout arrives at its `arrival_date`: paid, or failed when `fail` was drawn at its
+    /// creation.
+    PayoutArrive {
+        id: String,
+        fail: bool,
+    },
+}
+
+/// One simulated day.
+const DAY_MS: i64 = 86_400_000;
+
+/// The first tie-break key of scheduled work. The keys below it are the day numbers of the
+/// midnight payout runs, which go first at their instant.
+const FIRST_SEQ: u64 = 1 << 32;
+
+/// The first midnight UTC after `t`.
+fn next_midnight(t: SimTime) -> SimTime {
+    SimTime((t.0.div_euclid(DAY_MS) + 1) * DAY_MS)
+}
+
+/// The queued cause of a [`Continuation::PayoutDue`], which each run replaces with its own.
+fn payout_due_cause() -> Cause {
+    Cause {
+        action: "payout".to_string(),
+        action_id: String::new(),
+    }
 }
 
 #[derive(Debug)]
@@ -305,6 +342,12 @@ pub(crate) struct Ctx {
     pub pattern_rng: SimRng,
     /// The recipient of each separate-charges payment intent that has not succeeded yet.
     pub separate_recipients: BTreeMap<String, String>,
+    /// Whether a payout fails, and the scope's payout destination when it has no bank
+    /// account (stream `"generate.payout"`).
+    pub payout_rng: SimRng,
+    /// The `ba_` ID the scope's payouts go to when it is not a controlled account, drawn at
+    /// its first payout (P4).
+    pub payout_destination: Option<String>,
 }
 
 impl Ctx {
@@ -346,6 +389,18 @@ impl Ctx {
 
     fn next_due(&self) -> Option<SimTime> {
         self.queue.keys().next().map(|(t, _)| *t)
+    }
+
+    /// Queues the scope's next midnight payout run after `now`. It goes before every other
+    /// continuation due at that midnight, so a payout arriving (or failing) then is swept at
+    /// the following one: its tie-break key is the day number, below every [`FIRST_SEQ`]
+    /// key.
+    fn schedule_payout_due(&mut self, now: SimTime) {
+        let at = next_midnight(now);
+        let day = at.0.div_euclid(DAY_MS) as u64;
+        debug_assert!(day < FIRST_SEQ);
+        self.queue
+            .insert((at, day), (Continuation::PayoutDue, payout_due_cause()));
     }
 }
 
@@ -509,7 +564,7 @@ impl Generator {
                 }
             })
             .collect();
-        Generator {
+        let mut generator = Generator {
             actions,
             scale: 1.0,
             ctx: Ctx {
@@ -517,7 +572,7 @@ impl Generator {
                 page_size: config.payloads.nested_list_page_size,
                 queue: BTreeMap::new(),
                 settlements: BTreeMap::new(),
-                next_seq: 0,
+                next_seq: FIRST_SEQ,
                 lifecycle: stream("generate.lifecycle"),
                 billing: stream("generate.billing"),
                 payments: stream("generate.payments"),
@@ -526,12 +581,18 @@ impl Generator {
                 platform_payments: config.accounts.platform_payments.clone(),
                 pattern_rng: stream("generate.platform_payments"),
                 separate_recipients: BTreeMap::new(),
+                payout_rng: stream("generate.payout"),
+                payout_destination: None,
             },
             setup: stream("generate.account_setup"),
             control: stream("control.actions"),
             pagination_rng: stream("api.pagination_writes.content"),
             enabled: true,
+        };
+        if config.actions.payout == crate::PayoutMode::Daily {
+            generator.ctx.schedule_payout_due(start);
         }
+        generator
     }
 
     /// Runs once, in the account's scope, right after the account connects. A controlled
@@ -595,11 +656,23 @@ impl Generator {
     /// Replaces `[actions]`. Poisson actions whose rate changed redraw their next
     /// due time from `now`; everything else applies to later draws.
     /// Turning natural renewals back on queues a renewal for every live
-    /// subscription that has none pending.
+    /// subscription that has none pending. Turning `payout` to `daily` queues the next
+    /// midnight's run, and `off` drops the pending one (payouts already made still arrive).
     pub(crate) fn set_actions_config(&mut self, config: ActionsConfig, engine: &mut Engine) {
         let now = engine.now();
         let resume_renewals = self.ctx.config.renew_subscription_cycle != crate::RenewMode::Natural
             && config.renew_subscription_cycle == crate::RenewMode::Natural;
+        match (self.ctx.config.payout, config.payout) {
+            (crate::PayoutMode::Off, crate::PayoutMode::Daily) => {
+                self.ctx.schedule_payout_due(now);
+            }
+            (crate::PayoutMode::Daily, crate::PayoutMode::Off) => {
+                self.ctx
+                    .queue
+                    .retain(|_, (c, _)| !matches!(c, Continuation::PayoutDue));
+            }
+            _ => {}
+        }
         for a in &mut self.actions {
             let rate = match a.kind {
                 ActionKind::NewCustomer => config.new_customer,
@@ -870,6 +943,13 @@ impl Generator {
             .ok_or_else(|| {
                 MockError::InvalidAction("no transfer with something left to reverse".to_string())
             })?,
+            Action::Payout => connect::pay_out(Some(&mut self.control), engine, &mut self.ctx)
+                .ok_or_else(|| {
+                    MockError::InvalidAction(format!(
+                        "no available balance above 0 to pay out in {}",
+                        connect::scope_name(engine)
+                    ))
+                })?,
         };
         self.run_due_now(engine);
         Ok(cause)
@@ -994,6 +1074,14 @@ fn run_continuation(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mu
             account,
             group,
         } => connect::separate_transfer(engine, ctx, &charge, &account, &group, &cause),
+        Continuation::PayoutDue => {
+            connect::pay_out(None, engine, ctx);
+            ctx.schedule_payout_due(engine.now());
+        }
+        Continuation::PayoutInTransit { id } => connect::payout_in_transit(engine, &id, &cause),
+        Continuation::PayoutArrive { id, fail } => {
+            connect::payout_arrive(engine, ctx, &id, fail, &cause);
+        }
         c => billing::run(c, cause, engine, ctx),
     }
 }

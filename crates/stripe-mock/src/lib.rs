@@ -24,8 +24,9 @@ pub use config::{
     ClockSkew, Config, ConnectedAccounts, CustomerChurn, DestinationConfig, DisableAfter,
     Distribution, DurationStr, EventRetentionConfig, EventsConfig, ExternalAccountChurn,
     HistoryConfig, LateTail, MAX_DURATION_MS, MAX_SPEED, PINNED_API_VERSION, PaginationWrites,
-    PayloadFormat, PayloadsConfig, PaymentMethodChurn, PersonChurn, PlatformPaymentsMix, RateLimit,
-    RenewMode, RetrySchedule, StaleRead, UpdateChurn, WebhooksConfig,
+    PayloadFormat, PayloadsConfig, PaymentMethodChurn, PayoutMode, PersonChurn,
+    PlatformPaymentsMix, RateLimit, RenewMode, RetrySchedule, StaleRead, UpdateChurn,
+    WebhooksConfig,
 };
 pub use control::{
     ControlOp, JournalEntry, OpResult, RUN_FORMAT, ReplayGuard, ReplayOptions, RunExport,

@@ -430,6 +430,10 @@ pub struct ActionsConfig {
     pub step_delay: Distribution,
     /// Chance that a payment attempt (an invoice's or a one-off payment) fails.
     pub payment_failure_probability: f64,
+    /// Automatic payouts of each scope's available balance (phase 8 ruling P5).
+    pub payout: PayoutMode,
+    /// Chance that a payout fails at its arrival date (drawn when it is created).
+    pub payout_failure_probability: f64,
 }
 
 impl ActionsConfig {
@@ -457,8 +461,23 @@ impl ActionsConfig {
         check_probability(
             "actions.payment_failure_probability",
             self.payment_failure_probability,
+        )?;
+        check_probability(
+            "actions.payout_failure_probability",
+            self.payout_failure_probability,
         )
     }
+}
+
+/// Whether each scope's available balance is paid out automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PayoutMode {
+    /// No automatic payouts.
+    #[default]
+    Off,
+    /// At each simulated midnight UTC, per currency.
+    Daily,
 }
 
 /// Whether subscriptions renew at the end of each billing period.

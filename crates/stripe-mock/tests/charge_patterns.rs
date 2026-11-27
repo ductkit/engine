@@ -561,6 +561,7 @@ application_fee = { probability = 0.8, percent = 10.0 }
 new_customer = 1.0
 one_off_payment = 2.0
 application_fee_refund = 0.5
+payout = \"daily\"
 [churn.external_account]
 create = 0.5
 delete = 0.2
@@ -585,8 +586,14 @@ delete = 0.1
     ];
     let mut seen = std::collections::BTreeMap::<ObjectType, usize>::new();
     let mut py_scope = std::collections::BTreeMap::<String, String>::new();
+    // Payouts live in the scope whose balance they pay out: the platform's and each
+    // account's own.
+    let mut payout_scopes = std::collections::BTreeSet::<Option<String>>::new();
     for u in &log {
         *seen.entry(u.object_type).or_default() += 1;
+        if u.object_type == ObjectType::Payout {
+            payout_scopes.insert(u.account.clone());
+        }
         if platform_only.contains(&u.object_type) {
             assert!(u.account.is_none(), "{u:?}");
         }
@@ -602,6 +609,13 @@ delete = 0.1
             match u.state["type"].as_str().unwrap() {
                 "payment" => assert!(source.starts_with("py_") && u.account.is_some(), "{u:?}"),
                 "transfer" | "application_fee" => assert!(u.account.is_none(), "{u:?}"),
+                // A payout's balance transactions live with the payout.
+                "payout" | "payout_failure" => assert!(
+                    log.iter().any(|p| p.object_type == ObjectType::Payout
+                        && p.object_id == source
+                        && p.account == u.account),
+                    "{u:?}"
+                ),
                 _ => {}
             }
         }
@@ -627,6 +641,7 @@ delete = 0.1
         ObjectType::Transfer,
         ObjectType::ApplicationFee,
         ObjectType::FeeRefund,
+        ObjectType::Payout,
         ObjectType::BankAccount,
         ObjectType::Card,
         ObjectType::Person,
@@ -634,6 +649,10 @@ delete = 0.1
         assert!(seen.get(&t).is_some_and(|n| *n > 0), "no {t:?}: {seen:?}");
     }
     assert!(!py_scope.is_empty());
+    assert!(
+        payout_scopes.contains(&None) && payout_scopes.len() > 1,
+        "{payout_scopes:?}"
+    );
 
     // Every event's label is its object's scope (an account's own events are labelled with
     // it although the account lives on the platform).
@@ -649,6 +668,9 @@ delete = 0.1
         let name = e.event_type.trim_start_matches("v1.");
         if name.starts_with("transfer.") || name.starts_with("application_fee.") {
             assert_eq!(e.account, None, "{e:?}");
+        }
+        if name.starts_with("payout.") {
+            assert!(payout_scopes.contains(&e.account), "{e:?}");
         }
         if name.starts_with("person.") || name.starts_with("account.external_account.") {
             assert!(e.account.is_some(), "{e:?}");

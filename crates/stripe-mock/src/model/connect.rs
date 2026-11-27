@@ -2,8 +2,9 @@
 //! external accounts and persons. They arrive with the generators that create these
 //! objects (phase 8, tasks 3 to 8); this file holds the ones built so far: external
 //! accounts (bank accounts and debit cards) and persons of controlled accounts, whose
-//! presence follows ruling R1 (spec section 5.4), application fees with their refunds, and
-//! transfers with the `py_` payments they create.
+//! presence follows ruling R1 (spec section 5.4), application fees with their refunds,
+//! transfers with the `py_` payments they create, and automatic payouts with their balance
+//! transactions (ruling P5).
 
 use crate::model::payments::{AVAILABLE_AFTER_SECS, empty_billing_details, stripe_account_details};
 use crate::stripe::{self, Expandable};
@@ -724,4 +725,113 @@ pub(crate) fn new_payment_refund(r: &NewPaymentRefund) -> stripe::Refund {
         status: Some(Some("succeeded".to_string())),
         transfer_reversal: Some(None),
     }
+}
+
+/// The failure code of a failed payout.
+pub(crate) const PAYOUT_FAILURE_CODE: &str = "account_closed";
+/// The failure message of a failed payout.
+pub(crate) const PAYOUT_FAILURE_MESSAGE: &str = "The bank account has been closed.";
+/// How long after its creation an automatic payout arrives: two days.
+pub(crate) const PAYOUT_ARRIVAL_SECS: i64 = 2 * 86_400;
+
+/// The inputs of an automatic payout.
+pub(crate) struct NewPayout<'a> {
+    pub id: &'a str,
+    pub created: i64,
+    pub amount: i64,
+    pub currency: &'a str,
+    /// The bank account paid: a controlled account's default one, or a drawn ID (P4).
+    pub destination: &'a str,
+    pub balance_transaction: &'a str,
+}
+
+/// An automatic standard payout of a card balance to a bank account: `pending`, arriving
+/// [`PAYOUT_ARRIVAL_SECS`] later, reconciliation `in_progress`, with no failure, fee,
+/// reversal or trace yet.
+pub(crate) fn new_payout(p: &NewPayout) -> stripe::Payout {
+    stripe::Payout {
+        amount: p.amount,
+        application_fee: Some(None),
+        application_fee_amount: Some(None),
+        arrival_date: p.created + PAYOUT_ARRIVAL_SECS,
+        automatic: true,
+        balance_transaction: Some(Some(Expandable::Id(p.balance_transaction.to_string()))),
+        created: p.created,
+        currency: p.currency.to_string(),
+        description: Some(None),
+        destination: Some(Some(Expandable::Id(p.destination.to_string()))),
+        failure_balance_transaction: Some(None),
+        failure_code: Some(None),
+        failure_message: Some(None),
+        id: p.id.to_string(),
+        livemode: false,
+        metadata: Some(Some(Default::default())),
+        method: "standard".to_string(),
+        object: stripe::PayoutObject::Payout,
+        original_payout: Some(None),
+        payout_method: Some(None),
+        reconciliation_status: stripe::PayoutReconciliationStatus::InProgress,
+        reversed_by: Some(None),
+        source_type: "card".to_string(),
+        statement_descriptor: Some(None),
+        status: "pending".to_string(),
+        trace_id: Some(None),
+        type_: stripe::PayoutType::BankAccount,
+    }
+}
+
+/// A payout's balance transaction, `available` at once with no fee: the payout itself is
+/// `-amount` (`type: payout`); its failure returns `+amount` (`type: payout_failure`).
+pub(crate) fn new_payout_balance_transaction(
+    id: &str,
+    created: i64,
+    amount: i64,
+    currency: &str,
+    payout: &str,
+    failure: bool,
+) -> stripe::BalanceTransaction {
+    let (amount, category, type_) = if failure {
+        (
+            amount,
+            "payout_reversal",
+            stripe::BalanceTransactionType::PayoutFailure,
+        )
+    } else {
+        (-amount, "payout", stripe::BalanceTransactionType::Payout)
+    };
+    stripe::BalanceTransaction {
+        amount,
+        available_on: created,
+        balance_type: stripe::BalanceTransactionBalanceType::Payments,
+        created,
+        currency: currency.to_string(),
+        description: Some(None),
+        exchange_rate: Some(None),
+        fee: 0,
+        fee_details: Vec::new(),
+        id: id.to_string(),
+        net: amount,
+        object: stripe::BalanceTransactionObject::BalanceTransaction,
+        reporting_category: category.to_string(),
+        source: Some(Some(Expandable::Id(payout.to_string()))),
+        status: "available".to_string(),
+        type_,
+    }
+}
+
+/// A payout that failed at its arrival date, with the balance transaction that returned
+/// its funds.
+pub(crate) fn fail_payout(p: &mut stripe::Payout, failure_balance_transaction: &str) {
+    p.status = "failed".to_string();
+    p.failure_code = Some(Some(PAYOUT_FAILURE_CODE.to_string()));
+    p.failure_message = Some(Some(PAYOUT_FAILURE_MESSAGE.to_string()));
+    p.failure_balance_transaction = Some(Some(Expandable::Id(
+        failure_balance_transaction.to_string(),
+    )));
+}
+
+/// A payout that arrived: `paid`, reconciliation `completed`.
+pub(crate) fn pay_payout(p: &mut stripe::Payout) {
+    p.status = "paid".to_string();
+    p.reconciliation_status = stripe::PayoutReconciliationStatus::Completed;
 }

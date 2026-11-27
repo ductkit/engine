@@ -2,7 +2,8 @@
 //! (spec section 5.4; phase 8 rulings P4, P8 and P9), run in the account's own scope with
 //! its generator's streams; application fees (run from the connected account's payment);
 //! and the platform payments' charge patterns with their transfers (ruling P7, run by the
-//! platform's generator). Later phase 8 tasks add their flows here.
+//! platform's generator); and the daily payouts of each scope's balance (ruling P5, run by
+//! each scope's own generator).
 
 use chrono::Datelike;
 
@@ -18,8 +19,9 @@ use crate::model::connect::{
     representative_due,
 };
 use crate::model::connect::{
-    NewPaymentRefund, NewTransferReversal, new_payment_refund, new_reversal_balance_transaction,
-    new_transfer_reversal, transfer_reversals_url,
+    NewPaymentRefund, NewPayout, NewTransferReversal, fail_payout, new_payment_refund, new_payout,
+    new_payout_balance_transaction, new_reversal_balance_transaction, new_transfer_reversal,
+    pay_payout, transfer_reversals_url,
 };
 use crate::rng::SimRng;
 use crate::stripe;
@@ -1131,4 +1133,188 @@ pub(super) fn transfer_reversal(
         .expect("live destination payment");
     });
     Ok(Some(cause))
+}
+
+/// One hour: the gap between a payout's creation and its `in_transit`.
+const PAYOUT_IN_TRANSIT_MS: i64 = 3_600_000;
+
+/// The scope's available balance per currency (ruling P6), in currency order: the sum of
+/// `net` over its `available` balance transactions that no payout swept, leaving out the
+/// payouts' own (`type: payout`), with those transactions in creation order.
+fn available_balances(engine: &Engine) -> std::collections::BTreeMap<String, (i64, Vec<String>)> {
+    let scope = engine.scope();
+    let mut out: std::collections::BTreeMap<String, (i64, Vec<String>)> = Default::default();
+    for o in engine
+        .store()
+        .in_creation_order(ObjectType::BalanceTransaction)
+    {
+        let s = &o.latest.state;
+        let id = &o.latest.object_id;
+        if o.deleted || s["status"] != "available" || s["type"] == "payout" {
+            continue;
+        }
+        if engine.swept(scope, id) {
+            continue;
+        }
+        let (Some(currency), Some(net)) = (s["currency"].as_str(), s["net"].as_i64()) else {
+            continue;
+        };
+        let entry = out.entry(currency.to_string()).or_default();
+        entry.0 += net;
+        entry.1.push(id.clone());
+    }
+    out
+}
+
+/// Where the scope's payouts go (P4): a controlled account's default bank account, else a
+/// `ba_` ID drawn once per scope from `generate.payout`, which no store holds.
+fn payout_destination(engine: &Engine, ctx: &mut Ctx) -> String {
+    if controlled(engine)
+        && let Some((_, id, _)) = live_external(engine)
+            .into_iter()
+            .find(|(t, _, default)| *t == ObjectType::BankAccount && *default)
+    {
+        return id;
+    }
+    ctx.payout_destination
+        .get_or_insert_with(|| ctx.payout_rng.id(ObjectType::BankAccount.id_prefix()))
+        .clone()
+}
+
+/// Pays out every currency of the scope's available balance now (ruling P5), in currency
+/// order, under one `payout` cause: for each currency whose balance is above 0, the payout's
+/// balance transaction (`type: payout`, `-amount`, `available` at once), the payout
+/// (`pending`; `payout.created`), the record of what it swept, and its `in_transit` an hour
+/// later and its arrival at `arrival_date` as continuations. Whether it fails is drawn now,
+/// from `control` for a control action, else from `generate.payout`. `None` (and no draw)
+/// when no balance is above 0.
+pub(super) fn pay_out(
+    control: Option<&mut SimRng>,
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+) -> Option<Cause> {
+    let due: Vec<(String, i64, Vec<String>)> = available_balances(engine)
+        .into_iter()
+        .filter(|(_, (amount, _))| *amount > 0)
+        .map(|(currency, (amount, ids))| (currency, amount, ids))
+        .collect();
+    if due.is_empty() {
+        return None;
+    }
+    let cause = engine.begin_action("payout");
+    let destination = payout_destination(engine, ctx);
+    let p = ctx.config.payout_failure_probability;
+    let mut control = control;
+    for (currency, amount, swept) in due {
+        let created = engine.now().unix_seconds();
+        let id = ctx.payments.id(ObjectType::Payout.id_prefix());
+        let bt_id = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
+        let fail = match control.as_deref_mut() {
+            Some(rng) => rng.chance(p),
+            None => ctx.payout_rng.chance(p),
+        };
+        let bt = new_payout_balance_transaction(&bt_id, created, amount, &currency, &id, false);
+        engine.create_obj(
+            ObjectType::BalanceTransaction,
+            bt_id.clone(),
+            &bt,
+            cause.clone(),
+            &[],
+        );
+        let payout = new_payout(&NewPayout {
+            id: &id,
+            created,
+            amount,
+            currency: &currency,
+            destination: &destination,
+            balance_transaction: &bt_id,
+        });
+        engine.create_obj(
+            ObjectType::Payout,
+            id.clone(),
+            &payout,
+            cause.clone(),
+            &["payout.created"],
+        );
+        engine.record_payout(&id, swept);
+        let now = engine.now();
+        ctx.schedule(
+            now.plus_ms(PAYOUT_IN_TRANSIT_MS),
+            Continuation::PayoutInTransit { id: id.clone() },
+            cause.clone(),
+        );
+        ctx.schedule(
+            SimTime(payout.arrival_date * 1000),
+            Continuation::PayoutArrive { id, fail },
+            cause.clone(),
+        );
+    }
+    Some(cause)
+}
+
+/// The payout goes `in_transit` (`payout.updated`).
+pub(super) fn payout_in_transit(engine: &mut Engine, id: &str, cause: &Cause) {
+    engine
+        .update_obj::<stripe::Payout>(
+            ObjectType::Payout,
+            id,
+            |p| p.status = "in_transit".to_string(),
+            cause.clone(),
+            ChangeKind::StateChanged,
+            &["payout.updated"],
+        )
+        .expect("live payout");
+}
+
+/// The payout arrives at its `arrival_date`: `paid` with reconciliation `completed`
+/// (`payout.paid`, `payout.updated`, `payout.reconciliation_completed`), or, when `fail` was
+/// drawn, `failed` with the balance transaction that returns its funds (`type:
+/// payout_failure`, `+amount`, `available` at once; `payout.failed`, `payout.updated`).
+pub(super) fn payout_arrive(
+    engine: &mut Engine,
+    ctx: &mut Ctx,
+    id: &str,
+    fail: bool,
+    cause: &Cause,
+) {
+    let t = ObjectType::Payout;
+    if !fail {
+        engine
+            .update_obj::<stripe::Payout>(
+                t,
+                id,
+                pay_payout,
+                cause.clone(),
+                ChangeKind::StateChanged,
+                &[
+                    "payout.paid",
+                    "payout.updated",
+                    "payout.reconciliation_completed",
+                ],
+            )
+            .expect("live payout");
+        return;
+    }
+    let payout: stripe::Payout = engine.latest_obj(t, id).expect("live payout");
+    let created = engine.now().unix_seconds();
+    let bt_id = ctx.payments.id(ObjectType::BalanceTransaction.id_prefix());
+    let bt =
+        new_payout_balance_transaction(&bt_id, created, payout.amount, &payout.currency, id, true);
+    engine.create_obj(
+        ObjectType::BalanceTransaction,
+        bt_id.clone(),
+        &bt,
+        cause.clone(),
+        &[],
+    );
+    engine
+        .update_obj::<stripe::Payout>(
+            t,
+            id,
+            |p| fail_payout(p, &bt_id),
+            cause.clone(),
+            ChangeKind::StateChanged,
+            &["payout.failed", "payout.updated"],
+        )
+        .expect("live payout");
 }

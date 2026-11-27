@@ -3,7 +3,7 @@
 pub(crate) mod events;
 pub(crate) mod store;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use serde::Serialize;
@@ -96,6 +96,11 @@ pub(crate) struct Engine {
     accounts: Vec<AccountMeta>,
     /// Draws account IDs.
     account_ids: SimRng,
+    /// Per scope, the balance transactions each payout swept, in creation order (phase 8
+    /// ruling P5). Derived truth: replay rebuilds it, so it is not exported.
+    payouts: BTreeMap<Scope, BTreeMap<String, Vec<String>>>,
+    /// Per scope, every balance transaction some payout swept.
+    swept: BTreeMap<Scope, BTreeSet<String>>,
 }
 
 impl Engine {
@@ -120,7 +125,37 @@ impl Engine {
             deliveries: Deliveries::new(&config.webhooks, streams),
             accounts: Vec::new(),
             account_ids: streams.stream("accounts.ids"),
+            payouts: BTreeMap::new(),
+            swept: BTreeMap::new(),
         }
+    }
+
+    /// Records, in the current scope, that `payout` swept the balance transactions `swept`.
+    /// A transaction is swept at most once.
+    pub(crate) fn record_payout(&mut self, payout: &str, swept: Vec<String>) {
+        let set = self.swept.entry(self.scope.clone()).or_default();
+        for id in &swept {
+            let fresh = set.insert(id.clone());
+            debug_assert!(fresh, "{id} swept twice");
+        }
+        self.payouts
+            .entry(self.scope.clone())
+            .or_default()
+            .insert(payout.to_string(), swept);
+    }
+
+    /// The balance transactions `payout` swept in `scope`, in creation order; empty for an
+    /// unknown payout.
+    pub(crate) fn payout_members(&self, scope: &Scope, payout: &str) -> &[String] {
+        self.payouts
+            .get(scope)
+            .and_then(|p| p.get(payout))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether a payout in `scope` swept the balance transaction `txn`.
+    pub(crate) fn swept(&self, scope: &Scope, txn: &str) -> bool {
+        self.swept.get(scope).is_some_and(|s| s.contains(txn))
     }
 
     /// What the mock knows about an account ever connected.
