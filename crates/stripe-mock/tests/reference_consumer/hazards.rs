@@ -117,7 +117,10 @@ async fn stale_retry_carries_older_version() {
 
     // Naive: the last body to arrive wins, and it is the late retry.
     assert_ne!(bodies.last().unwrap()["data"]["object"], latest);
-    // Correct: the newest `created` wins (ties by arrival).
+    // Correct here: the newest `created` wins. `created` has one-second resolution, so
+    // this only orders events from different seconds (the updates above are 2 s apart).
+    // A same-second tie has no safe answer from `created` or from arrival order: refetch
+    // the object instead.
     let newest = bodies
         .iter()
         .enumerate()
@@ -142,15 +145,21 @@ async fn delete_before_create_under_reorder() {
     }
     m.quiesce().await.unwrap();
 
-    // When each snapshot create/delete was first scheduled. Real HTTP doesn't order
-    // arrivals within a step, so the mock's schedule is the order that counts.
-    let mut first_attempt: BTreeMap<String, SimTime> = BTreeMap::new();
+    // When the consumer accepted each snapshot create/delete: its first successful
+    // attempt. The hook server rejects the first attempt of some events, which are then
+    // applied at their retry, so the first schedule is not the order a sync sees. Real
+    // HTTP doesn't order arrivals within a step either, so the log's times count.
+    let mut accepted_at: BTreeMap<String, SimTime> = BTreeMap::new();
     for r in m.delivery_log() {
-        if let DeliveryRecordKind::Scheduled { attempt_at, .. } = r.kind {
-            first_attempt.entry(r.event_id).or_insert(attempt_at);
+        if let DeliveryRecordKind::Attempt {
+            outcome: AttemptOutcome::Success { .. },
+            ..
+        } = r.kind
+        {
+            accepted_at.entry(r.event_id).or_insert(r.at);
         }
     }
-    let mut scheduled: Vec<(SimTime, String, bool)> = m
+    let mut accepted: Vec<(SimTime, String, bool, String)> = m
         .event_timeline()
         .into_iter()
         .filter(|e| e.format == EventFormat::Snapshot)
@@ -160,30 +169,41 @@ async fn delete_before_create_under_reorder() {
                 "customer.deleted" => true,
                 _ => return None,
             };
-            Some((first_attempt[&e.id], e.object_id, deleted))
+            Some((accepted_at[&e.id], e.object_id, deleted, e.id))
         })
         .collect();
-    scheduled.sort();
+    accepted.sort();
 
+    // Inversions in accepted order, and those reordering alone caused (neither event's
+    // first attempt was rejected), so the test is about the reorder window.
+    let mut create_of: BTreeMap<&str, &str> = BTreeMap::new();
+    let (mut inverted, mut by_reorder) = (0, 0);
+    for (_, id, deleted, ev) in &accepted {
+        if !*deleted {
+            create_of.insert(id, ev);
+        }
+    }
     let mut created_seen = BTreeSet::new();
-    let inverted = scheduled
-        .iter()
-        .filter(|(_, id, deleted)| {
-            if *deleted {
-                !created_seen.contains(id)
-            } else {
-                created_seen.insert(id.clone());
-                false
+    for (_, id, deleted, ev) in &accepted {
+        if !*deleted {
+            created_seen.insert(id.clone());
+        } else if !created_seen.contains(id) {
+            inverted += 1;
+            if !fails_first(ev) && !fails_first(create_of[id.as_str()]) {
+                by_reorder += 1;
             }
-        })
-        .count();
-    assert!(inverted >= 1, "no delete was scheduled before its create");
+        }
+    }
+    assert!(
+        by_reorder >= 1,
+        "reordering put no delete before its create ({inverted} inversions in all)"
+    );
 
     // Naive upsert in delivery order: a delete before its create leaves a ghost.
     let mut naive = BTreeSet::new();
     // Correct: remember deleted IDs and ignore a later create of one.
     let (mut correct, mut tombstones) = (BTreeSet::new(), BTreeSet::new());
-    for (_, id, deleted) in &scheduled {
+    for (_, id, deleted, _) in &accepted {
         if *deleted {
             naive.remove(id);
             correct.remove(id);
@@ -199,6 +219,9 @@ async fn delete_before_create_under_reorder() {
     assert!(correct.is_empty(), "{correct:?}");
 }
 
+/// `late_tail.max` in `ending_before_poller_misses_late_events`, in seconds.
+const LATE_TAIL_MAX_S: i64 = 600;
+
 #[tokio::test]
 async fn ending_before_poller_misses_late_events() {
     use crate::client::{Client, Fetched};
@@ -208,7 +231,8 @@ async fn ending_before_poller_misses_late_events() {
     let (snapshot, thin) = (HookServer::start(), HookServer::start());
     let m = quiet_mock(
         "[actions]\nnew_customer = 30.0\n\
-         [events]\nlate_tail = { probability = 0.5, min = \"1m\", max = \"10m\" }\n",
+         [events]\nvisibility_lag = { distribution = \"fixed\", ms = 0 }\n\
+         late_tail = { probability = 0.5, min = \"1m\", max = \"10m\" }\n",
         &snapshot,
         &thin,
     )
@@ -222,7 +246,9 @@ async fn ending_before_poller_misses_late_events() {
     // Naive: ask only for what is newer than the newest event seen.
     let mut naive: BTreeSet<String> = BTreeSet::new();
     let mut cursor: Option<String> = None;
-    // Correct: re-read a window as long as the late tail, and dedupe by ID.
+    // Correct: re-read a window at least as long as the total visibility lag, and
+    // dedupe by ID. Here that is the late tail's max, because `visibility_lag` is pinned
+    // to 0; with an unbounded lag distribution no fixed window is enough.
     let mut overlap: BTreeSet<String> = BTreeSet::new();
     let mut newest_created: i64 = 0;
     for tick in 0..=120 {
@@ -242,7 +268,10 @@ async fn ending_before_poller_misses_late_events() {
         }
         naive.extend(data.iter().map(|e| e["id"].as_str().unwrap().to_string()));
 
-        let base = format!("/v1/events?limit=100&created[gte]={}", newest_created - 600);
+        let base = format!(
+            "/v1/events?limit=100&created[gte]={}",
+            newest_created - LATE_TAIL_MAX_S
+        );
         let mut p = page(base.clone()).await;
         loop {
             let data = p["data"].as_array().unwrap();

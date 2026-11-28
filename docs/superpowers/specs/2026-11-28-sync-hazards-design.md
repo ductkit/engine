@@ -33,15 +33,15 @@ The reference consumer harness shows that the mock's faults break a naive sync, 
    - Update a customer until the update event is one whose first attempt fails (`fails_first`), then update it again.
    - The retry's body is the older state.
    - The delivery log's retry `Attempt` has `object_version < latest_version`.
-   - Applying bodies in arrival order (naive) ends on the older state. Keeping the event with the newest `created`, with ties broken by arrival, ends on the latest.
+   - Applying bodies in arrival order (naive) ends on the older state. Keeping the event with the newest `created` ends on the latest. `created` has one-second resolution, so this only orders events from different seconds; a same-second tie has no safe answer from `created` or arrival, and a sync must refetch the object instead.
 2. **`delete_before_create_under_reorder`.**
    - Create and delete many customers a second apart, with a wide `reorder_window`.
-   - In at least one pair, the `customer.deleted` delivery is scheduled before its `customer.created`. This is read from the delivery log's `Scheduled.attempt_at`, not from arrival, which real HTTP doesn't order.
+   - In at least one pair, the consumer accepts `customer.deleted` before its `customer.created`, and neither event's first attempt was rejected, so the reordering alone caused it. The order comes from the delivery log's first successful `Attempt`, not from arrival, which real HTTP doesn't order. (Retries of rejected first attempts cause further inversions; the test counts but doesn't rely on them.)
    - A naive upsert, applying in scheduled order, keeps the customer. A consumer that remembers deleted IDs drops it.
 3. **`ending_before_poller_misses_late_events`.**
    - Use a high `late_tail` probability.
    - A loop that polls `/v1/events?ending_before=<newest seen>` each step misses some events.
-   - A poller that re-reads `created[gte] = newest_created − late_tail.max` and dedupes by ID sees every event once quiesce has made them visible.
+   - A poller that re-reads `created[gte] = newest_created − late_tail.max` and dedupes by ID sees every event once quiesce has made them visible. The window has to cover the *total* visibility lag. The test pins `visibility_lag` to 0 so the late tail's max is enough; with an unbounded lag distribution no fixed window is.
 4. **`same_second_events_list_out_of_truth_order`.**
    - Turn `same_second_shuffle` on and apply several updates to one customer in one instant.
    - `/v1/events` lists them out of truth order for some burst; retry bursts until one does.
