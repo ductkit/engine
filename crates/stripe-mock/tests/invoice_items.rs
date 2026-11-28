@@ -435,6 +435,86 @@ async fn oversized_pending_item_stays_pending() {
 }
 
 #[tokio::test]
+async fn checkout_subscriptions_leave_pending_items_pending() {
+    let m = mock_with("seed = 22").await;
+    common::recurring_prices(&m, 1, "month");
+    let cust = m.create_customer(Default::default()).unwrap();
+    // The session opens now and completes about 30 minutes later; its amount is fixed now.
+    let cause = m
+        .run_action(Action::Checkout {
+            customer: Some(cust.clone()),
+            mode: Some(ductkit_stripe_mock::CheckoutMode::Subscription),
+            complete: Some(true),
+        })
+        .unwrap();
+    let cs = created_by(&m, &cause, ObjectType::CheckoutSession);
+    let currency = state(&m, ObjectType::CheckoutSession, &cs)["currency"].clone();
+    // A pending item in the session's currency, created while the session is open.
+    let price = (0..300)
+        .find_map(|_| {
+            let mut ids: Vec<String> = m
+                .truth_log()
+                .into_iter()
+                .filter(|u| u.object_type == ObjectType::Price)
+                .map(|u| u.object_id)
+                .collect();
+            ids.dedup();
+            let found = ids.into_iter().find(|id| {
+                let p = state(&m, ObjectType::Price, id);
+                p["active"] == true
+                    && p["type"] == "one_time"
+                    && p["currency"] == currency
+                    && p["unit_amount"].as_i64() > Some(0)
+                    && p["unit_amount"].as_i64() < Some(MAX_CHARGE_AMOUNT)
+            });
+            if found.is_none() {
+                m.run_action(Action::CatalogChange).unwrap();
+            }
+            found
+        })
+        .expect("a one-time price in the session currency");
+    let item_cause = m
+        .run_action(create_item(&cust, Some(&price), Some(1)))
+        .unwrap();
+    let ii = created_by(&m, &item_cause, ObjectType::InvoiceItem);
+    m.step(DAY).await.unwrap();
+    let session = state(&m, ObjectType::CheckoutSession, &cs);
+    assert_eq!(session["status"], "complete");
+    let invoice = state(
+        &m,
+        ObjectType::Invoice,
+        session["invoice"].as_str().unwrap(),
+    );
+    assert_eq!(invoice["currency"], currency);
+    assert_eq!(invoice["amount_paid"], session["amount_total"]);
+    assert!(lines(&invoice).iter().all(|l| line_item(l).is_none()));
+    assert_eq!(
+        state(&m, ObjectType::InvoiceItem, &ii)["invoice"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn named_quantities_stay_within_the_maximum_charge() {
+    let m = mock_with("seed = 4").await;
+    let (price, _) = prices(&m, None);
+    let cust = m.create_customer(Default::default()).unwrap();
+    for q in [u64::MAX, i64::MAX as u64, MAX_CHARGE_AMOUNT as u64 + 1] {
+        match m.run_action(create_item(&cust, Some(&price), Some(q))) {
+            Err(MockError::InvalidAction(msg)) => {
+                assert!(msg.contains(&q.to_string()), "{msg}")
+            }
+            other => panic!("{q}: {other:?}"),
+        }
+    }
+    assert!(
+        m.truth_log()
+            .iter()
+            .all(|u| u.object_type != ObjectType::InvoiceItem)
+    );
+}
+
+#[tokio::test]
 async fn generated_items_and_their_churn() {
     let m =
         mock_with("seed = 11\n[actions]\nnew_customer = 5.0\n[churn.invoiceitem]\ndelete = 2.0")

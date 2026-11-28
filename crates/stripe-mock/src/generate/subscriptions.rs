@@ -268,7 +268,15 @@ pub(crate) fn start_paid_now(
 ) -> String {
     create_subscription(engine, ctx, customer, draw, cause);
     let sub = &draw.id;
-    let invoice = invoice_subscription(engine, ctx, sub, BillingReason::SubscriptionCreate, cause);
+    // The session fixed the amount, so no pending item joins this invoice.
+    let invoice = invoice_subscription(
+        engine,
+        ctx,
+        sub,
+        BillingReason::SubscriptionCreate,
+        false,
+        cause,
+    );
     finalize(engine, &invoice, cause);
     payments::pay_invoice(engine, ctx, &invoice, true, cause);
     set_status(engine, sub, Status::Active, cause);
@@ -320,12 +328,14 @@ pub(crate) fn item_lines(engine: &Engine, sub: &str) -> (Vec<LineSpec>, (i64, i6
     (lines, period)
 }
 
-/// Creates a subscription invoice and points `latest_invoice` at it.
+/// Creates a subscription invoice and points `latest_invoice` at it. `take_pending`: whether
+/// the customer's pending invoice items join it (see [`create_draft_invoice`]).
 pub(crate) fn invoice_subscription(
     engine: &mut Engine,
     ctx: &mut Ctx,
     sub: &str,
     reason: BillingReason,
+    take_pending: bool,
     cause: &Cause,
 ) -> String {
     let customer = latest_sub(engine, sub).customer.id().to_string();
@@ -338,6 +348,7 @@ pub(crate) fn invoice_subscription(
         reason,
         Some(sub),
         period,
+        take_pending,
         cause,
     );
     let id = invoice.clone();
@@ -386,8 +397,14 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
             if sub_status(engine, &sub) != Some(Status::Incomplete) {
                 return;
             }
-            let invoice =
-                invoice_subscription(engine, ctx, &sub, BillingReason::SubscriptionCreate, &cause);
+            let invoice = invoice_subscription(
+                engine,
+                ctx,
+                &sub,
+                BillingReason::SubscriptionCreate,
+                true,
+                &cause,
+            );
             ctx.then(
                 engine,
                 Continuation::FinalizeFirstInvoice { sub, invoice },
@@ -446,8 +463,14 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
                 &["customer.subscription.updated"],
                 &cause,
             );
-            let invoice =
-                invoice_subscription(engine, ctx, &sub, BillingReason::SubscriptionCycle, &cause);
+            let invoice = invoice_subscription(
+                engine,
+                ctx,
+                &sub,
+                BillingReason::SubscriptionCycle,
+                true,
+                &cause,
+            );
             schedule_renewal(engine, ctx, &sub, &cause);
             ctx.then(
                 engine,

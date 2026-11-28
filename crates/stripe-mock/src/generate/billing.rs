@@ -131,7 +131,8 @@ fn invoice_items(engine: &Engine, invoice: &str) -> Vec<String> {
 /// the invoice's currency and keeps the subtotal within [`payments::MAX_CHARGE_AMOUNT`];
 /// otherwise it stays pending. Invoice, line and one-off item IDs come from the
 /// `"generate.billing"` stream, drawn as before items existed; joining draws nothing.
-/// Returns the invoice ID.
+/// With `take_pending` false (a Checkout subscription's first invoice, whose amount the
+/// session fixed), no pending item joins. Returns the invoice ID.
 #[allow(clippy::too_many_arguments)] // each argument is part of the invoice
 pub(crate) fn create_draft_invoice(
     engine: &mut Engine,
@@ -141,6 +142,7 @@ pub(crate) fn create_draft_invoice(
     reason: BillingReason,
     subscription: Option<&str>,
     period: (i64, i64),
+    take_pending: bool,
     cause: &Cause,
 ) -> String {
     let id = ctx.billing.id(ObjectType::Invoice.id_prefix());
@@ -167,7 +169,12 @@ pub(crate) fn create_draft_invoice(
         .map(|l| l.price.unit_amount.flatten().unwrap_or(0) * l.spec.quantity as i64)
         .sum();
     let mut joined = Vec::new();
-    for item in customer_items(engine, customer) {
+    let candidates = if take_pending {
+        customer_items(engine, customer)
+    } else {
+        Vec::new()
+    };
+    for item in candidates {
         let fits = subtotal + item.amount <= payments::MAX_CHARGE_AMOUNT;
         if item_invoice(&item).is_some() || Some(&item.currency) != currency.as_ref() || !fits {
             continue;
@@ -573,6 +580,7 @@ pub(crate) fn one_off_invoice(
         BillingReason::Manual,
         None,
         (now, now),
+        true,
         &cause,
     );
     let next = if outcome == InvoiceOutcome::DeleteDraft {
@@ -730,6 +738,18 @@ pub(crate) fn create_invoice_item(
         return Err(MockError::InvalidAction(
             "an invoice item needs a quantity of at least 1".to_string(),
         ));
+    }
+    // A named quantity must keep the item's amount within the maximum charge (and in range
+    // of an `i64`).
+    if let (Some(q), Some(p)) = (quantity, &price) {
+        let unit = payments::unit_amount(engine, p);
+        let amount = i64::try_from(q).ok().and_then(|q| unit.checked_mul(q));
+        if amount.is_none_or(|a| a > payments::MAX_CHARGE_AMOUNT) {
+            return Err(MockError::InvalidAction(format!(
+                "quantity {q} of price {p} exceeds the maximum charge of {}",
+                payments::MAX_CHARGE_AMOUNT
+            )));
+        }
     }
     let cause = engine.begin_action("invoice_item");
     let customer = match customer {
