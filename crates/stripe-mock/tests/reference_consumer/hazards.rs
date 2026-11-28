@@ -337,3 +337,90 @@ async fn same_second_events_list_out_of_truth_order() {
         "replaying the list ends on a stale state"
     );
 }
+
+#[tokio::test]
+async fn thin_fetch_after_delete_returns_stub() {
+    use crate::client::{Client, Fetched};
+    use crate::truth::{Synced, Truth};
+    use ductkit_stripe_mock::ObjectType;
+
+    let (snapshot, thin) = (HookServer::start(), HookServer::start());
+    let m = quiet_mock("", &snapshot, &thin).await;
+    let c = m.create_customer(NewCustomer::default()).unwrap();
+    m.step(Duration::from_secs(60)).await.unwrap();
+    m.update_customer(&c, CustomerUpdate::SetName(Some("before delete".into())))
+        .unwrap();
+    m.step(Duration::from_secs(60)).await.unwrap();
+    m.delete_customer(&c).unwrap();
+    m.quiesce().await.unwrap();
+
+    // The hint for the update arrives, but the object is gone by the time it's fetched.
+    let mut cursor = 0;
+    let hint = thin
+        .take_new(&mut cursor)
+        .into_iter()
+        .find(|e| e["type"] == "v1.customer.updated" && e["related_object"]["id"] == c.as_str())
+        .expect("a thin v1.customer.updated for the customer");
+    let url = hint["related_object"]["url"].as_str().unwrap();
+    let resp = common::get(&m, url).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "a deleted customer is a 200 stub, not a 404"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["deleted"], true, "{body}");
+
+    // Storing the stub as the object is a state the customer never had.
+    let truth = Truth::from_log(&m.truth_log());
+    let key = (None, ObjectType::Customer, c.clone());
+    let naive: Synced = [(key.clone(), body)].into_iter().collect();
+    assert_eq!(truth.classify(&naive).other, vec![key]);
+    // Correct: the stub means gone.
+    assert!(matches!(
+        Client::new(&m).get(url, None).await,
+        Fetched::Gone
+    ));
+}
+
+#[tokio::test]
+async fn stale_read_regresses_after_webhook() {
+    let (snapshot, thin) = (HookServer::start(), HookServer::start());
+    let m = quiet_mock(
+        "[api]\nstale_read = { probability = 1.0, max_lag = \"10m\" }\n",
+        &snapshot,
+        &thin,
+    )
+    .await;
+    let c = m.create_customer(NewCustomer::default()).unwrap();
+    // Older than `max_lag`, so a stale read lands on version 1, never before creation.
+    m.step(Duration::from_secs(20 * 60)).await.unwrap();
+    m.update_customer(&c, CustomerUpdate::SetName(Some("v2".into())))
+        .unwrap();
+    m.step(Duration::from_secs(1)).await.unwrap();
+    m.quiesce().await.unwrap();
+
+    let mut cursor = 0;
+    let webhook = snapshot
+        .take_new(&mut cursor)
+        .into_iter()
+        .find(|e| e["type"] == "customer.updated" && e["data"]["object"]["id"] == c.as_str())
+        .expect("the customer.updated webhook");
+    assert_eq!(webhook["data"]["object"], state_at(&m, &c, 2));
+
+    // A refetch after the webhook can go back to version 1.
+    let v1 = state_at(&m, &c, 1);
+    let mut regressed = false;
+    for _ in 0..10 {
+        let r = common::get(&m, &format!("/v1/customers/{c}")).await;
+        assert_eq!(r.status(), 200);
+        if r.json::<Value>().await.unwrap() == v1 {
+            regressed = true;
+            break;
+        }
+    }
+    assert!(
+        regressed,
+        "no retrieve returned the version before the webhook"
+    );
+}
