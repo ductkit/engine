@@ -52,12 +52,6 @@ pub enum Action {
     /// Archive a product (`prod_…`), price (`price_…`), promotion code (`promo_…`, set
     /// inactive) or tax rate (`txr_…`) now. Control-only.
     Archive { id: String },
-    /// A random coupon, promotion code or tax rate change (phase 9 ruling Q6): create one,
-    /// deactivate or archive one, or delete a coupon.
-    BillingCatalogChange,
-    /// Delete the coupon `id`, deactivating its active promotion codes first. A missing or
-    /// already deleted coupon is an error naming it. Control-only.
-    DeleteCoupon { id: String },
     /// A manual invoice for the named or a random customer, walked to `outcome`
     /// (drawn when `None`). A fixed outcome is a control-only hook.
     OneOffInvoice {
@@ -149,6 +143,12 @@ pub enum Action {
     /// `actions.payout = "daily"` does, whatever that setting. Control-only. With no
     /// balance above 0, an error naming the scope.
     Payout,
+    /// A random coupon, promotion code or tax rate change (phase 9 ruling Q6): create one,
+    /// deactivate or archive one, or delete a coupon.
+    BillingCatalogChange,
+    /// Delete the coupon `id`, deactivating its active promotion codes first. A missing or
+    /// already deleted coupon is an error naming it. Control-only.
+    DeleteCoupon { id: String },
 }
 
 /// The kind of an external account.

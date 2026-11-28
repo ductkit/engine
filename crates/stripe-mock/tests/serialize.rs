@@ -160,6 +160,10 @@ fn actions_round_trip() {
             id: Some("sub_1".into()),
             at_period_end: Some(true),
         },
+        Action::BillingCatalogChange,
+        Action::DeleteCoupon {
+            id: "AbCd1234".into(),
+        },
     ];
     for a in actions {
         let v = serde_json::to_value(&a).unwrap();
@@ -168,6 +172,14 @@ fn actions_round_trip() {
     assert_eq!(
         serde_json::to_value(Action::NewCustomer).unwrap(),
         json!({"type": "new_customer"})
+    );
+    assert_eq!(
+        serde_json::to_value(Action::BillingCatalogChange).unwrap(),
+        json!({"type": "billing_catalog_change"})
+    );
+    assert_eq!(
+        serde_json::to_value(Action::DeleteCoupon { id: "c".into() }).unwrap(),
+        json!({"type": "delete_coupon", "id": "c"})
     );
     for o in [
         InvoiceOutcome::DeleteDraft,
