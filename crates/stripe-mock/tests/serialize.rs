@@ -181,6 +181,13 @@ fn actions_round_trip() {
         Action::RemoveDiscount {
             id: Some("di_1".into()),
         },
+        Action::CreditNote {
+            invoice: Some("in_1".into()),
+            amount: Some(100),
+        },
+        Action::VoidCreditNote {
+            id: Some("cn_1".into()),
+        },
     ];
     for a in actions {
         let v = serde_json::to_value(&a).unwrap();
@@ -225,6 +232,18 @@ fn actions_round_trip() {
     assert_eq!(
         serde_json::to_value(Action::RemoveDiscount { id: None }).unwrap(),
         json!({"type": "remove_discount", "id": null})
+    );
+    // Both fields of `credit_note` may be left out.
+    assert_eq!(
+        serde_json::from_value::<Action>(json!({"type": "credit_note"})).unwrap(),
+        Action::CreditNote {
+            invoice: None,
+            amount: None,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(Action::VoidCreditNote { id: None }).unwrap(),
+        json!({"type": "void_credit_note", "id": null})
     );
     for o in [
         InvoiceOutcome::DeleteDraft,

@@ -158,10 +158,6 @@ impl Engine {
     }
 
     /// Records, in the current scope, the line items of `credit_note`, in creation order.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "credit notes arrive in phase 9 Task 7")
-    )]
     pub(crate) fn record_credit_note_lines(&mut self, credit_note: &str, lines: Vec<String>) {
         let previous = self
             .credit_note_lines

@@ -15,6 +15,7 @@ mod billing_catalog;
 mod catalog;
 mod checkout;
 mod connect;
+mod credit_notes;
 mod discounts;
 mod mux;
 mod payments;
@@ -184,6 +185,20 @@ pub enum Action {
     /// Remove the named or a random live discount from its parent. A named one that is
     /// missing or already removed, or none to pick, is an error naming it.
     RemoveDiscount { id: Option<String> },
+    /// A credit note (phase 9 ruling Q8) on the named or a random eligible invoice for
+    /// `amount` (drawn when `None`): a pre-payment note on an `open` invoice, which lowers
+    /// `amount_due`, or a post-payment note on a `paid` one, which refunds its charge. A
+    /// named invoice that is missing, neither open nor paid, or has nothing left to credit,
+    /// or an `amount` outside `[1, amount_remaining − 1]` (open) or `[1, left to refund]`
+    /// (paid), is an error naming it; so is no invoice the amount fits.
+    CreditNote {
+        invoice: Option<String>,
+        amount: Option<i64>,
+    },
+    /// Void the named or a random issued pre-payment credit note whose invoice is still
+    /// open, giving the credit back. A named note that is missing, void, post-payment or
+    /// on an invoice that is no longer open, or none to void, is an error naming it.
+    VoidCreditNote { id: Option<String> },
 }
 
 /// The kind of an external account.
@@ -228,6 +243,7 @@ enum ActionKind {
     InvoiceItem,
     InvoiceItemDelete,
     DiscountChange,
+    CreditNote,
 }
 
 /// A follow-up step of an action.
@@ -630,6 +646,11 @@ impl Generator {
                 a.discount_change,
                 "generate.discount_change",
             ),
+            (
+                ActionKind::CreditNote,
+                a.credit_note,
+                "generate.credit_note",
+            ),
         ];
         let actions = specs
             .into_iter()
@@ -772,6 +793,7 @@ impl Generator {
                 ActionKind::BillingCatalogChange => config.billing_catalog_change,
                 ActionKind::InvoiceItem => config.invoice_item,
                 ActionKind::DiscountChange => config.discount_change,
+                ActionKind::CreditNote => config.credit_note,
                 _ => continue,
             };
             a.base_rate = rate;
@@ -927,6 +949,16 @@ impl Generator {
             )?,
             Action::RemoveDiscount { id } => {
                 discounts::remove_discount(&mut self.control, engine, id)?
+            }
+            Action::CreditNote { invoice, amount } => credit_notes::credit_note_hook(
+                &mut self.control,
+                engine,
+                &mut self.ctx,
+                invoice,
+                amount,
+            )?,
+            Action::VoidCreditNote { id } => {
+                credit_notes::void_credit_note(&mut self.control, engine, id)?
             }
             Action::OneOffInvoice { customer, outcome } => billing::one_off_invoice(
                 &mut self.control,
@@ -1153,11 +1185,14 @@ impl Generator {
                 self.run_due_now(engine);
                 return;
             }
-            // Phase 9 ruling Q10: stubs that draw nothing until the task building the type
-            // fills them in.
-            // Task 7: a credit note `metadata.note` update.
-            ObjectType::CreditNote => return,
-            // Task 8: a schedule `metadata.note` update.
+            // Phase 9 ruling Q10: a `metadata.note` update, drawn from the pagination stream.
+            ObjectType::CreditNote => {
+                credit_notes::pagination_update(&mut self.pagination_rng, engine);
+                self.run_due_now(engine);
+                return;
+            }
+            // Phase 9 ruling Q10: a stub that draws nothing until Task 8 fills it in with a
+            // schedule `metadata.note` update.
             ObjectType::SubscriptionSchedule => return,
             // Not listable on their own.
             ObjectType::Discount | ObjectType::CreditNoteLineItem => return,
@@ -1379,6 +1414,7 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
         }
         ActionKind::InvoiceItemDelete => billing::churn_delete_item(rng, engine),
         ActionKind::DiscountChange => discounts::discount_change(rng, engine, ctx),
+        ActionKind::CreditNote => credit_notes::credit_note_action(rng, engine, ctx),
     }
 }
 

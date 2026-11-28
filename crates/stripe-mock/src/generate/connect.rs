@@ -409,12 +409,17 @@ const FULL_FEE_REFUND_PROBABILITY: f64 = 0.7;
 /// application fee, and how much. Only a connected account's scope can: the platform's own
 /// payments never do. With `accounts.application_fee.probability` at 0 nothing is drawn.
 pub(super) fn draw_application_fee(engine: &Engine, ctx: &mut Ctx, amount: i64) -> Option<i64> {
-    let (probability, percent) = (ctx.application_fee.probability, ctx.application_fee.percent);
+    let probability = ctx.application_fee.probability;
     if engine.scope().is_none() || probability <= 0.0 || !ctx.fee_rng.chance(probability) {
         return None;
     }
-    // Rounded half up; no fee when that is 0.
-    let fee = (amount as f64 * percent / 100.0 + 0.5).floor() as i64;
+    application_fee_for(ctx, amount)
+}
+
+/// The application fee on `amount` at `accounts.application_fee.percent`, rounded half up;
+/// `None` when that is 0. Draws nothing: the caller has decided the payment carries a fee.
+pub(super) fn application_fee_for(ctx: &Ctx, amount: i64) -> Option<i64> {
+    let fee = (amount as f64 * ctx.application_fee.percent / 100.0 + 0.5).floor() as i64;
     (fee > 0).then_some(fee)
 }
 

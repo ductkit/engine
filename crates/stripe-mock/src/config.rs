@@ -434,6 +434,9 @@ pub struct ActionsConfig {
     /// A discount added to a random customer or subscription, or a random one removed
     /// (phase 9 ruling Q7).
     pub discount_change: f64,
+    /// A credit note on a random open or paid invoice, or a random pre-payment note voided
+    /// (phase 9 ruling Q8).
+    pub credit_note: f64,
     pub renew_subscription_cycle: RenewMode,
     /// Gap between consecutive steps of one action.
     pub step_delay: Distribution,
@@ -469,6 +472,7 @@ impl ActionsConfig {
             ),
             ("actions.invoice_item", self.invoice_item),
             ("actions.discount_change", self.discount_change),
+            ("actions.credit_note", self.credit_note),
         ] {
             check_rate(name, rate)?;
         }
@@ -1287,6 +1291,25 @@ mod tests {
             (0.5, 0.1)
         );
         assert_eq!(c.actions.discount_change, 0.3);
+        assert_eq!(c.actions.credit_note, 0.2);
+    }
+
+    #[test]
+    fn config_accepts_a_credit_note_rate() {
+        let c = Config::from_toml_str(
+            "[actions]
+credit_note = 0.5",
+        )
+        .unwrap();
+        assert_eq!(c.actions.credit_note, 0.5);
+        assert_eq!(Config::default().actions.credit_note, 0.0);
+        let msg = Config::from_toml_str(
+            "[actions]
+credit_note = -1.0",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("actions.credit_note"), "{msg}");
     }
 
     #[test]

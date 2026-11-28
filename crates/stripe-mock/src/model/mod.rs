@@ -7,6 +7,7 @@ pub mod amounts;
 pub mod catalog;
 pub mod checkout;
 pub mod connect;
+pub mod credit_note;
 pub mod customer;
 pub mod discounts;
 pub mod embedded;

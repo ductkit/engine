@@ -404,7 +404,13 @@ pub(crate) fn pay_invoice(
     let customer = inv.customer.id().to_string();
     let pm = ensure_payment_method(engine, ctx, &customer, cause);
     let (pi, ip_id) = match open_invoice_payment(engine, invoice) {
-        Some(ip) => (intent_of(&ip), ip.id),
+        Some(ip) => {
+            let pi = intent_of(&ip);
+            if ip.amount_requested != amount {
+                reprice_attempt(engine, ctx, &ip.id, &pi, amount, cause);
+            }
+            (pi, ip.id)
+        }
         None => {
             let pi = create_payment_intent(
                 engine,
@@ -458,6 +464,54 @@ pub(crate) fn pay_invoice(
     }
     outcome.invoice_payment = Some(ip_id);
     Some(outcome)
+}
+
+/// Before a retry of an invoice whose `amount_remaining` changed since its first attempt (a
+/// pre-payment credit note issued or voided, phase 9 ruling Q8): the open invoice payment's
+/// `amount_requested` and its payment intent's `amount` become `amount`, silently (Stripe
+/// announces no payment intent amount change). An intent that carries an application fee
+/// gets it recomputed on the new amount, without a draw.
+fn reprice_attempt(engine: &mut Engine, ctx: &Ctx, ip: &str, pi: &str, amount: i64, cause: &Cause) {
+    engine
+        .update_obj::<InvoicePayment>(
+            ObjectType::InvoicePayment,
+            ip,
+            |p| p.amount_requested = amount,
+            cause.clone(),
+            ChangeKind::Updated,
+            &[],
+        )
+        .expect("live invoice payment");
+    let fee = connect::application_fee_for(ctx, amount);
+    engine
+        .update_obj::<PaymentIntent>(
+            ObjectType::PaymentIntent,
+            pi,
+            |p| {
+                p.amount = Some(amount);
+                if p.application_fee_amount.flatten().is_some() {
+                    p.application_fee_amount = Some(fee);
+                }
+            },
+            cause.clone(),
+            ChangeKind::Updated,
+            &[],
+        )
+        .expect("live payment intent");
+}
+
+/// The charge that paid the invoice: its `paid` invoice payment's intent's `latest_charge`.
+/// `None` for an invoice paid with no payment (a zero amount) or not paid.
+pub(crate) fn invoice_charge(engine: &Engine, invoice: &str) -> Option<String> {
+    let ip = engine
+        .store()
+        .children(ObjectType::InvoicePayment, "invoice", invoice)
+        .into_iter()
+        .find(|o| o.latest.state["status"] == "paid")?;
+    let pi = ip.latest.state["payment"]["payment_intent"].as_str()?;
+    engine.latest(ObjectType::PaymentIntent, pi)?.state["latest_charge"]
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Before an open invoice is voided: its open invoice payment
