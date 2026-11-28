@@ -12,12 +12,14 @@ use ductkit_stripe_mock::stripe::{check_payload, schema_fields};
 use ductkit_stripe_mock::{ChangeKind, MockStripe, ObjectType, StateUpdate, expand_paths};
 use serde_json::Value;
 
-/// Every action and churn rate above zero, the phase-7 and phase-8 ones included, with daily
-/// payouts of which a fifth fail. Rates are low so that 30 days of history in four scopes
-/// stay quick to serve and check in a debug build.
+/// Every action and churn rate above zero, the phase 7 to 9 ones included, with daily
+/// payouts of which a fifth fail. Rates are low so that the history of four scopes stays
+/// quick to serve and check in a debug build.
 const BUSY_RATES: &str = "[actions]\n\
     new_customer = 0.4\nstart_subscription = 0.15\ncancel_subscription = 0.03\n\
     catalog_change = 0.05\none_off_invoice = 0.1\none_off_payment = 0.3\nrefund = 0.05\n\
+    billing_catalog_change = 0.05\ninvoice_item = 0.05\ndiscount_change = 0.05\n\
+    credit_note = 0.05\nschedule_subscription = 0.2\n\
     dispute = 0.04\nsave_payment_method = 0.1\ncheckout = 0.15\n\
     application_fee_refund = 0.05\ntransfer_reversal = 0.05\n\
     payment_failure_probability = 0.3\n\
@@ -27,6 +29,8 @@ const BUSY_RATES: &str = "[actions]\n\
     [churn.price]\nupdate = 0.02\narchive = 0.01\n\
     [churn.subscription]\nupdate = 0.05\n\
     [churn.invoice]\nupdate = 0.05\n\
+    [churn.coupon]\nupdate = 0.02\n\
+    [churn.invoiceitem]\ndelete = 0.02\n\
     [churn.account]\nupdate = 0.02\n\
     [churn.payment_method]\ndetach = 0.02\n\
     [churn.person]\nupdate = 0.02\ndelete = 0.005\n\
@@ -34,7 +38,9 @@ const BUSY_RATES: &str = "[actions]\n\
 
 /// The busy run's config: seed 7, three initial connected accounts (half v1, half v2),
 /// every Connect charge pattern, application fees on half the connected accounts'
-/// payments, 30 days of history, one snapshot and one thin destination taking every event.
+/// payments, 120 days of history at a quarter of the rates (long enough for subscription
+/// schedules of two or three phases of 1-3 months to end, at about the volume of 30 days at
+/// full rate), one snapshot and one thin destination taking every event.
 /// Accounts disconnect slowly enough that controlled ones stay connected, so their external
 /// accounts and persons are reachable.
 fn busy_config(snap: &str, thin: &str) -> String {
@@ -45,7 +51,7 @@ fn busy_config(snap: &str, thin: &str) -> String {
          account_api = {{ v1 = 0.5, v2 = 0.5 }}\n\
          platform_payments = {{ own = 0.4, destination = 0.3, separate = 0.3 }}\n\
          application_fee = {{ probability = 0.5, percent = 10.0 }}\n\
-         [history]\nduration = \"30d\"\n\
+         [history]\nduration = \"120d\"\nscale = 0.25\n\
          {BUSY_RATES}\
          [[destinations]]\nname = \"snap\"\nurl = \"{snap}\"\npayload = \"snapshot\"\n\
          enabled_events = [\"*\"]\nconnect = true\n\
@@ -63,7 +69,8 @@ async fn busy_run(snap: &Receiver, thin: &Receiver) -> MockStripe {
 }
 
 /// The boolean fields whose `true` [`Served`] records: a fully reversed transfer, a fully
-/// refunded charge or application fee.
+/// refunded charge or application fee. It also records `inactive` for `active: false`, and
+/// an invoice item's `pending` or `invoiced`.
 const FLAGS: [&str; 2] = ["reversed", "refunded"];
 
 /// What the served payloads showed: how often each `object` appeared, each
@@ -89,6 +96,21 @@ impl Served {
                         if o.get(flag) == Some(&Value::Bool(true)) {
                             self.flags.insert((object.clone(), flag.to_string()));
                         }
+                    }
+                    // A deactivated promotion code or archived tax rate, and an invoice
+                    // item pending or on an invoice.
+                    if o.get("active") == Some(&Value::Bool(false)) {
+                        self.flags.insert((object.clone(), "inactive".to_string()));
+                    }
+                    if object == "invoiceitem"
+                        && let Some(invoice) = o.get("invoice")
+                    {
+                        let state = if invoice.is_null() {
+                            "pending"
+                        } else {
+                            "invoiced"
+                        };
+                        self.flags.insert((object.clone(), state.to_string()));
                     }
                 }
                 o.values().for_each(|c| self.record(c));
@@ -261,6 +283,12 @@ const LISTS: &[&str] = &[
     "/v1/transfers",
     "/v1/application_fees",
     "/v1/payouts",
+    "/v1/coupons",
+    "/v1/promotion_codes",
+    "/v1/invoiceitems",
+    "/v1/credit_notes",
+    "/v1/tax_rates",
+    "/v1/subscription_schedules",
 ];
 
 /// The value at a dotted `path` of `v`, stepping into the first item of a `data` array.
@@ -366,6 +394,7 @@ async fn check_scope(
     for (list, sub, t) in [
         ("/v1/transfers", "reversals", ObjectType::TransferReversal),
         ("/v1/application_fees", "refunds", ObjectType::FeeRefund),
+        ("/v1/credit_notes", "lines", ObjectType::CreditNoteLineItem),
     ] {
         for parent in &listed[list] {
             let path = format!("{list}/{}/{sub}", id_of(parent));
@@ -404,6 +433,7 @@ async fn check_scope(
     for t in [
         ObjectType::TransferReversal,
         ObjectType::FeeRefund,
+        ObjectType::CreditNoteLineItem,
         ObjectType::BankAccount,
         ObjectType::Card,
         ObjectType::Person,
@@ -454,7 +484,11 @@ async fn check_scope(
             }
             let (base, at) = retrieve_at(*t, id, &u.state, scope).unwrap();
             let v = fetch(m, served, &format!("{base}?expand[]={path}"), at.as_deref()).await;
-            let got = at_path(&v, path);
+            // A list of IDs (`discounts`) is checked by its first item.
+            let got = match at_path(&v, path) {
+                Value::Array(a) => a.first().unwrap_or(&Value::Null),
+                got => got,
+            };
             assert!(got.is_object(), "{base} expand {path}: {got}");
             // An ID expands to the object it names, from whichever scope holds it (P2).
             if let Some(want) = id_at(&u.state, path) {
@@ -495,7 +529,8 @@ const INCLUDABLE: [(ObjectType, &str); 2] = [
     (ObjectType::Invoice, "payments"),
 ];
 
-/// The ID the field `path` names in `state`, if it holds one.
+/// The ID the field `path` names in `state`, if it holds one: for a list of IDs
+/// (`discounts`), the first.
 fn id_at<'a>(state: &'a Value, path: &str) -> Option<&'a str> {
     let (parent, target) = path.rsplit_once('.').unwrap_or(("", path));
     let holder = if parent.is_empty() {
@@ -503,7 +538,10 @@ fn id_at<'a>(state: &'a Value, path: &str) -> Option<&'a str> {
     } else {
         at_path(state, parent)
     };
-    holder[target].as_str()
+    match &holder[target] {
+        Value::Array(ids) => ids.first()?.as_str(),
+        v => v.as_str(),
+    }
 }
 
 /// The scope the object at `path` of `t`'s `state` (in `scope`) lives in: the cross-scope
@@ -549,6 +587,20 @@ fn expands(ctx: &Ctx, scope: &Option<String>, t: ObjectType, state: &Value, path
     if let Some(acct) = &target
         && !ctx.connected.contains(acct)
     {
+        return false;
+    }
+    // A deleted coupon stays an ID wherever it is named, and so does a deleted discount
+    // except in `invoice.discounts`: no other field allows the tombstone (phase 9 ruling
+    // Q10; Task 9 ruling).
+    let deleted = |ty: ObjectType| {
+        ctx.truth
+            .get(&(scope.clone(), ty, id.to_string()))
+            .is_none_or(|u| u.kind == ChangeKind::Deleted)
+    };
+    if path.ends_with("coupon") && deleted(ObjectType::Coupon) {
+        return false;
+    }
+    if path == "discounts" && t != ObjectType::Invoice && deleted(ObjectType::Discount) {
         return false;
     }
     if (t, path) == (ObjectType::Payout, "destination") {
@@ -641,10 +693,10 @@ async fn busy_connect_run_conforms() {
         served.record(&v);
     }
 
+    // Every type, phase 9's included: credit note line items through their note's
+    // sub-list, and discounts embedded in customers (and in subscriptions, expanded).
     assert_eq!(ObjectType::ALL.len(), 33);
-    // The last eight are phase 9's (ruling Q1). Nothing generates them yet; Task 9 drops
-    // this skip once every one is served.
-    for t in &ObjectType::ALL[..25] {
+    for t in &ObjectType::ALL {
         assert!(
             served.objects.contains_key(t.as_str()),
             "{t:?} never served; served: {:?}",
@@ -669,6 +721,12 @@ async fn busy_connect_run_conforms() {
         ("payout", "in_transit"),
         ("payout", "paid"),
         ("payout", "failed"),
+        ("subscription_schedule", "active"),
+        ("subscription_schedule", "released"),
+        ("subscription_schedule", "completed"),
+        ("subscription_schedule", "canceled"),
+        ("credit_note", "issued"),
+        ("credit_note", "void"),
     ];
     for (object, status) in want {
         assert!(
@@ -687,15 +745,29 @@ async fn busy_connect_run_conforms() {
         "no closed dispute served: {:?}",
         served.statuses
     );
-    for (object, flag) in [("transfer", "reversed"), ("application_fee", "refunded")] {
+    for (object, flag) in [
+        ("transfer", "reversed"),
+        ("application_fee", "refunded"),
+        ("promotion_code", "inactive"),
+        ("tax_rate", "inactive"),
+        ("invoiceitem", "pending"),
+        ("invoiceitem", "invoiced"),
+    ] {
         assert!(
             served
                 .flags
                 .contains(&(object.to_string(), flag.to_string())),
-            "no {object} with {flag}: true served; served: {:?}",
+            "no {object} with {flag} served; served: {:?}",
             served.flags
         );
     }
+    // A coupon was deleted (it is no longer served, but discounts may still name it).
+    assert!(
+        truth
+            .iter()
+            .any(|((_, t, _), u)| *t == ObjectType::Coupon && u.kind == ChangeKind::Deleted),
+        "no coupon deleted"
+    );
     // External accounts of both objects.
     for object in ["bank_account", "card"] {
         assert!(
@@ -736,20 +808,11 @@ async fn busy_connect_run_conforms() {
         // An account's external account belongs to no customer.
         (ObjectType::BankAccount, "customer"),
         (ObjectType::Card, "customer"),
-        // Phase 9 (ruling Q10): nothing generates these yet. Each task building a type
-        // removes its paths here; Task 9 checks none is left.
-        (ObjectType::Customer, "discount.promotion_code"),
-        (ObjectType::Customer, "discount.source.coupon"),
-        (ObjectType::Subscription, "schedule"),
-        (ObjectType::Subscription, "discounts"),
-        (ObjectType::Invoice, "discounts"),
+        // Promotion codes are never restricted to a customer (phase 9 ruling Q6).
         (ObjectType::PromotionCode, "customer"),
-        (ObjectType::PromotionCode, "promotion.coupon"),
+        // Discounts apply to invoices and their lines, never to an invoice item, whose
+        // `discounts` stays `[]` (ruling Q2).
         (ObjectType::InvoiceItem, "discounts"),
-        (ObjectType::CreditNote, "customer"),
-        (ObjectType::CreditNote, "invoice"),
-        (ObjectType::SubscriptionSchedule, "customer"),
-        (ObjectType::SubscriptionSchedule, "subscription"),
     ];
     // Paths whose objects live only in connected accounts: direct charges' fees, `py_`
     // payments and `pyr_` refunds, external accounts, and the controlled accounts' payout
@@ -910,13 +973,18 @@ fn excluded(t: ObjectType, o: &Value) -> Vec<&'static str> {
         | ObjectType::BankAccount
         | ObjectType::Card
         | ObjectType::Person => vec![],
-        // Phase 9: nothing generates these yet; the task building each type records its
-        // exclusions here.
+        // Phase 9.
+        ObjectType::Coupon => vec![
+            // Includable-only: served with `expand[]=applies_to` /
+            // `expand[]=currency_options`, not by default.
+            "applies_to",
+            "currency_options",
+        ],
         // Not nullable, and documented as `null` for `discountable: true` items, which every
         // generated item is.
         ObjectType::InvoiceItem => vec!["net_amount"],
-        ObjectType::Coupon
-        | ObjectType::PromotionCode
+        // Every documented field is present (a value or `null`) on each.
+        ObjectType::PromotionCode
         | ObjectType::Discount
         | ObjectType::CreditNote
         | ObjectType::CreditNoteLineItem
@@ -1037,6 +1105,8 @@ async fn served_objects_carry_their_documented_fields() {
          save_payment_method = 2.0\ncheckout = 3.0\npayment_failure_probability = 0.3\n\
          application_fee_refund = 2.0\ntransfer_reversal = 2.0\n\
          payout = \"daily\"\npayout_failure_probability = 0.3\n\
+         billing_catalog_change = 1.0\ninvoice_item = 2.0\ndiscount_change = 2.0\n\
+         credit_note = 1.0\nschedule_subscription = 1.0\n\
          [churn.person]\nupdate = 0.5\n\
          [churn.external_account]\ncreate = 0.5\n",
     )
@@ -1062,6 +1132,21 @@ async fn served_objects_carry_their_documented_fields() {
     let customers = objects[&ObjectType::Customer].clone();
     for c in &customers {
         let path = format!("/v1/customers/{}/payment_methods", id_of(c));
+        first_page(&m, &mut served, &mut objects, &path, None).await;
+    }
+    // A discount is served only embedded (phase 9 ruling Q2), on any customer, so every
+    // page is searched.
+    for c in walk_v1(&m, &mut served, "/v1/customers", None).await {
+        if c["discount"].is_object() {
+            objects
+                .entry(ObjectType::Discount)
+                .or_default()
+                .push(c["discount"].clone());
+        }
+    }
+    let notes = objects[&ObjectType::CreditNote].clone();
+    for n in notes.iter().take(5) {
+        let path = format!("/v1/credit_notes/{}/lines", id_of(n));
         first_page(&m, &mut served, &mut objects, &path, None).await;
     }
     // The children of the platform's transfers and fees, through the sub-lists of ten
@@ -1141,9 +1226,7 @@ async fn served_objects_carry_their_documented_fields() {
     );
 
     let mut failures = Vec::new();
-    // The phase 9 types (the last eight, ruling Q1) are not generated yet; Task 9 drops
-    // this skip.
-    for t in ObjectType::ALL[..25].iter().copied() {
+    for t in ObjectType::ALL {
         let schema = t.as_str();
         let list = objects.get(&t).cloned().unwrap_or_default();
         assert!(!list.is_empty(), "no {t:?} served");
@@ -1412,6 +1495,218 @@ async fn money_moves_consistently() {
     }
 }
 
+/// The sum of `amount` over the entries of the array at `field` of `v` (`[]` or `null`: 0).
+fn sum_amounts(v: &Value, field: &str) -> i64 {
+    v[field]
+        .as_array()
+        .map_or(0, |a| a.iter().map(|e| e["amount"].as_i64().unwrap()).sum())
+}
+
+/// Review Focus 1 of phase 9: invoice money adds up, over the busy run's truth state in
+/// every scope (disconnected accounts' included).
+#[tokio::test]
+async fn billing_money_moves_consistently() {
+    let snap = Receiver::start(|_| (200, Duration::ZERO));
+    let thin = Receiver::start(|_| (200, Duration::ZERO));
+    let m = busy_run(&snap, &thin).await;
+    let log = m.truth_log();
+    let truth = latest(&m);
+    let state = |scope: &Option<String>, t: ObjectType, id: &str| -> &Value {
+        &truth
+            .get(&(scope.clone(), t, id.to_string()))
+            .unwrap_or_else(|| panic!("{t:?} {id} not in {scope:?}"))
+            .state
+    };
+    let scopes: BTreeSet<Option<String>> = truth.keys().map(|(s, _, _)| s.clone()).collect();
+
+    // Each credit note's line items: created in its scope just before it (ruling Q8 order),
+    // as a line item names no note.
+    let mut note_lines: BTreeMap<(Option<String>, String), Vec<String>> = BTreeMap::new();
+    let mut pending: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+    for u in log.iter().filter(|u| u.kind == ChangeKind::Created) {
+        match u.object_type {
+            ObjectType::CreditNoteLineItem => pending
+                .entry(u.account.clone())
+                .or_default()
+                .push(u.object_id.clone()),
+            ObjectType::CreditNote => {
+                let lines = pending.remove(&u.account).unwrap_or_default();
+                note_lines.insert((u.account.clone(), u.object_id.clone()), lines);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        pending.values().all(Vec::is_empty),
+        "line items with no note"
+    );
+
+    let mut n = BTreeMap::<&str, usize>::new();
+    for scope in &scopes {
+        // Live lines by invoice.
+        let mut lines: BTreeMap<&str, Vec<&Value>> = BTreeMap::new();
+        for (_, l) in live_in(&truth, scope, ObjectType::InvoiceLineItem) {
+            lines
+                .entry(l["invoice"].as_str().unwrap())
+                .or_default()
+                .push(l);
+        }
+        let notes: Vec<(&String, &Value)> =
+            live_in(&truth, scope, ObjectType::CreditNote).collect();
+        // The succeeded charges paying each invoice, through its paid invoice payments.
+        let paying = |invoice: &str| -> Vec<&Value> {
+            live_in(&truth, scope, ObjectType::InvoicePayment)
+                .filter(|(_, p)| p["invoice"] == invoice && p["status"] == "paid")
+                .flat_map(|(_, p)| {
+                    let pi = p["payment"]["payment_intent"].as_str().unwrap().to_string();
+                    live_in(&truth, scope, ObjectType::Charge)
+                        .filter(move |(_, c)| {
+                            c["payment_intent"] == pi.as_str() && c["status"] == "succeeded"
+                        })
+                        .map(|(_, c)| c)
+                })
+                .collect()
+        };
+
+        for (id, inv) in live_in(&truth, scope, ObjectType::Invoice) {
+            let get = |f: &str| inv[f].as_i64().unwrap_or_else(|| panic!("{id}.{f}"));
+            // Subtotal − discount + tax = total; the lines add up to the invoice.
+            let of = lines.get(id.as_str()).cloned().unwrap_or_default();
+            let subtotal: i64 = of.iter().map(|l| l["amount"].as_i64().unwrap()).sum();
+            assert_eq!(get("subtotal"), subtotal, "{id}");
+            assert_eq!(get("subtotal_excluding_tax"), subtotal, "{id}");
+            let d = sum_amounts(inv, "total_discount_amounts");
+            let tax = sum_amounts(inv, "total_taxes");
+            let line_d: i64 = of.iter().map(|l| sum_amounts(l, "discount_amounts")).sum();
+            let line_tax: i64 = of.iter().map(|l| sum_amounts(l, "taxes")).sum();
+            assert_eq!(line_d, d, "{id}: line discounts");
+            assert_eq!(line_tax, tax, "{id}: line taxes");
+            assert_eq!(get("total_excluding_tax"), subtotal - d, "{id}");
+            assert_eq!(get("total"), subtotal - d + tax, "{id}");
+            // `amount_due` = total − active pre-payment credits.
+            let credited = |kind: &str| -> i64 {
+                notes
+                    .iter()
+                    .filter(|(_, c)| {
+                        c["invoice"] == id.as_str() && c["type"] == kind && c["status"] == "issued"
+                    })
+                    .map(|(_, c)| c["amount"].as_i64().unwrap())
+                    .sum()
+            };
+            let pre = credited("pre_payment");
+            assert_eq!(get("pre_payment_credit_notes_amount"), pre, "{id}");
+            assert_eq!(
+                get("post_payment_credit_notes_amount"),
+                credited("post_payment"),
+                "{id}"
+            );
+            assert_eq!(get("amount_due"), get("total") - pre, "{id}");
+            // The charge's amount is the `amount_remaining` it paid. An open invoice's
+            // payment intent may still hold the amount before a credit until the retry
+            // (known gap), so only charges are compared.
+            let charged: i64 = paying(id)
+                .iter()
+                .map(|c| c["amount"].as_i64().unwrap())
+                .sum();
+            match inv["status"].as_str().unwrap() {
+                "paid" => {
+                    assert_eq!(get("amount_paid"), charged, "{id}");
+                    assert_eq!(get("amount_paid"), get("amount_due"), "{id}");
+                    assert_eq!(get("amount_remaining"), 0, "{id}");
+                    *n.entry("paid invoices").or_default() += 1;
+                }
+                "open" | "draft" => {
+                    assert_eq!(get("amount_paid"), 0, "{id}");
+                    assert_eq!(get("amount_remaining"), get("amount_due"), "{id}");
+                }
+                _ => {}
+            }
+            *n.entry("discounted invoices").or_default() += usize::from(d > 0);
+            *n.entry("taxed invoices").or_default() += usize::from(tax > 0);
+            *n.entry("credited invoices").or_default() += usize::from(pre > 0);
+        }
+
+        // Checkout's first subscription invoice takes no pending item, discount or tax:
+        // the session fixed its amount, which is what the invoice paid.
+        for (id, cs) in live_in(&truth, scope, ObjectType::CheckoutSession) {
+            if cs["mode"] != "subscription" || cs["status"] != "complete" {
+                continue;
+            }
+            let inv = state(scope, ObjectType::Invoice, cs["invoice"].as_str().unwrap());
+            assert_eq!(inv["total"], cs["amount_total"], "{id}");
+            assert_eq!(inv["amount_paid"], cs["amount_total"], "{id}");
+            assert_eq!(inv["total_discount_amounts"], serde_json::json!([]), "{id}");
+            assert_eq!(inv["total_taxes"], serde_json::json!([]), "{id}");
+            *n.entry("checkout subscription invoices").or_default() += 1;
+        }
+
+        // A note's amount is the sum of its line items, each crediting a line of its
+        // invoice; a post-payment note's refund adds up to its `post_payment_amount`, and
+        // its charge's `amount_refunded` includes it.
+        let mut refunded: BTreeMap<String, i64> = BTreeMap::new();
+        for (id, note) in &notes {
+            let invoice = note["invoice"].as_str().unwrap();
+            let items = &note_lines[&(scope.clone(), id.to_string())];
+            assert!(!items.is_empty(), "{id}: no line items");
+            let mut sum = 0;
+            for li in items {
+                let li = state(scope, ObjectType::CreditNoteLineItem, li);
+                sum += li["amount"].as_i64().unwrap();
+                let line = li["invoice_line_item"].as_str().unwrap();
+                assert!(
+                    lines[invoice].iter().any(|l| l["id"] == line),
+                    "{id}: {line} is not a line of {invoice}"
+                );
+            }
+            assert_eq!(note["amount"], sum, "{id}");
+            assert_eq!(note["total"], sum, "{id}");
+            if note["type"] == "post_payment" {
+                let refunds = note["refunds"].as_array().unwrap();
+                let total: i64 = refunds
+                    .iter()
+                    .map(|r| r["amount_refunded"].as_i64().unwrap())
+                    .sum();
+                assert_eq!(note["post_payment_amount"], total, "{id}");
+                let paid_by = paying(invoice);
+                assert_eq!(paid_by.len(), 1, "{id}: {invoice} paid by {paid_by:?}");
+                for r in refunds {
+                    let re = state(scope, ObjectType::Refund, r["refund"].as_str().unwrap());
+                    assert_eq!(re["amount"], r["amount_refunded"], "{id}");
+                    assert_eq!(re["charge"], paid_by[0]["id"], "{id}");
+                    *refunded
+                        .entry(re["charge"].as_str().unwrap().to_string())
+                        .or_default() += r["amount_refunded"].as_i64().unwrap();
+                }
+                *n.entry("post-payment notes").or_default() += 1;
+            } else {
+                assert_eq!(note["pre_payment_amount"], sum, "{id}");
+                *n.entry("pre-payment notes").or_default() += 1;
+            }
+        }
+        for (ch, by_notes) in refunded {
+            let charge = state(scope, ObjectType::Charge, &ch);
+            assert!(
+                charge["amount_refunded"].as_i64().unwrap() >= by_notes,
+                "{ch}: refunded {} < {by_notes} by notes",
+                charge["amount_refunded"]
+            );
+        }
+    }
+    // Each relation is exercised, not vacuously true.
+    for what in [
+        "paid invoices",
+        "discounted invoices",
+        "taxed invoices",
+        "credited invoices",
+        "checkout subscription invoices",
+        "post-payment notes",
+        "pre-payment notes",
+    ] {
+        let got = n.get(what).copied().unwrap_or(0);
+        assert!(got >= 1, "no {what}: {n:?}");
+    }
+}
+
 /// One full pagination of `path` (listing `t`), 10 per page: the IDs in order, and how
 /// many served objects differed from the live state the moment their page was served (a
 /// stale read: an older version, or an object missing from the live view's newest page).
@@ -1430,14 +1725,17 @@ async fn paginate_ids(m: &MockStripe, path: &str, t: ObjectType) -> (Vec<String>
         if after.is_empty() {
             // The first page shows the newest objects: a live one newer than the page's
             // first object but missing from it was created after the stale view's time.
-            let first = data.first().map_or(0, |o| o["created"].as_i64().unwrap());
+            // An invoice item has no `created`; its `date` is its creation time.
+            let created = |o: &Value| o["created"].as_i64().or(o["date"].as_i64()).unwrap();
+            let first = data.first().map_or(0, created);
             let shown: BTreeSet<&str> = data.iter().map(|o| o["id"].as_str().unwrap()).collect();
             stale += latest(m)
                 .into_values()
                 .filter(|u| {
                     u.account.is_none()
                         && u.object_type == t
-                        && u.state["created"].as_i64().unwrap() > first
+                        && u.kind != ChangeKind::Deleted
+                        && created(&u.state) > first
                         && !shown.contains(u.object_id.as_str())
                 })
                 .count();
@@ -1457,7 +1755,8 @@ async fn payment_lists_survive_faults() {
         pagination_writes = { probability = 1.0 }\n";
     // Payments: an hour of busy one-off payments. Connect money: platform payments routed to
     // three accounts over 25 days of history with daily payouts, so the platform holds many
-    // transfers and payouts. A payout has no pagination write (spec section 7.4).
+    // transfers and payouts. A payout has no pagination write (spec section 7.4). Billing
+    // extras: invoice items and credit notes.
     let runs = [
         (
             format!(
@@ -1482,6 +1781,21 @@ async fn payment_lists_survive_faults() {
             vec![
                 ("/v1/transfers", ObjectType::Transfer, true),
                 ("/v1/payouts", ObjectType::Payout, false),
+            ],
+        ),
+        // Billing extras: two days of one-off invoices (each line bills an item), pending
+        // items and credit notes. Their pagination writes add a pending item and change a
+        // note's metadata (phase 9 ruling Q10).
+        (
+            format!(
+                "seed = 7\n\
+                 [history]\nduration = \"2d\"\n\
+                 [actions]\nnew_customer = 1.0\none_off_invoice = 2.0\ninvoice_item = 1.0\n\
+                 credit_note = 1.0\npayment_failure_probability = 0.3\n{faults}"
+            ),
+            vec![
+                ("/v1/invoiceitems", ObjectType::InvoiceItem, true),
+                ("/v1/credit_notes", ObjectType::CreditNote, true),
             ],
         ),
     ];

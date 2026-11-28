@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use common::{get, get_as, mock_with, recurring_prices};
 use ductkit_stripe_mock::{
-    AccountApi, Action, Cause, ChargePattern, MockError, MockStripe, ObjectType, StateUpdate,
+    AccountApi, Action, Cause, ChangeKind, ChargePattern, MockError, MockStripe, ObjectType,
+    StateUpdate,
 };
 use serde_json::Value;
 
@@ -30,6 +31,16 @@ fn caused(m: &MockStripe, cause: &Cause) -> Vec<StateUpdate> {
         .into_iter()
         .filter(|u| u.cause.as_ref() == Some(cause))
         .collect()
+}
+
+/// The one object of type `t` that `updates` create, in any scope.
+fn only_in(updates: &[StateUpdate], t: ObjectType) -> String {
+    let ids: Vec<&StateUpdate> = updates
+        .iter()
+        .filter(|u| u.object_type == t && u.kind == ChangeKind::Created)
+        .collect();
+    assert_eq!(ids.len(), 1, "{t:?}: {ids:?}");
+    ids[0].object_id.clone()
 }
 
 /// The one platform-scope object of type `t` in `updates`.
@@ -562,6 +573,18 @@ new_customer = 1.0
 one_off_payment = 2.0
 application_fee_refund = 0.5
 payout = \"daily\"
+start_subscription = 0.5
+catalog_change = 0.2
+one_off_invoice = 0.5
+billing_catalog_change = 0.5
+invoice_item = 0.5
+discount_change = 0.5
+credit_note = 0.5
+schedule_subscription = 0.3
+[churn.coupon]
+update = 0.1
+[churn.invoiceitem]
+delete = 0.1
 [churn.external_account]
 create = 0.5
 delete = 0.2
@@ -653,6 +676,14 @@ delete = 0.1
         payout_scopes.contains(&None) && payout_scopes.len() > 1,
         "{payout_scopes:?}"
     );
+    // Every phase 9 type is generated in a connected account's scope too (Review Focus 4).
+    for t in &ObjectType::ALL[ObjectType::ALL.len() - 8..] {
+        assert!(
+            log.iter()
+                .any(|u| u.object_type == *t && u.account.is_some()),
+            "no {t:?} in a connected account"
+        );
+    }
 
     // Every event's label is its object's scope (an account's own events are labelled with
     // it although the account lives on the platform).
@@ -676,6 +707,117 @@ delete = 0.1
             assert!(e.account.is_some(), "{e:?}");
         }
     }
+
+    // A disconnect drops the account's pending discount ends and schedule steps: nothing
+    // but settlement happens in its scope afterwards (Review Focus 4). The account gets a
+    // `repeating` discount and an active schedule with a monthly phase first.
+    let acct = m
+        .accounts()
+        .into_iter()
+        .find(|a| a.connected)
+        .expect("a connected account")
+        .id;
+    let a = m.account(&acct);
+    let in_acct = |t: ObjectType| -> Vec<StateUpdate> {
+        let mut out: std::collections::BTreeMap<String, StateUpdate> = Default::default();
+        for u in m.truth_log() {
+            if u.object_type == t && u.account.as_deref() == Some(acct.as_str()) {
+                out.insert(u.object_id.clone(), u);
+            }
+        }
+        out.into_values().collect()
+    };
+    let now = || m.now().0 / 1000;
+    let coupon = (0..500)
+        .find_map(|_| {
+            let found = in_acct(ObjectType::Coupon).into_iter().find(|u| {
+                u.kind != ChangeKind::Deleted
+                    && u.state["valid"] == true
+                    && u.state["duration"] == "repeating"
+                    && u.state["duration_in_months"].as_i64() <= Some(3)
+            });
+            if found.is_none() {
+                a.run_action(Action::BillingCatalogChange).unwrap();
+            }
+            found.map(|u| u.object_id)
+        })
+        .expect("a repeating coupon");
+    let cust = a.create_customer(Default::default()).unwrap();
+    let cause = a
+        .run_action(Action::AddDiscount {
+            customer: Some(cust),
+            subscription: None,
+            coupon: Some(coupon),
+            promotion_code: None,
+        })
+        .unwrap();
+    let di = only_in(&caused(&m, &cause), ObjectType::Discount);
+    let discount_end = a.get(ObjectType::Discount, &di).unwrap().unwrap().state["end"]
+        .as_i64()
+        .unwrap();
+    let (sched, phase_end) = (0..20)
+        .find_map(|_| {
+            let cause = a
+                .run_action(Action::ScheduleSubscription {
+                    customer: None,
+                    end_behavior: None,
+                })
+                .unwrap();
+            let id = only_in(&caused(&m, &cause), ObjectType::SubscriptionSchedule);
+            let s = a
+                .get(ObjectType::SubscriptionSchedule, &id)
+                .unwrap()
+                .unwrap();
+            let end = s.state["current_phase"]["end_date"].as_i64().unwrap();
+            (end - now() < 100 * DAY as i64).then_some((id, end))
+        })
+        .expect("a schedule with a monthly phase");
+    let schedule_before = a
+        .get(ObjectType::SubscriptionSchedule, &sched)
+        .unwrap()
+        .unwrap();
+    m.disconnect_account(&acct).unwrap();
+    let cut = m.truth_log().last().unwrap().seq;
+    // Only continuations run from here on, so stepping past both ends stays quick.
+    m.update_actions_config(|c| {
+        c.new_customer = 0.0;
+        c.one_off_payment = 0.0;
+        c.application_fee_refund = 0.0;
+        c.start_subscription = 0.0;
+        c.catalog_change = 0.0;
+        c.one_off_invoice = 0.0;
+        c.billing_catalog_change = 0.0;
+        c.invoice_item = 0.0;
+        c.discount_change = 0.0;
+        c.credit_note = 0.0;
+        c.schedule_subscription = 0.0;
+    })
+    .unwrap();
+    while now() < discount_end.max(phase_end) + DAY as i64 {
+        m.step(Duration::from_secs(10 * DAY)).await.unwrap();
+    }
+    let after: Vec<StateUpdate> = m
+        .truth_log()
+        .into_iter()
+        .filter(|u| u.seq > cut && u.account.as_deref() == Some(acct.as_str()))
+        .collect();
+    assert!(
+        after
+            .iter()
+            .all(|u| u.object_type == ObjectType::BalanceTransaction),
+        "{:?}",
+        after
+            .iter()
+            .filter(|u| u.object_type != ObjectType::BalanceTransaction)
+            .collect::<Vec<_>>()
+    );
+    let last =
+        |t: ObjectType, id: &str| in_acct(t).into_iter().find(|u| u.object_id == id).unwrap();
+    assert_eq!(last(ObjectType::Discount, &di).kind, ChangeKind::Created);
+    assert_eq!(
+        last(ObjectType::SubscriptionSchedule, &sched).version,
+        schedule_before.version
+    );
 }
 
 fn reverse(transfer: &str, amount: Option<i64>) -> Action {
