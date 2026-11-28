@@ -277,3 +277,63 @@ async fn ending_before_poller_misses_late_events() {
     );
     assert_eq!(overlap, all, "the overlap poller missed events");
 }
+
+#[tokio::test]
+async fn same_second_events_list_out_of_truth_order() {
+    use crate::client::{Client, Fetched};
+    use ductkit_stripe_mock::{EventFormat, ObjectType};
+
+    let (snapshot, thin) = (HookServer::start(), HookServer::start());
+    let m = quiet_mock("[events]\nsame_second_shuffle = true\n", &snapshot, &thin).await;
+    let client = Client::new(&m);
+    let c = m.create_customer(NewCustomer::default()).unwrap();
+    m.step(Duration::from_secs(2)).await.unwrap();
+
+    let mut replayed_last: Option<Value> = None;
+    for burst in 0..20 {
+        let second = m.now().unix_seconds();
+        for i in 0..4 {
+            m.update_customer(&c, CustomerUpdate::SetName(Some(format!("b{burst}-{i}"))))
+                .unwrap();
+        }
+        // The burst's events in truth order (the timeline is in creation order).
+        let burst_ids: Vec<String> = m
+            .event_timeline()
+            .into_iter()
+            .filter(|e| {
+                e.format == EventFormat::Snapshot
+                    && e.object_id == c
+                    && e.event_type == "customer.updated"
+                    && e.created.unix_seconds() == second
+            })
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(burst_ids.len(), 4);
+        let Fetched::Object(page) = client
+            .get(&format!("/v1/events?limit=100&created[gte]={second}"), None)
+            .await
+        else {
+            panic!("events list is gone");
+        };
+        // Oldest first, as a consumer replaying the list would apply it.
+        let mut replay: Vec<&Value> = page["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| burst_ids.iter().any(|id| e["id"] == id.as_str()))
+            .collect();
+        replay.reverse();
+        assert_eq!(replay.len(), 4);
+        if replay.last().unwrap()["id"] != burst_ids.last().unwrap().as_str() {
+            replayed_last = Some(replay.last().unwrap()["data"]["object"].clone());
+            break;
+        }
+        m.step(Duration::from_secs(2)).await.unwrap();
+    }
+    let replayed_last = replayed_last.expect("no burst listed out of truth order in 20 tries");
+    let latest = m.get(ObjectType::Customer, &c).unwrap().state;
+    assert_ne!(
+        replayed_last, latest,
+        "replaying the list ends on a stale state"
+    );
+}
