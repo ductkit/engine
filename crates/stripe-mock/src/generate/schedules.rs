@@ -496,3 +496,55 @@ pub(crate) fn pagination_update(rng: &mut SimRng, engine: &mut Engine) {
         &cause,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generate::{Action, Generator};
+    use crate::rng::RngStreams;
+    use crate::{Config, SimTime};
+
+    /// A schedule's item IDs are dropped when it ends early (canceled by the control hook or
+    /// with its subscription), not only at its last phase.
+    #[test]
+    fn schedule_items_are_dropped_when_a_schedule_ends_early() {
+        let config = Config::default();
+        let streams = RngStreams::new(7);
+        let mut engine = Engine::new(SimTime(1_700_000_000_000), &config, &streams);
+        let mut gen_ = Generator::new(&config, &streams, SimTime(1_700_000_000_000));
+        gen_.set_enabled(false, SimTime(1_700_000_000_000));
+        gen_.run_action(&mut engine, Action::NewCustomer).unwrap();
+        for _ in 0..4 {
+            gen_.run_action(
+                &mut engine,
+                Action::ScheduleSubscription {
+                    customer: None,
+                    end_behavior: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(gen_.ctx.schedule_items.len(), 4);
+        let ids: Vec<String> = gen_.ctx.schedule_items.keys().cloned().collect();
+        gen_.run_action(
+            &mut engine,
+            Action::CancelSubscriptionSchedule {
+                id: Some(ids[0].clone()),
+            },
+        )
+        .unwrap();
+        assert!(!gen_.ctx.schedule_items.contains_key(&ids[0]));
+        let customer = engine
+            .latest_obj::<SubscriptionSchedule>(ObjectType::SubscriptionSchedule, &ids[1])
+            .unwrap()
+            .customer
+            .id()
+            .to_string();
+        // A customer deleted through the API ends its schedules where no `Ctx` is at hand.
+        let cause = engine.begin_action("test");
+        crate::generate::delete_customer_cascade(&mut engine, &customer, &cause).unwrap();
+        gen_.run_action(&mut engine, Action::CatalogChange).unwrap();
+        assert!(!gen_.ctx.schedule_items.contains_key(&ids[1]));
+        assert!(gen_.ctx.schedule_items.len() < 4);
+    }
+}

@@ -270,12 +270,12 @@ impl<'a> View<'a> {
         self.state(o).filter(|u| u.kind != ChangeKind::Deleted)
     }
 
-    /// The state retrieve shows: a deleted customer or coupon is its stub, other deleted
-    /// objects (and objects not yet created in this view) are missing.
+    /// The state retrieve shows: a deleted customer is its stub, other deleted objects
+    /// (and objects not yet created in this view) are missing. A deleted coupon is missing
+    /// too: the pinned schema allows only `coupon` on its retrieve.
     pub(crate) fn visible(&self, t: ObjectType, id: &str) -> Option<Value> {
         let u = self.state(self.store().get(t, id)?)?;
-        if u.kind == ChangeKind::Deleted && !matches!(t, ObjectType::Customer | ObjectType::Coupon)
-        {
+        if u.kind == ChangeKind::Deleted && t != ObjectType::Customer {
             return None;
         }
         Some(u.state.clone())
@@ -294,6 +294,14 @@ fn matches(
     let eq = |field: &str, key: &str| {
         f.get(key)
             .is_none_or(|want| s[field].as_str() == Some(want))
+    };
+    // Stripe documents the promotion code `code` filter as case-insensitive.
+    let eq_ci = |field: &str, key: &str| {
+        f.get(key).is_none_or(|want| {
+            s[field]
+                .as_str()
+                .is_some_and(|v| v.eq_ignore_ascii_case(want))
+        })
     };
     match r.t {
         ObjectType::Customer => eq("email", "email"),
@@ -388,7 +396,7 @@ fn matches(
         // `coupon` names the coupon the code promotes.
         ObjectType::PromotionCode => {
             active.is_none_or(|a| s["active"].as_bool() == Some(a))
-                && eq("code", "code")
+                && eq_ci("code", "code")
                 && eq("customer", "customer")
                 && f.get("coupon")
                     .is_none_or(|want| s["promotion"]["coupon"].as_str() == Some(want))

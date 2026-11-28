@@ -461,6 +461,18 @@ impl Ctx {
         self.next_seq += 1;
     }
 
+    /// Drops the item IDs of every schedule that is no longer `active` in the engine's
+    /// current scope. A schedule can end where no `Ctx` is at hand (early endings, a customer
+    /// deleted through the API), so this runs after each step. A schedule the scope cannot
+    /// see is kept.
+    fn prune_schedule_items(&mut self, engine: &Engine) {
+        self.schedule_items.retain(|id, _| {
+            engine
+                .latest(ObjectType::SubscriptionSchedule, id)
+                .is_none_or(|u| u.state["status"] == "active")
+        });
+    }
+
     fn next_settlement(&self) -> Option<SimTime> {
         self.settlements.keys().next().map(|(t, _)| *t)
     }
@@ -915,6 +927,7 @@ impl Generator {
                     engine.set_now(due);
                     let action = &mut self.actions[i];
                     perform(action.kind, &mut action.rng, engine, &mut self.ctx);
+                    self.ctx.prune_schedule_items(engine);
                     action.next_due = action
                         .rng
                         .exp_interval_ms(action.rate)
@@ -932,6 +945,7 @@ impl Generator {
         };
         engine.set_now(at);
         run_continuation(c, cause, engine, &mut self.ctx);
+        self.ctx.prune_schedule_items(engine);
     }
 
     /// Runs `a` now, then every continuation due at or before now (when generation
@@ -1137,6 +1151,7 @@ impl Generator {
                 })?,
         };
         self.run_due_now(engine);
+        self.ctx.prune_schedule_items(engine);
         Ok(cause)
     }
 

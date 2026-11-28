@@ -150,12 +150,17 @@ async fn deleting_a_coupon_deactivates_its_codes() {
         "{events:?}"
     );
 
+    // The pinned schema allows only `coupon` on retrieve, so a deleted coupon is missing
+    // (its tombstone stays in the store for discounts that name it).
     let r = get(&m, &format!("/v1/coupons/{coupon}")).await;
-    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.status().as_u16(), 404);
     let v: Value = r.json().await.unwrap();
-    assert_eq!(
-        v,
-        serde_json::json!({"id": coupon, "object": "coupon", "deleted": true})
+    assert_eq!(v["error"]["code"], "resource_missing");
+    assert!(
+        !list(&m, "/v1/coupons?limit=100")
+            .await
+            .iter()
+            .any(|c| c["id"] == coupon.as_str())
     );
     let r = get(&m, &format!("/v1/promotion_codes/{promo}")).await;
     assert_eq!(r.status().as_u16(), 200);
@@ -168,6 +173,25 @@ async fn deleting_a_coupon_deactivates_its_codes() {
             Err(MockError::InvalidAction(msg)) => assert!(msg.contains(&id), "{msg}"),
             other => panic!("expected invalid_action, got {other:?}"),
         }
+    }
+}
+
+/// Stripe documents the promotion code list's `code` filter as case-insensitive.
+#[tokio::test]
+async fn promotion_code_filter_ignores_case() {
+    let m = mock_with("seed = 9").await;
+    change_until(&m, |m| !active(m, ObjectType::PromotionCode).is_empty());
+    let promo = active(&m, ObjectType::PromotionCode).remove(0);
+    let code = m.get(ObjectType::PromotionCode, &promo).unwrap().state["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for q in [code.clone(), code.to_lowercase()] {
+        let data = list(&m, &format!("/v1/promotion_codes?code={q}")).await;
+        assert!(
+            data.iter().any(|p| p["id"] == promo.as_str()),
+            "code={q} lists {promo}"
+        );
     }
 }
 
