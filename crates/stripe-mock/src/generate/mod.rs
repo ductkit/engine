@@ -1026,6 +1026,17 @@ impl Generator {
             | ObjectType::BankAccount
             | ObjectType::Card
             | ObjectType::Person => return,
+            // Phase 9 ruling Q10: stubs that draw nothing until the task building the type
+            // fills them in. Task 3: coupons, promotion codes and tax rates.
+            ObjectType::Coupon | ObjectType::PromotionCode | ObjectType::TaxRate => return,
+            // Task 4: a new pending invoice item.
+            ObjectType::InvoiceItem => return,
+            // Task 7: a credit note `metadata.note` update.
+            ObjectType::CreditNote => return,
+            // Task 8: a schedule `metadata.note` update.
+            ObjectType::SubscriptionSchedule => return,
+            // Not listable on their own.
+            ObjectType::Discount | ObjectType::CreditNoteLineItem => return,
         };
         let kind = *pick(&mut self.pagination_rng, kinds);
         perform(kind, &mut self.pagination_rng, engine, &mut self.ctx);

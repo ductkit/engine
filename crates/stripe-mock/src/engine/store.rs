@@ -30,8 +30,9 @@ struct TypeStore {
 }
 
 /// The parent fields indexed for each type, as they were at creation. Parent fields never
-/// change, except a payment method's `customer`, which detaching sets to `null`: readers of
-/// that index check the current state.
+/// change, except a payment method's `customer`, which detaching sets to `null`, and an
+/// invoice item's `invoice`, which a pending item gets when it joins an invoice (phase 9
+/// ruling Q4) and the index never sees: readers of those indexes check the current state.
 fn parent_fields(t: ObjectType) -> &'static [&'static str] {
     match t {
         ObjectType::SubscriptionItem => &["subscription"],
@@ -45,6 +46,10 @@ fn parent_fields(t: ObjectType) -> &'static [&'static str] {
         ObjectType::FeeRefund => &["fee"],
         ObjectType::Transfer => &["destination"],
         ObjectType::ApplicationFee => &["account"],
+        ObjectType::PromotionCode | ObjectType::SubscriptionSchedule => &["customer"],
+        ObjectType::Discount => &["customer", "subscription"],
+        ObjectType::InvoiceItem => &["customer", "invoice"],
+        ObjectType::CreditNote => &["invoice", "customer"],
         ObjectType::Customer
         | ObjectType::Product
         | ObjectType::Account
@@ -56,7 +61,10 @@ fn parent_fields(t: ObjectType) -> &'static [&'static str] {
         | ObjectType::Payout
         | ObjectType::BankAccount
         | ObjectType::Card
-        | ObjectType::Person => &[],
+        | ObjectType::Person
+        | ObjectType::Coupon
+        | ObjectType::CreditNoteLineItem
+        | ObjectType::TaxRate => &[],
     }
 }
 

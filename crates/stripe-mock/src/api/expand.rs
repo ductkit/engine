@@ -21,14 +21,21 @@ pub(crate) fn allowed(t: ObjectType) -> &'static [&'static str] {
             "default_payment_method",
             "latest_invoice",
             "items.data.price.product",
+            "schedule",
+            "discounts",
         ],
         ObjectType::Invoice => &[
             "customer",
             "default_payment_method",
             "parent.subscription_details.subscription",
             "payments",
+            "discounts",
         ],
-        ObjectType::Customer => &["invoice_settings.default_payment_method"],
+        ObjectType::Customer => &[
+            "invoice_settings.default_payment_method",
+            "discount.promotion_code",
+            "discount.source.coupon",
+        ],
         ObjectType::Price => &["product"],
         ObjectType::SubscriptionItem => &["price.product"],
         // Each new type's `expandable_fields` whose target is modelled (not `application`
@@ -98,10 +105,19 @@ pub(crate) fn allowed(t: ObjectType) -> &'static [&'static str] {
         ],
         // `account` is a platform-scope object (see `foreign_scope`).
         ObjectType::BankAccount | ObjectType::Card => &["account", "customer"],
+        // Phase 9 ruling Q10.
+        ObjectType::PromotionCode => &["customer", "promotion.coupon"],
+        ObjectType::InvoiceItem => &["customer", "invoice", "discounts"],
+        ObjectType::CreditNote => &["customer", "invoice"],
+        ObjectType::SubscriptionSchedule => &["customer", "subscription"],
         ObjectType::Product
         | ObjectType::InvoiceLineItem
         | ObjectType::Account
-        | ObjectType::Person => &[],
+        | ObjectType::Person
+        | ObjectType::Coupon
+        | ObjectType::Discount
+        | ObjectType::CreditNoteLineItem
+        | ObjectType::TaxRate => &[],
     }
 }
 
@@ -141,8 +157,11 @@ fn type_of_id(id: &str) -> Option<ObjectType> {
             return Some(t);
         }
     }
+    // A coupon has no prefix, so its IDs are recognized only by the field naming them (see
+    // `apply`).
     ObjectType::ALL
         .into_iter()
+        .filter(|t| !t.id_prefix().is_empty())
         .filter(|t| {
             id.strip_prefix(t.id_prefix())
                 .is_some_and(|rest| rest.starts_with('_'))
@@ -152,9 +171,10 @@ fn type_of_id(id: &str) -> Option<ObjectType> {
 
 /// The object an ID names, as expansion shows it: a deleted customer is its
 /// stub, other deleted objects are `null`, unknown IDs and disconnected accounts stay
-/// strings.
-fn lookup(view: &View, id: &str, foreign: Option<Scope>) -> Option<Value> {
-    let t = type_of_id(id)?;
+/// strings. `field` is the segment naming the ID: a `coupon` field names a coupon, whose
+/// ID has no prefix (phase 9 ruling Q10).
+fn lookup(view: &View, id: &str, field: &str, foreign: Option<Scope>) -> Option<Value> {
+    let t = type_of_id(id).or((field == "coupon").then_some(ObjectType::Coupon))?;
     // A foreign scope is read at the view's own time; an account that has disconnected is
     // out of reach, so its objects stay IDs.
     let other;
@@ -179,6 +199,16 @@ fn lookup(view: &View, id: &str, foreign: Option<Scope>) -> Option<Value> {
     // `transfer_data.destination`, `application_fee.account`) is nullable.
     if u.kind == ChangeKind::Deleted && t == ObjectType::Account {
         return None;
+    }
+    // No field naming a coupon allows `deleted_coupon` or `null`, so a deleted coupon stays
+    // an ID.
+    if u.kind == ChangeKind::Deleted && t == ObjectType::Coupon {
+        return None;
+    }
+    // `invoice.discounts` and its lines' `discounts` allow `deleted_discount`, the
+    // tombstone (phase 9 ruling Q2).
+    if u.kind == ChangeKind::Deleted && t == ObjectType::Discount {
+        return Some(u.state.clone());
     }
     if u.kind == ChangeKind::Deleted && t != ObjectType::Customer {
         return Some(Value::Null);
@@ -279,8 +309,20 @@ fn apply(view: &View, v: &mut Value, segs: &[&str]) {
     let Some(child) = v.get_mut(*first) else {
         return;
     };
+    // A list of IDs (`discounts`): each one expands as a field of its own would.
+    if let Some(items) = child.as_array_mut() {
+        for item in items {
+            if let Some(id) = item.as_str()
+                && let Some(found) = lookup(view, id, first, foreign.clone())
+            {
+                *item = found;
+            }
+            apply(view, item, rest);
+        }
+        return;
+    }
     if let Some(id) = child.as_str()
-        && let Some(found) = lookup(view, id, foreign)
+        && let Some(found) = lookup(view, id, first, foreign)
     {
         *child = found;
     }
@@ -305,6 +347,95 @@ pub(crate) fn expand(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Engine;
+    use crate::rng::RngStreams;
+    use crate::{Config, SimTime};
+    use serde_json::json;
+
+    fn engine() -> Engine {
+        let c = Config::from_toml_str("").unwrap();
+        Engine::new(SimTime(1_767_225_600_000), &c, &RngStreams::new(c.seed))
+    }
+
+    fn view(e: &Engine) -> View<'_> {
+        View {
+            engine: e,
+            at: None,
+            scope: None,
+            page_size: 10,
+        }
+    }
+
+    fn discount(id: &str) -> Value {
+        json!({"id": id, "object": "discount", "customer": "cus_1", "subscription": null})
+    }
+
+    /// `discounts` holds IDs: each expands, a deleted discount to its `deleted_discount`
+    /// tombstone (phase 9 ruling Q2), and an unknown one stays an ID.
+    #[test]
+    fn id_arrays_expand_each_id() {
+        let mut e = engine();
+        e.create_json_for_test(ObjectType::Discount, "di_1", discount("di_1"));
+        e.create_json_for_test(ObjectType::Discount, "di_2", discount("di_2"));
+        let mut tombstone = discount("di_2");
+        tombstone["deleted"] = json!(true);
+        let cause = e.begin_action("t");
+        e.delete(ObjectType::Discount, "di_2", &tombstone, cause, &[])
+            .unwrap();
+        let mut inv = json!({"id": "in_1", "object": "invoice",
+                             "discounts": ["di_1", "di_2", "di_nope"]});
+        expand(
+            &view(&e),
+            ObjectType::Invoice,
+            &mut inv,
+            &["discounts".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            inv["discounts"],
+            json!([discount("di_1"), tombstone, "di_nope"])
+        );
+    }
+
+    /// A `coupon` field resolves its unprefixed ID; a deleted coupon stays an ID.
+    #[test]
+    fn coupon_fields_resolve_unprefixed_ids() {
+        let mut e = engine();
+        let coupon = |id: &str| json!({"id": id, "object": "coupon", "valid": true});
+        e.create_json_for_test(ObjectType::Coupon, "ABCDEFGH", coupon("ABCDEFGH"));
+        e.create_json_for_test(ObjectType::Coupon, "ZYXWVUTS", coupon("ZYXWVUTS"));
+        let cause = e.begin_action("t");
+        e.delete(
+            ObjectType::Coupon,
+            "ZYXWVUTS",
+            &json!({"deleted": true, "id": "ZYXWVUTS", "object": "coupon"}),
+            cause,
+            &[],
+        )
+        .unwrap();
+        let promo = |coupon: &str| {
+            json!({"id": "promo_1", "object": "promotion_code",
+                   "promotion": {"coupon": coupon, "type": "coupon"}})
+        };
+        let paths = ["promotion.coupon".to_string()];
+        let mut live = promo("ABCDEFGH");
+        expand(&view(&e), ObjectType::PromotionCode, &mut live, &paths).unwrap();
+        assert_eq!(live["promotion"]["coupon"], coupon("ABCDEFGH"));
+        let mut gone = promo("ZYXWVUTS");
+        expand(&view(&e), ObjectType::PromotionCode, &mut gone, &paths).unwrap();
+        assert_eq!(gone["promotion"]["coupon"], "ZYXWVUTS");
+        // Elsewhere an unprefixed string is not a coupon.
+        let mut cus = json!({"id": "cus_1", "object": "customer",
+                             "discount": {"promotion_code": "ABCDEFGH"}});
+        expand(
+            &view(&e),
+            ObjectType::Customer,
+            &mut cus,
+            &["discount.promotion_code".to_string()],
+        )
+        .unwrap();
+        assert_eq!(cus["discount"]["promotion_code"], "ABCDEFGH");
+    }
 
     #[test]
     fn py_and_pyr_ids_resolve_by_prefix() {
@@ -331,6 +462,20 @@ mod tests {
         assert_eq!(type_of_id("ba_1"), Some(ObjectType::BankAccount));
         assert_eq!(type_of_id("card_1"), Some(ObjectType::Card));
         assert_eq!(type_of_id("person_1"), Some(ObjectType::Person));
+        assert_eq!(type_of_id("promo_1"), Some(ObjectType::PromotionCode));
+        assert_eq!(type_of_id("di_1"), Some(ObjectType::Discount));
+        assert_eq!(type_of_id("ii_1"), Some(ObjectType::InvoiceItem));
+        assert_eq!(type_of_id("cn_1"), Some(ObjectType::CreditNote));
+        assert_eq!(type_of_id("cnli_1"), Some(ObjectType::CreditNoteLineItem));
+        assert_eq!(type_of_id("txr_1"), Some(ObjectType::TaxRate));
+        assert_eq!(
+            type_of_id("sub_sched_1"),
+            Some(ObjectType::SubscriptionSchedule)
+        );
+        assert_eq!(type_of_id("sub_1"), Some(ObjectType::Subscription));
+        // Coupons have no prefix; only a `coupon` field resolves them.
+        assert_eq!(type_of_id("ABCDEFGH"), None);
+        assert_eq!(type_of_id("_ABCDEFG"), None);
         assert_eq!(type_of_id("cs_live_1"), None);
         assert_eq!(type_of_id("nope"), None);
     }

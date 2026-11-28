@@ -133,6 +133,17 @@ impl SimRng {
             .collect()
     }
 
+    /// `len` characters from `[0-9A-Za-z]`, as in a coupon ID.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "coupons arrive in phase 9 Task 3")
+    )]
+    pub(crate) fn code(&mut self, len: usize) -> String {
+        (0..len)
+            .map(|_| ALNUM[self.below(62) as usize] as char)
+            .collect()
+    }
+
     /// A uniformly chosen element of a non-empty slice.
     pub(crate) fn choose<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[self.below(items.len() as u64) as usize]
@@ -237,6 +248,16 @@ mod tests {
         let mut r = RngStreams::new(4).stream("u");
         assert!((0..1000).all(|_| (5..=9).contains(&r.uniform_ms(5, 9))));
         assert_eq!(r.uniform_ms(3, 3), 3);
+    }
+
+    #[test]
+    fn code_draws_alphanumerics() {
+        let mut r = RngStreams::new(6).stream("code");
+        let a = r.code(8);
+        let b = r.code(8);
+        assert_eq!(a.len(), 8);
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric()), "{a}");
+        assert_ne!(a, b);
     }
 
     #[test]

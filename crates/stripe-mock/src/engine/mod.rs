@@ -101,6 +101,9 @@ pub(crate) struct Engine {
     payouts: BTreeMap<Scope, BTreeMap<String, Vec<String>>>,
     /// Per scope, every balance transaction some payout swept.
     swept: BTreeMap<Scope, BTreeSet<String>>,
+    /// Per scope, each credit note's line items, in creation order (phase 9 ruling Q8): a
+    /// line item has no parent field. Derived truth, like `payouts`.
+    credit_note_lines: BTreeMap<Scope, BTreeMap<String, Vec<String>>>,
 }
 
 impl Engine {
@@ -127,6 +130,7 @@ impl Engine {
             account_ids: streams.stream("accounts.ids"),
             payouts: BTreeMap::new(),
             swept: BTreeMap::new(),
+            credit_note_lines: BTreeMap::new(),
         }
     }
 
@@ -150,6 +154,29 @@ impl Engine {
         self.payouts
             .get(scope)
             .and_then(|p| p.get(payout))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Records, in the current scope, the line items of `credit_note`, in creation order.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "credit notes arrive in phase 9 Task 7")
+    )]
+    pub(crate) fn record_credit_note_lines(&mut self, credit_note: &str, lines: Vec<String>) {
+        let previous = self
+            .credit_note_lines
+            .entry(self.scope.clone())
+            .or_default()
+            .insert(credit_note.to_string(), lines);
+        debug_assert!(previous.is_none(), "{credit_note} lines recorded twice");
+    }
+
+    /// The line items of `credit_note` in `scope`, in creation order; empty for an unknown
+    /// note.
+    pub(crate) fn credit_note_lines(&self, scope: &Scope, credit_note: &str) -> &[String] {
+        self.credit_note_lines
+            .get(scope)
+            .and_then(|n| n.get(credit_note))
             .map_or(&[], Vec::as_slice)
     }
 
@@ -594,6 +621,14 @@ impl Engine {
         self.store_mut().replace(update.clone(), pos);
         self.notify(&update);
         Ok(update)
+    }
+
+    /// Creates `id` from raw JSON, announcing nothing: for tests outside this module that
+    /// need an object without building its generated struct.
+    #[cfg(test)]
+    pub(crate) fn create_json_for_test(&mut self, t: ObjectType, id: &str, state: Value) {
+        let cause = self.begin_action("test");
+        self.create_raw(t, id.to_string(), state, cause, &[]);
     }
 
     /// The object's latest version with `at <= at`; `None` if it did not exist yet.
@@ -1108,6 +1143,25 @@ mod tests {
         e.in_scope(Some("acct_1".into()), |e| {
             assert!(e.as_of(ObjectType::Customer, "cus_c", at).is_some());
         });
+    }
+
+    #[test]
+    fn credit_note_lines_are_kept_per_scope() {
+        let mut e = test_engine();
+        e.record_credit_note_lines("cn_1", vec!["cnli_1".into(), "cnli_2".into()]);
+        e.in_scope(Some("acct_1".into()), |e| {
+            e.record_credit_note_lines("cn_1", vec!["cnli_3".into()]);
+        });
+        assert_eq!(e.credit_note_lines(&None, "cn_1"), ["cnli_1", "cnli_2"]);
+        assert_eq!(
+            e.credit_note_lines(&Some("acct_1".into()), "cn_1"),
+            ["cnli_3"]
+        );
+        assert!(e.credit_note_lines(&None, "cn_2").is_empty());
+        assert!(
+            e.credit_note_lines(&Some("acct_2".into()), "cn_1")
+                .is_empty()
+        );
     }
 
     #[test]

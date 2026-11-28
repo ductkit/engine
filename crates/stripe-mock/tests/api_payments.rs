@@ -178,8 +178,37 @@ fn new_types_have_the_documented_names() {
         ),
         (ObjectType::Card, "card", "card", "card"),
         (ObjectType::Person, "person", "person", "person"),
+        // Phase 9 ruling Q1.
+        (ObjectType::Coupon, "coupon", "coupon", ""),
+        (
+            ObjectType::PromotionCode,
+            "promotion_code",
+            "promotion_code",
+            "promo",
+        ),
+        (ObjectType::Discount, "discount", "discount", "di"),
+        (ObjectType::InvoiceItem, "invoiceitem", "invoice_item", "ii"),
+        (ObjectType::CreditNote, "credit_note", "credit_note", "cn"),
+        (
+            ObjectType::CreditNoteLineItem,
+            "credit_note_line_item",
+            "credit_note_line_item",
+            "cnli",
+        ),
+        (ObjectType::TaxRate, "tax_rate", "tax_rate", "txr"),
+        (
+            ObjectType::SubscriptionSchedule,
+            "subscription_schedule",
+            "subscription_schedule",
+            "sub_sched",
+        ),
     ];
-    assert_eq!(ObjectType::ALL.len(), 25);
+    assert_eq!(ObjectType::ALL.len(), 33);
+    // The table lists the types from `PaymentIntent` on, in declaration order.
+    assert_eq!(
+        expected.iter().map(|e| e.0).collect::<Vec<_>>(),
+        ObjectType::ALL[ObjectType::ALL.len() - expected.len()..]
+    );
     for (t, name, serde_name, prefix) in expected {
         assert_eq!(t.as_str(), name);
         assert_eq!(t.serde_name(), serde_name);
@@ -189,4 +218,14 @@ fn new_types_have_the_documented_names() {
         ObjectType::CheckoutSession.api_path("cs_test_1").unwrap(),
         "/v1/checkout/sessions/cs_test_1"
     );
+    assert_eq!(
+        ObjectType::Coupon.api_path("ABCDEFGH").unwrap(),
+        "/v1/coupons/ABCDEFGH"
+    );
+    assert_eq!(
+        ObjectType::InvoiceItem.api_path("ii_1").unwrap(),
+        "/v1/invoiceitems/ii_1"
+    );
+    assert_eq!(ObjectType::Discount.api_path("di_1"), None);
+    assert_eq!(ObjectType::CreditNoteLineItem.api_path("cnli_1"), None);
 }

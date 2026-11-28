@@ -269,6 +269,23 @@ impl Projector {
                 type_: "v2.core.account".to_string(),
                 url: format!("/v2/core/accounts/{}", u.object_id),
             }
+        } else if u.object_type == ObjectType::Discount {
+            // Phase 9 ruling Q2: a discount has no URL of its own, so its events point at
+            // the parent that embeds it: the subscription when set, else the customer.
+            let url = match (
+                u.state["subscription"].as_str(),
+                u.state["customer"].as_str(),
+            ) {
+                (Some(sub), _) => ObjectType::Subscription.api_path(sub),
+                (None, Some(cus)) => ObjectType::Customer.api_path(cus),
+                (None, None) => None,
+            }
+            .unwrap_or_else(|| panic!("discount {} has no parent", u.object_id));
+            stripe::V2CoreEventRelatedObject {
+                id: Some(u.object_id.clone()),
+                type_: name.to_string(),
+                url,
+            }
         } else {
             stripe::V2CoreEventRelatedObject {
                 id: Some(u.object_id.clone()),
@@ -651,6 +668,39 @@ mod tests {
         let t = e.events().get(&u.events.thin[0]).unwrap();
         assert_eq!(t.payload["related_object"]["url"], "/v1/invoices/in_x");
         assert_eq!(t.payload["related_object"]["type"], "invoice");
+    }
+
+    #[test]
+    fn discount_related_object_is_its_parent() {
+        let mut e = engine_with("");
+        let c = e.begin_action("t");
+        let on_sub = e.create_raw(
+            ObjectType::Discount,
+            "di_1".into(),
+            json!({"id": "di_1", "object": "discount", "customer": "cus_1",
+                   "subscription": "sub_1", "start": 1767225600}),
+            c.clone(),
+            &["customer.discount.created"],
+        );
+        let on_customer = e.create_raw(
+            ObjectType::Discount,
+            "di_2".into(),
+            json!({"id": "di_2", "object": "discount", "customer": "cus_1",
+                   "subscription": null, "start": 1767225600}),
+            c,
+            &["customer.discount.created"],
+        );
+        let t = e.events().get(&on_sub.events.thin[0]).unwrap();
+        assert_eq!(t.event_type, "v1.customer.discount.created");
+        assert_eq!(
+            t.payload["related_object"],
+            json!({"id": "di_1", "type": "discount", "url": "/v1/subscriptions/sub_1"})
+        );
+        let t = e.events().get(&on_customer.events.thin[0]).unwrap();
+        assert_eq!(
+            t.payload["related_object"],
+            json!({"id": "di_2", "type": "discount", "url": "/v1/customers/cus_1"})
+        );
     }
 
     #[test]

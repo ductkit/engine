@@ -48,11 +48,23 @@ pub enum ObjectType {
     Card,
     /// A person of a connected account. Child of an account.
     Person,
+    /// A coupon. Its ID has no prefix (phase 9 ruling Q1).
+    Coupon,
+    PromotionCode,
+    /// A discount. Embedded in its customer or subscription; no endpoint of its own.
+    Discount,
+    /// An invoice item. Serializes as `invoice_item`; its Stripe `object` is `invoiceitem`.
+    InvoiceItem,
+    CreditNote,
+    /// A line of a credit note. Served by `/v1/credit_notes/{id}/lines` only.
+    CreditNoteLineItem,
+    TaxRate,
+    SubscriptionSchedule,
 }
 
 impl ObjectType {
     /// Every type, in declaration order.
-    pub const ALL: [ObjectType; 25] = [
+    pub const ALL: [ObjectType; 33] = [
         ObjectType::Customer,
         ObjectType::Product,
         ObjectType::Price,
@@ -78,6 +90,14 @@ impl ObjectType {
         ObjectType::BankAccount,
         ObjectType::Card,
         ObjectType::Person,
+        ObjectType::Coupon,
+        ObjectType::PromotionCode,
+        ObjectType::Discount,
+        ObjectType::InvoiceItem,
+        ObjectType::CreditNote,
+        ObjectType::CreditNoteLineItem,
+        ObjectType::TaxRate,
+        ObjectType::SubscriptionSchedule,
     ];
 
     /// The Stripe `object` name.
@@ -108,11 +128,20 @@ impl ObjectType {
             ObjectType::BankAccount => "bank_account",
             ObjectType::Card => "card",
             ObjectType::Person => "person",
+            ObjectType::Coupon => "coupon",
+            ObjectType::PromotionCode => "promotion_code",
+            ObjectType::Discount => "discount",
+            ObjectType::InvoiceItem => "invoiceitem",
+            ObjectType::CreditNote => "credit_note",
+            ObjectType::CreditNoteLineItem => "credit_note_line_item",
+            ObjectType::TaxRate => "tax_rate",
+            ObjectType::SubscriptionSchedule => "subscription_schedule",
         }
     }
 
     /// The name this type serializes to (`StateUpdate.object_type`, state dump
-    /// keys). It differs from [`as_str`](Self::as_str) for line items.
+    /// keys). It differs from [`as_str`](Self::as_str) for invoice line items and invoice
+    /// items.
     pub fn serde_name(&self) -> String {
         match serde_json::to_value(self) {
             Ok(serde_json::Value::String(s)) => s,
@@ -149,11 +178,21 @@ impl ObjectType {
             ObjectType::BankAccount => "ba",
             ObjectType::Card => "card",
             ObjectType::Person => "person",
+            // Coupon IDs are 8 alphanumerics with no prefix (phase 9 ruling Q1).
+            ObjectType::Coupon => "",
+            ObjectType::PromotionCode => "promo",
+            ObjectType::Discount => "di",
+            ObjectType::InvoiceItem => "ii",
+            ObjectType::CreditNote => "cn",
+            ObjectType::CreditNoteLineItem => "cnli",
+            ObjectType::TaxRate => "txr",
+            ObjectType::SubscriptionSchedule => "sub_sched",
         }
     }
 
     /// The retrieve path of an object, e.g. `/v1/customers/cus_1`; `None` for
-    /// line items, which have no retrieve endpoint.
+    /// line items, discounts and credit note lines, which have no retrieve endpoint, and for
+    /// children, which nest under their parent (see [`sub_path`](Self::sub_path)).
     pub fn api_path(&self, id: &str) -> Option<String> {
         let collection = match self {
             ObjectType::Customer => "customers",
@@ -175,12 +214,20 @@ impl ObjectType {
             ObjectType::Transfer => "transfers",
             ObjectType::ApplicationFee => "application_fees",
             ObjectType::Payout => "payouts",
+            ObjectType::Coupon => "coupons",
+            ObjectType::PromotionCode => "promotion_codes",
+            ObjectType::InvoiceItem => "invoiceitems",
+            ObjectType::CreditNote => "credit_notes",
+            ObjectType::TaxRate => "tax_rates",
+            ObjectType::SubscriptionSchedule => "subscription_schedules",
             ObjectType::InvoiceLineItem
             | ObjectType::TransferReversal
             | ObjectType::FeeRefund
             | ObjectType::BankAccount
             | ObjectType::Card
-            | ObjectType::Person => return None,
+            | ObjectType::Person
+            | ObjectType::Discount
+            | ObjectType::CreditNoteLineItem => return None,
         };
         Some(format!("/v1/{collection}/{id}"))
     }

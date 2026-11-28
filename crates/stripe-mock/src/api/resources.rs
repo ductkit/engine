@@ -176,6 +176,54 @@ pub(crate) static PAYOUTS: Resource = Resource {
     required: None,
 };
 
+// Phase 9 ruling Q10.
+pub(crate) static COUPONS: Resource = Resource {
+    t: ObjectType::Coupon,
+    path: "/v1/coupons",
+    filters: &[],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static PROMOTION_CODES: Resource = Resource {
+    t: ObjectType::PromotionCode,
+    path: "/v1/promotion_codes",
+    filters: &["active", "code", "coupon", "customer"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static INVOICE_ITEMS: Resource = Resource {
+    t: ObjectType::InvoiceItem,
+    path: "/v1/invoiceitems",
+    filters: &["customer", "invoice", "pending"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static CREDIT_NOTES: Resource = Resource {
+    t: ObjectType::CreditNote,
+    path: "/v1/credit_notes",
+    filters: &["customer", "invoice"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static TAX_RATES: Resource = Resource {
+    t: ObjectType::TaxRate,
+    path: "/v1/tax_rates",
+    filters: &["active", "inclusive"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+pub(crate) static SUBSCRIPTION_SCHEDULES: Resource = Resource {
+    t: ObjectType::SubscriptionSchedule,
+    path: "/v1/subscription_schedules",
+    filters: &["customer"],
+    order: Order::CreatedDesc,
+    required: None,
+};
+
+/// Boolean filters other than `active`: checked when the list is parsed, compared as
+/// `"true"`/`"false"` by [`matches`].
+const BOOL_FILTERS: [&str; 2] = ["inclusive", "pending"];
+
 fn bool_param(p: &ListParams, name: &str) -> Result<Option<bool>, ApiError> {
     match p.extra.get(name).map(String::as_str) {
         None => Ok(None),
@@ -335,6 +383,32 @@ fn matches(
                 && eq("subscription", "subscription")
                 && eq("status", "status")
         }
+        ObjectType::Coupon => true,
+        // `coupon` names the coupon the code promotes.
+        ObjectType::PromotionCode => {
+            active.is_none_or(|a| s["active"].as_bool() == Some(a))
+                && eq("code", "code")
+                && eq("customer", "customer")
+                && f.get("coupon")
+                    .is_none_or(|want| s["promotion"]["coupon"].as_str() == Some(want))
+        }
+        // `pending=true` lists the items on no invoice yet, `false` the others.
+        ObjectType::InvoiceItem => {
+            eq("customer", "customer")
+                && eq("invoice", "invoice")
+                && f.get("pending")
+                    .is_none_or(|want| (want == "true") == s["invoice"].is_null())
+        }
+        ObjectType::CreditNote => eq("customer", "customer") && eq("invoice", "invoice"),
+        ObjectType::TaxRate => {
+            active.is_none_or(|a| s["active"].as_bool() == Some(a))
+                && f.get("inclusive")
+                    .is_none_or(|want| s["inclusive"].as_bool() == Some(want == "true"))
+        }
+        ObjectType::SubscriptionSchedule => eq("customer", "customer"),
+        // No list of their own: a discount is embedded, and credit note lines are listed
+        // under their note from the engine's index.
+        ObjectType::Discount | ObjectType::CreditNoteLineItem => true,
         // `payment` names the paid object: a payment intent, charge or payment record.
         ObjectType::InvoicePayment => {
             eq("invoice", "invoice")
@@ -398,6 +472,11 @@ async fn list(
     } else {
         None
     };
+    for name in BOOL_FILTERS {
+        if r.filters.contains(&name) {
+            bool_param(&p, name)?;
+        }
+    }
     let mut sim = shared.lock();
     ensure_connected(&sim.engine, &scope)?;
     pagination_write(&mut sim, &scope, &p, r.t);
@@ -568,6 +647,48 @@ pub(crate) async fn invoice_lines(
     expand(
         &view,
         ObjectType::InvoiceLineItem,
+        &mut out,
+        expand_paths(&p),
+    )?;
+    Ok(Json(out))
+}
+
+/// `GET /v1/credit_notes/{id}/lines`: the note's line items, in creation order, from the
+/// engine's index (phase 9 ruling Q8).
+pub(crate) async fn credit_note_lines(
+    State(shared): State<Arc<Shared>>,
+    Extension(RequestScope(scope)): Extension<RequestScope>,
+    Path(id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    let p = parse_list_params(decode(query), &[], &["expand"])?;
+    let mut sim = shared.lock();
+    ensure_connected(&sim.engine, &scope)?;
+    let at = stale_at(&mut sim);
+    let view = View {
+        engine: &sim.engine,
+        at,
+        scope,
+        page_size: sim.generators.nested_list_page_size(),
+    };
+    if view.visible(ObjectType::CreditNote, &id).is_none() {
+        return Err(no_such(ObjectType::CreditNote, &id));
+    }
+    let lines: Vec<&StoredObject> = view
+        .engine
+        .credit_note_lines(&view.scope, &id)
+        .iter()
+        .filter_map(|l| view.store().get(ObjectType::CreditNoteLineItem, l))
+        .collect();
+    let (page, has_more) = paginate(&lines, |o| view.listed(o).is_some(), &p)?;
+    let mut out = v1_list(
+        format!("/v1/credit_notes/{id}/lines"),
+        has_more,
+        states(&view, &page),
+    );
+    expand(
+        &view,
+        ObjectType::CreditNoteLineItem,
         &mut out,
         expand_paths(&p),
     )?;

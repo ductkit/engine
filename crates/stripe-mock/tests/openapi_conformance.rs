@@ -641,8 +641,10 @@ async fn busy_connect_run_conforms() {
         served.record(&v);
     }
 
-    assert_eq!(ObjectType::ALL.len(), 25);
-    for t in ObjectType::ALL {
+    assert_eq!(ObjectType::ALL.len(), 33);
+    // The last eight are phase 9's (ruling Q1). Nothing generates them yet; Task 9 drops
+    // this skip once every one is served.
+    for t in &ObjectType::ALL[..25] {
         assert!(
             served.objects.contains_key(t.as_str()),
             "{t:?} never served; served: {:?}",
@@ -734,6 +736,22 @@ async fn busy_connect_run_conforms() {
         // An account's external account belongs to no customer.
         (ObjectType::BankAccount, "customer"),
         (ObjectType::Card, "customer"),
+        // Phase 9 (ruling Q10): nothing generates these yet. Each task building a type
+        // removes its paths here; Task 9 checks none is left.
+        (ObjectType::Customer, "discount.promotion_code"),
+        (ObjectType::Customer, "discount.source.coupon"),
+        (ObjectType::Subscription, "schedule"),
+        (ObjectType::Subscription, "discounts"),
+        (ObjectType::Invoice, "discounts"),
+        (ObjectType::PromotionCode, "customer"),
+        (ObjectType::PromotionCode, "promotion.coupon"),
+        (ObjectType::InvoiceItem, "customer"),
+        (ObjectType::InvoiceItem, "invoice"),
+        (ObjectType::InvoiceItem, "discounts"),
+        (ObjectType::CreditNote, "customer"),
+        (ObjectType::CreditNote, "invoice"),
+        (ObjectType::SubscriptionSchedule, "customer"),
+        (ObjectType::SubscriptionSchedule, "subscription"),
     ];
     // Paths whose objects live only in connected accounts: direct charges' fees, `py_`
     // payments and `pyr_` refunds, external accounts, and the controlled accounts' payout
@@ -894,6 +912,16 @@ fn excluded(t: ObjectType, o: &Value) -> Vec<&'static str> {
         | ObjectType::BankAccount
         | ObjectType::Card
         | ObjectType::Person => vec![],
+        // Phase 9: nothing generates these yet; the task building each type records its
+        // exclusions here.
+        ObjectType::Coupon
+        | ObjectType::PromotionCode
+        | ObjectType::Discount
+        | ObjectType::InvoiceItem
+        | ObjectType::CreditNote
+        | ObjectType::CreditNoteLineItem
+        | ObjectType::TaxRate
+        | ObjectType::SubscriptionSchedule => vec![],
     };
     // Only where the platform controls the account (the field's own description), so not
     // on Standard accounts.
@@ -1113,7 +1141,9 @@ async fn served_objects_carry_their_documented_fields() {
     );
 
     let mut failures = Vec::new();
-    for t in ObjectType::ALL {
+    // The phase 9 types (the last eight, ruling Q1) are not generated yet; Task 9 drops
+    // this skip.
+    for t in ObjectType::ALL[..25].iter().copied() {
         let schema = t.as_str();
         let list = objects.get(&t).cloned().unwrap_or_default();
         assert!(!list.is_empty(), "no {t:?} served");

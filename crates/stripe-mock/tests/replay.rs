@@ -505,27 +505,46 @@ account_api = { v1 = 1.0, v2 = 0.0 }
 account_types = { standard = 1.0, express = 0.0, custom = 0.0 }
 "#;
 
-/// The phase 9 object types (ruling Q1), by `StateUpdate.object_type` serde name (the
-/// snake_case of the Q1 `ObjectType` variant names, which the variants added in phase 9 derive).
-/// The projection drops their entries.
-const PHASE_9_TYPES: [&str; 8] = [
-    "coupon",
-    "promotion_code",
-    "discount",
-    "invoice_item",
-    "credit_note",
-    "credit_note_line_item",
-    "tax_rate",
-    "subscription_schedule",
+/// The phase 9 object types (ruling Q1). The projection drops their entries.
+const PHASE_9_TYPES: [ObjectType; 8] = [
+    ObjectType::Coupon,
+    ObjectType::PromotionCode,
+    ObjectType::Discount,
+    ObjectType::InvoiceItem,
+    ObjectType::CreditNote,
+    ObjectType::CreditNoteLineItem,
+    ObjectType::TaxRate,
+    ObjectType::SubscriptionSchedule,
 ];
+
+/// The phase 9 types are the last eight variants, and serialize as the strings Task 1 dropped
+/// before they existed (`InvoiceItem` as `invoice_item`, not its `object` `invoiceitem`).
+#[test]
+fn phase_9_types_are_the_appended_variants() {
+    assert_eq!(ObjectType::ALL[ObjectType::ALL.len() - 8..], PHASE_9_TYPES);
+    let names: Vec<String> = PHASE_9_TYPES.iter().map(ObjectType::serde_name).collect();
+    assert_eq!(
+        names,
+        [
+            "coupon",
+            "promotion_code",
+            "discount",
+            "invoice_item",
+            "credit_note",
+            "credit_note_line_item",
+            "tax_rate",
+            "subscription_schedule",
+        ]
+    );
+}
 
 /// The truth log as phase 8 produced it (ruling Q12): entries of the phase 9 types removed, and
 /// `seq` and `events` stripped from every remaining entry.
 fn phase_8_projection(log: &[StateUpdate]) -> String {
     let entries: Vec<serde_json::Value> = log
         .iter()
+        .filter(|u| !PHASE_9_TYPES.contains(&u.object_type))
         .map(|u| serde_json::to_value(u).unwrap())
-        .filter(|v| !PHASE_9_TYPES.contains(&v["object_type"].as_str().unwrap()))
         .map(|mut v| {
             let o = v.as_object_mut().unwrap();
             o.remove("seq");
