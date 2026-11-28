@@ -916,3 +916,51 @@ async fn deleting_an_item_from_a_discounted_draft_recomputes_the_discount() {
         assert_eq!(stored["discount_amounts"], line["discount_amounts"]);
     }
 }
+
+/// An ended subscription can name a deleted discount. `subscription.discounts` has no
+/// `deleted_discount` alternative in the pinned schema, so expanding it leaves the ID, as a
+/// deleted coupon stays an ID (Task 9 ruling); `invoice.discounts` still expands it.
+#[tokio::test]
+async fn deleted_discount_stays_an_id_on_a_subscription() {
+    let m = mock_with("seed = 17").await;
+    let forever = percent_coupon(&m, "forever");
+    let cust = m.create_customer(Default::default()).unwrap();
+    let start = m
+        .run_action(Action::StartSubscription {
+            customer: Some(cust.clone()),
+            prices: Some(recurring_prices(&m, 1, "month")),
+        })
+        .unwrap();
+    let sub = created_by(&m, &start, ObjectType::Subscription);
+    m.step(DAY).await.unwrap();
+    let cause = m.run_action(add(None, Some(&sub), Some(&forever))).unwrap();
+    let di = created_by(&m, &cause, ObjectType::Discount);
+    m.run_action(Action::CancelSubscription {
+        id: Some(sub.clone()),
+        at_period_end: Some(false),
+    })
+    .unwrap();
+    m.run_action(Action::RemoveDiscount {
+        id: Some(di.clone()),
+    })
+    .unwrap();
+    assert_eq!(
+        state(&m, ObjectType::Subscription, &sub)["discounts"],
+        serde_json::json!([di])
+    );
+    // `get` checks the body against the pinned schema.
+    for path in [
+        format!("/v1/subscriptions/{sub}?expand[]=discounts"),
+        format!("/v1/subscriptions?status=all&customer={cust}&expand[]=data.discounts"),
+    ] {
+        let r = get(&m, &path).await;
+        assert_eq!(r.status().as_u16(), 200, "{path}");
+        let v: Value = r.json().await.unwrap();
+        let s = if v["object"] == "list" {
+            &v["data"][0]
+        } else {
+            &v
+        };
+        assert_eq!(s["discounts"], serde_json::json!([di]), "{path}");
+    }
+}

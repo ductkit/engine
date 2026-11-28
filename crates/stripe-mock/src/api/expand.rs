@@ -172,8 +172,14 @@ fn type_of_id(id: &str) -> Option<ObjectType> {
 /// The object an ID names, as expansion shows it: a deleted customer is its
 /// stub, other deleted objects are `null`, unknown IDs and disconnected accounts stay
 /// strings. `field` is the segment naming the ID: a `coupon` field names a coupon, whose
-/// ID has no prefix (phase 9 ruling Q10).
-fn lookup(view: &View, id: &str, field: &str, foreign: Option<Scope>) -> Option<Value> {
+/// ID has no prefix (phase 9 ruling Q10). `parent` is the type of the object holding it.
+fn lookup(
+    view: &View,
+    id: &str,
+    field: &str,
+    parent: Option<ObjectType>,
+    foreign: Option<Scope>,
+) -> Option<Value> {
     let t = type_of_id(id).or((field == "coupon").then_some(ObjectType::Coupon))?;
     // A foreign scope is read at the view's own time; an account that has disconnected is
     // out of reach, so its objects stay IDs.
@@ -205,10 +211,11 @@ fn lookup(view: &View, id: &str, field: &str, foreign: Option<Scope>) -> Option<
     if u.kind == ChangeKind::Deleted && t == ObjectType::Coupon {
         return None;
     }
-    // `invoice.discounts` and its lines' `discounts` allow `deleted_discount`, the
-    // tombstone (phase 9 ruling Q2).
+    // Only `invoice.discounts` allows `deleted_discount`, the tombstone (phase 9 ruling
+    // Q2). `subscription.discounts` and `invoiceitem.discounts` allow neither it nor
+    // `null`, so there a deleted discount stays an ID, as a deleted coupon does.
     if u.kind == ChangeKind::Deleted && t == ObjectType::Discount {
-        return Some(u.state.clone());
+        return (parent == Some(ObjectType::Invoice)).then(|| u.state.clone());
     }
     if u.kind == ChangeKind::Deleted && t != ObjectType::Customer {
         return Some(Value::Null);
@@ -302,8 +309,9 @@ fn apply(view: &View, v: &mut Value, segs: &[&str]) {
     }
     // `foreign_scope` reads sibling fields of the parent, so it is decided before the child
     // is borrowed.
+    let parent = type_of_object(v);
     let foreign = match v.get(*first).and_then(Value::as_str) {
-        Some(_) => type_of_object(v).and_then(|t| foreign_scope(view, t, v, first)),
+        Some(_) => parent.and_then(|t| foreign_scope(view, t, v, first)),
         None => None,
     };
     let Some(child) = v.get_mut(*first) else {
@@ -313,7 +321,7 @@ fn apply(view: &View, v: &mut Value, segs: &[&str]) {
     if let Some(items) = child.as_array_mut() {
         for item in items {
             if let Some(id) = item.as_str()
-                && let Some(found) = lookup(view, id, first, foreign.clone())
+                && let Some(found) = lookup(view, id, first, parent, foreign.clone())
             {
                 *item = found;
             }
@@ -322,7 +330,7 @@ fn apply(view: &View, v: &mut Value, segs: &[&str]) {
         return;
     }
     if let Some(id) = child.as_str()
-        && let Some(found) = lookup(view, id, first, foreign)
+        && let Some(found) = lookup(view, id, first, parent, foreign)
     {
         *child = found;
     }
@@ -395,6 +403,17 @@ mod tests {
             inv["discounts"],
             json!([discount("di_1"), tombstone, "di_nope"])
         );
+        // `subscription.discounts` has no `deleted_discount` alternative: the ID stays.
+        let mut sub = json!({"id": "sub_1", "object": "subscription",
+                             "discounts": ["di_1", "di_2"]});
+        expand(
+            &view(&e),
+            ObjectType::Subscription,
+            &mut sub,
+            &["discounts".to_string()],
+        )
+        .unwrap();
+        assert_eq!(sub["discounts"], json!([discount("di_1"), "di_2"]));
     }
 
     /// A `coupon` field resolves its unprefixed ID; a deleted coupon stays an ID.
