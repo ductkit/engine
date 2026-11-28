@@ -145,7 +145,7 @@ Each test is a small scripted run on the virtual clock.
 
 - [ ] **Step 1: Write `thin_fetch_after_delete_returns_stub`.**
   - Use `extra = ""`.
-  - Create `c`, then quiesce and resume generation (`m.resume_generation()`).
+  - Create `c`, then step 1 min.
   - Update `c`, step 1 min, delete `c`.
   - From the thin hook, take the `v1.customer.updated` for `c`.
   - Assertions:
