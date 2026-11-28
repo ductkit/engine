@@ -22,7 +22,7 @@ pub fn fails_first(event_id: &str) -> bool {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    h % 3 == 0
+    h.is_multiple_of(3)
 }
 
 #[derive(Clone, Default)]
