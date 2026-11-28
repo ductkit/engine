@@ -198,3 +198,82 @@ async fn delete_before_create_under_reorder() {
     assert_eq!(naive.len(), inverted, "every inversion leaves a ghost");
     assert!(correct.is_empty(), "{correct:?}");
 }
+
+#[tokio::test]
+async fn ending_before_poller_misses_late_events() {
+    use crate::client::{Client, Fetched};
+    use ductkit_stripe_mock::EventFormat;
+    use std::collections::BTreeSet;
+
+    let (snapshot, thin) = (HookServer::start(), HookServer::start());
+    let m = quiet_mock(
+        "[actions]\nnew_customer = 30.0\n\
+         [events]\nlate_tail = { probability = 0.5, min = \"1m\", max = \"10m\" }\n",
+        &snapshot,
+        &thin,
+    )
+    .await;
+    let c = Client::new(&m);
+    let page = async |path: String| match c.get(&path, None).await {
+        Fetched::Object(v) => v,
+        Fetched::Gone => panic!("{path} is gone"),
+    };
+
+    // Naive: ask only for what is newer than the newest event seen.
+    let mut naive: BTreeSet<String> = BTreeSet::new();
+    let mut cursor: Option<String> = None;
+    // Correct: re-read a window as long as the late tail, and dedupe by ID.
+    let mut overlap: BTreeSet<String> = BTreeSet::new();
+    let mut newest_created: i64 = 0;
+    for tick in 0..=120 {
+        if tick == 120 {
+            m.quiesce().await.unwrap(); // every event is visible now
+        } else {
+            m.step(Duration::from_secs(60)).await.unwrap();
+        }
+        let path = match &cursor {
+            Some(id) => format!("/v1/events?limit=100&ending_before={id}"),
+            None => "/v1/events?limit=100".to_string(),
+        };
+        let p = page(path).await;
+        let data = p["data"].as_array().unwrap();
+        if let Some(first) = data.first() {
+            cursor = Some(first["id"].as_str().unwrap().to_string());
+        }
+        naive.extend(data.iter().map(|e| e["id"].as_str().unwrap().to_string()));
+
+        let base = format!("/v1/events?limit=100&created[gte]={}", newest_created - 600);
+        let mut p = page(base.clone()).await;
+        loop {
+            let data = p["data"].as_array().unwrap();
+            for e in data {
+                overlap.insert(e["id"].as_str().unwrap().to_string());
+                newest_created = newest_created.max(e["created"].as_i64().unwrap());
+            }
+            if p["has_more"] != true {
+                break;
+            }
+            let last = data.last().unwrap()["id"].as_str().unwrap();
+            p = page(format!("{base}&starting_after={last}")).await;
+        }
+    }
+
+    let all: BTreeSet<String> = m
+        .event_timeline()
+        .into_iter()
+        .filter(|e| e.format == EventFormat::Snapshot)
+        .map(|e| e.id)
+        .collect();
+    assert!(naive.is_subset(&all));
+    assert!(
+        naive.len() < all.len(),
+        "the ending_before poller missed nothing ({} events)",
+        all.len()
+    );
+    eprintln!(
+        "ending_before poller missed {} of {}",
+        all.len() - naive.len(),
+        all.len()
+    );
+    assert_eq!(overlap, all, "the overlap poller missed events");
+}
