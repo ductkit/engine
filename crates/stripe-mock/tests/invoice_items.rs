@@ -506,6 +506,13 @@ async fn named_quantities_stay_within_the_maximum_charge() {
             }
             other => panic!("{q}: {other:?}"),
         }
+        // With a drawn price too.
+        match m.run_action(create_item(&cust, None, Some(q))) {
+            Err(MockError::InvalidAction(msg)) => {
+                assert!(msg.contains(&q.to_string()), "{msg}")
+            }
+            other => panic!("{q} with a drawn price: {other:?}"),
+        }
     }
     assert!(
         m.truth_log()

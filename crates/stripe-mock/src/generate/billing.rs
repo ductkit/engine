@@ -740,7 +740,16 @@ pub(crate) fn create_invoice_item(
         ));
     }
     // A named quantity must keep the item's amount within the maximum charge (and in range
-    // of an `i64`).
+    // of an `i64`). With a drawn price, a quantity up to the maximum keeps `unit × quantity`
+    // in range (every unit amount is at most the maximum); a larger amount stays pending.
+    if let Some(q) = quantity
+        && q > payments::MAX_CHARGE_AMOUNT as u64
+    {
+        return Err(MockError::InvalidAction(format!(
+            "quantity {q} exceeds the maximum charge of {}",
+            payments::MAX_CHARGE_AMOUNT
+        )));
+    }
     if let (Some(q), Some(p)) = (quantity, &price) {
         let unit = payments::unit_amount(engine, p);
         let amount = i64::try_from(q).ok().and_then(|q| unit.checked_mul(q));
