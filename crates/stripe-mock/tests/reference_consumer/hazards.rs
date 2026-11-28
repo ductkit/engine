@@ -126,3 +126,75 @@ async fn stale_retry_carries_older_version() {
         .1;
     assert_eq!(newest["data"]["object"], latest);
 }
+
+#[tokio::test]
+async fn delete_before_create_under_reorder() {
+    use ductkit_stripe_mock::{EventFormat, SimTime};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let (snapshot, thin) = (HookServer::start(), HookServer::start());
+    let m = quiet_mock("[webhooks]\nreorder_window = \"10s\"\n", &snapshot, &thin).await;
+    for _ in 0..20 {
+        let c = m.create_customer(NewCustomer::default()).unwrap();
+        m.step(Duration::from_secs(1)).await.unwrap();
+        m.delete_customer(&c).unwrap();
+        m.step(Duration::from_secs(60)).await.unwrap();
+    }
+    m.quiesce().await.unwrap();
+
+    // When each snapshot create/delete was first scheduled. Real HTTP doesn't order
+    // arrivals within a step, so the mock's schedule is the order that counts.
+    let mut first_attempt: BTreeMap<String, SimTime> = BTreeMap::new();
+    for r in m.delivery_log() {
+        if let DeliveryRecordKind::Scheduled { attempt_at, .. } = r.kind {
+            first_attempt.entry(r.event_id).or_insert(attempt_at);
+        }
+    }
+    let mut scheduled: Vec<(SimTime, String, bool)> = m
+        .event_timeline()
+        .into_iter()
+        .filter(|e| e.format == EventFormat::Snapshot)
+        .filter_map(|e| {
+            let deleted = match e.event_type.as_str() {
+                "customer.created" => false,
+                "customer.deleted" => true,
+                _ => return None,
+            };
+            Some((first_attempt[&e.id], e.object_id, deleted))
+        })
+        .collect();
+    scheduled.sort();
+
+    let mut created_seen = BTreeSet::new();
+    let inverted = scheduled
+        .iter()
+        .filter(|(_, id, deleted)| {
+            if *deleted {
+                !created_seen.contains(id)
+            } else {
+                created_seen.insert(id.clone());
+                false
+            }
+        })
+        .count();
+    assert!(inverted >= 1, "no delete was scheduled before its create");
+
+    // Naive upsert in delivery order: a delete before its create leaves a ghost.
+    let mut naive = BTreeSet::new();
+    // Correct: remember deleted IDs and ignore a later create of one.
+    let (mut correct, mut tombstones) = (BTreeSet::new(), BTreeSet::new());
+    for (_, id, deleted) in &scheduled {
+        if *deleted {
+            naive.remove(id);
+            correct.remove(id);
+            tombstones.insert(id.clone());
+        } else {
+            naive.insert(id.clone());
+            if !tombstones.contains(id) {
+                correct.insert(id.clone());
+            }
+        }
+    }
+    assert_eq!(naive.len(), inverted, "every inversion leaves a ghost");
+    assert!(correct.is_empty(), "{correct:?}");
+}
