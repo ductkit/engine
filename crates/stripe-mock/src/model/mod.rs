@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod account;
+pub mod amounts;
 pub mod catalog;
 pub mod checkout;
 pub mod connect;

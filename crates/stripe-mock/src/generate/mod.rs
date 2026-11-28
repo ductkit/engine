@@ -15,6 +15,7 @@ mod billing_catalog;
 mod catalog;
 mod checkout;
 mod connect;
+mod discounts;
 mod mux;
 mod payments;
 mod subscriptions;
@@ -165,6 +166,24 @@ pub enum Action {
     /// already deleted, or on an invoice that is not a draft is an error naming it; so is
     /// no ID when nothing is pending. Deleting an item on a draft takes its line with it.
     DeleteInvoiceItem { id: Option<String> },
+    /// A discount (phase 9 rulings Q2 and Q7) on the named customer or subscription (drawn
+    /// when neither is named), redeeming the named coupon or promotion code (drawn when
+    /// neither is named). Naming both targets, or both a coupon and a code, is an error; so
+    /// is a target that is missing, ended or already discounted, a coupon that is not valid,
+    /// a code that is not active, or no target to draw.
+    AddDiscount {
+        #[serde(default)]
+        customer: Option<String>,
+        #[serde(default)]
+        subscription: Option<String>,
+        #[serde(default)]
+        coupon: Option<String>,
+        #[serde(default)]
+        promotion_code: Option<String>,
+    },
+    /// Remove the named or a random live discount from its parent. A named one that is
+    /// missing or already removed, or none to pick, is an error naming it.
+    RemoveDiscount { id: Option<String> },
 }
 
 /// The kind of an external account.
@@ -208,6 +227,7 @@ enum ActionKind {
     CouponUpdate,
     InvoiceItem,
     InvoiceItemDelete,
+    DiscountChange,
 }
 
 /// A follow-up step of an action.
@@ -307,6 +327,11 @@ pub(crate) enum Continuation {
     PayoutArrive {
         id: String,
         fail: bool,
+    },
+    /// A `repeating` discount ends at its `end`, unless it was removed earlier (phase 9
+    /// ruling Q2).
+    DiscountEnd {
+        id: String,
     },
 }
 
@@ -597,6 +622,11 @@ impl Generator {
                 c.invoiceitem.delete,
                 "generate.invoice_item.delete",
             ),
+            (
+                ActionKind::DiscountChange,
+                a.discount_change,
+                "generate.discount_change",
+            ),
         ];
         let actions = specs
             .into_iter()
@@ -737,6 +767,7 @@ impl Generator {
                 ActionKind::TransferReversal => config.transfer_reversal,
                 ActionKind::BillingCatalogChange => config.billing_catalog_change,
                 ActionKind::InvoiceItem => config.invoice_item,
+                ActionKind::DiscountChange => config.discount_change,
                 _ => continue,
             };
             a.base_rate = rate;
@@ -875,6 +906,23 @@ impl Generator {
             }
             Action::DeleteInvoiceItem { id } => {
                 billing::delete_invoice_item(&mut self.control, engine, self.ctx.page_size, id)?
+            }
+            Action::AddDiscount {
+                customer,
+                subscription,
+                coupon,
+                promotion_code,
+            } => discounts::add_discount(
+                &mut self.control,
+                engine,
+                &mut self.ctx,
+                customer,
+                subscription,
+                coupon,
+                promotion_code,
+            )?,
+            Action::RemoveDiscount { id } => {
+                discounts::remove_discount(&mut self.control, engine, id)?
             }
             Action::OneOffInvoice { customer, outcome } => billing::one_off_invoice(
                 &mut self.control,
@@ -1167,6 +1215,7 @@ fn run_continuation(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mu
         Continuation::PayoutArrive { id, fail } => {
             connect::payout_arrive(engine, ctx, &id, fail, &cause);
         }
+        Continuation::DiscountEnd { id } => discounts::run_end(engine, &id, &cause),
         c => billing::run(c, cause, engine, ctx),
     }
 }
@@ -1325,6 +1374,7 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
                 .expect("random targets are valid");
         }
         ActionKind::InvoiceItemDelete => billing::churn_delete_item(rng, engine),
+        ActionKind::DiscountChange => discounts::discount_change(rng, engine, ctx),
     }
 }
 

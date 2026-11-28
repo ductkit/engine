@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::model::amounts::{AppliedTax, InvoiceAmounts, LineAmounts};
 use crate::model::embedded::embedded_list;
 use crate::model::subscription::self_issuer;
 use crate::stripe;
@@ -49,6 +50,12 @@ pub(crate) struct NewLine<'a> {
     /// The `ii_…` billed: every line of a one-off invoice, and the line of a pending item
     /// that joined an invoice of either kind.
     pub invoice_item: Option<&'a str>,
+    /// The line's share of the invoice's discount and its tax (ruling Q3).
+    pub amounts: &'a LineAmounts,
+    /// The `di_…` the invoice applies, if any.
+    pub discount: Option<&'a str>,
+    /// The tax rate the invoice applies, if any.
+    pub tax: Option<&'a AppliedTax>,
 }
 
 type ProrationDetails = stripe::BillingBillResourceInvoicingLinesCommonProrationDetails;
@@ -75,11 +82,99 @@ fn price_pricing(price: &stripe::Price) -> stripe::BillingBillResourceInvoicingP
     }
 }
 
+type TaxEntry = stripe::BillingBillResourceInvoicingTaxesTax;
+
+/// One exclusive tax entry of `rate` (ruling Q3).
+fn tax_entry(rate: &AppliedTax, amount: i64, taxable: i64) -> TaxEntry {
+    TaxEntry {
+        amount,
+        tax_behavior: stripe::BillingBillResourceInvoicingTaxesTaxTaxBehavior::Exclusive,
+        tax_rate_details: Some(Some(
+            stripe::BillingBillResourceInvoicingTaxesTaxRateDetails {
+                tax_rate: stripe::Expandable::Id(rate.rate.id.clone()),
+            },
+        )),
+        taxability_reason:
+            stripe::BillingBillResourceInvoicingTaxesTaxTaxabilityReason::StandardRated,
+        taxable_amount: Some(Some(taxable)),
+        type_: stripe::BillingBillResourceInvoicingTaxesTaxType::TaxRateDetails,
+    }
+}
+
+fn discount_amount(amount: i64, di: &str) -> stripe::DiscountsResourceDiscountAmount {
+    stripe::DiscountsResourceDiscountAmount {
+        amount,
+        discount: stripe::Expandable::Id(di.to_string()),
+    }
+}
+
+/// Sets a line's discount and tax fields from its computed amounts (ruling Q3). Its
+/// `amount` stays before discount and tax, as in Stripe.
+pub(crate) fn set_line_amounts(
+    line: &mut stripe::LineItem,
+    amounts: &LineAmounts,
+    discount: Option<&str>,
+    tax: Option<&AppliedTax>,
+) {
+    line.discount_amounts = Some(Some(
+        discount
+            .map(|di| vec![discount_amount(amounts.discount, di)])
+            .unwrap_or_default(),
+    ));
+    line.discounts = discount
+        .map(|di| vec![stripe::Expandable::Id(di.to_string())])
+        .unwrap_or_default();
+    line.taxes = Some(Some(
+        tax.map(|t| vec![tax_entry(t, amounts.tax, amounts.taxable)])
+            .unwrap_or_default(),
+    ));
+}
+
+/// Sets an invoice's computed amounts (ruling Q3): `subtotal`, the discount and tax totals,
+/// `total`, and `amount_due = amount_remaining = total`.
+pub(crate) fn set_invoice_amounts(
+    invoice: &mut stripe::Invoice,
+    amounts: &InvoiceAmounts,
+    discount: Option<&str>,
+    tax: Option<&AppliedTax>,
+) {
+    invoice.subtotal = amounts.subtotal;
+    invoice.subtotal_excluding_tax = Some(Some(amounts.subtotal));
+    invoice.discounts = discount
+        .map(|di| vec![stripe::Expandable::Id(di.to_string())])
+        .unwrap_or_default();
+    invoice.total_discount_amounts = Some(Some(
+        discount
+            .map(|di| vec![discount_amount(amounts.discount, di)])
+            .unwrap_or_default(),
+    ));
+    invoice.total_excluding_tax = Some(Some(amounts.subtotal - amounts.discount));
+    let taxable: i64 = amounts.lines.iter().map(|l| l.taxable).sum();
+    invoice.total_taxes = Some(Some(
+        tax.map(|t| vec![tax_entry(t, amounts.tax, taxable)])
+            .unwrap_or_default(),
+    ));
+    invoice.total = amounts.total;
+    invoice.amount_due = amounts.total;
+    invoice.amount_remaining = amounts.total;
+}
+
+/// The line's amount: its price's unit amount times its quantity, before discount and tax.
+pub(crate) fn line_amount(price: &stripe::Price, quantity: u64) -> i64 {
+    price.unit_amount.flatten().unwrap_or(0) * quantity as i64
+}
+
 /// An invoice line item. Presence follows ruling R1: every field is present, `null` or empty
 /// when unset.
 pub(crate) fn new_line(l: &NewLine) -> stripe::LineItem {
-    let unit_amount = l.price.unit_amount.flatten().unwrap_or(0);
-    let amount = unit_amount * l.spec.quantity as i64;
+    let mut line = line_before_amounts(l);
+    set_line_amounts(&mut line, l.amounts, l.discount, l.tax);
+    line
+}
+
+/// The line with no discount or tax, until [`set_line_amounts`] sets them.
+fn line_before_amounts(l: &NewLine) -> stripe::LineItem {
+    let amount = line_amount(l.price, l.spec.quantity);
     let parent = match (l.subscription, &l.spec.subscription_item) {
         (Some(sub), Some(si)) => LineParent {
             invoice_item_details: Some(None),
@@ -242,6 +337,12 @@ pub(crate) struct NewInvoice<'a> {
     pub period: (i64, i64),
     pub created: i64,
     pub page_size: usize,
+    /// Computed from `lines`, `discount` and `tax` (ruling Q3).
+    pub amounts: &'a InvoiceAmounts,
+    /// The `di_…` the invoice applies, if any.
+    pub discount: Option<&'a str>,
+    /// The tax rate the invoice applies, if any.
+    pub tax: Option<&'a AppliedTax>,
 }
 
 pub(crate) fn lines_url(invoice: &str) -> String {
@@ -257,7 +358,13 @@ pub(crate) fn payments_url(invoice: &str) -> String {
 /// `status_details` and `threshold_reason`. `payments` is an empty list until the invoice
 /// has payments.
 pub(crate) fn new_invoice(i: &NewInvoice) -> stripe::Invoice {
-    let total: i64 = i.lines.iter().map(|l| l.amount).sum();
+    let mut invoice = invoice_before_amounts(i);
+    set_invoice_amounts(&mut invoice, i.amounts, i.discount, i.tax);
+    invoice
+}
+
+/// The draft with every amount 0, until [`set_invoice_amounts`] sets them.
+fn invoice_before_amounts(i: &NewInvoice) -> stripe::Invoice {
     let parent =
         i.subscription.map(
             |sub| {
@@ -285,11 +392,11 @@ pub(crate) fn new_invoice(i: &NewInvoice) -> stripe::Invoice {
         account_country: Some(Some("US".to_string())),
         account_name: Some(Some("ductkit mock".to_string())),
         account_tax_ids: Some(None),
-        amount_due: total,
+        amount_due: 0,
         amount_overpaid: 0,
         amount_paid: 0,
         amount_paid_off_stripe: 0,
-        amount_remaining: total,
+        amount_remaining: 0,
         amount_shipping: 0,
         application: Some(None),
         attempt_count: 0,
@@ -367,13 +474,13 @@ pub(crate) fn new_invoice(i: &NewInvoice) -> stripe::Invoice {
             paid_at: Some(None),
             voided_at: Some(None),
         },
-        subtotal: total,
-        subtotal_excluding_tax: Some(Some(total)),
+        subtotal: 0,
+        subtotal_excluding_tax: Some(None),
         test_clock: Some(None),
         threshold_reason: None,
-        total,
+        total: 0,
         total_discount_amounts: Some(Some(Vec::new())),
-        total_excluding_tax: Some(Some(total)),
+        total_excluding_tax: Some(None),
         total_pretax_credit_amounts: Some(Some(Vec::new())),
         total_taxes: Some(Some(Vec::new())),
         webhooks_delivered_at: Some(None),
@@ -383,8 +490,131 @@ pub(crate) fn new_invoice(i: &NewInvoice) -> stripe::Invoice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::amounts::{AppliedDiscount, LineAmount, compute};
     use crate::model::catalog::{PriceSpec, new_price};
     use crate::model::customer::{NewCustomer, new_customer};
+    use crate::model::discounts::{TaxRateSpec, tax_bp, tax_rate};
+
+    #[test]
+    fn discounted_and_taxed_invoices_conform() {
+        let price = new_price(
+            &PriceSpec {
+                id: "price_1".into(),
+                currency: "usd",
+                unit_amount: 500,
+                interval: None,
+                nickname: None,
+            },
+            "prod_1",
+            1,
+        );
+        let rate = tax_rate(
+            &TaxRateSpec {
+                id: "txr_1".into(),
+                display_name: "VAT",
+                country: "DE",
+                state: None,
+                tax_type: stripe::TaxRateTaxType::Vat,
+                level: stripe::TaxRateJurisdictionLevel::Country,
+                percentage: 20.0,
+            },
+            1,
+        );
+        let tax = AppliedTax {
+            bp: tax_bp(&rate),
+            rate,
+        };
+        let discount = AppliedDiscount {
+            id: "di_1".into(),
+            percent_bp: Some(1000),
+            amount_off: None,
+        };
+        let specs: Vec<LineSpec> = [1, 3]
+            .into_iter()
+            .map(|quantity| LineSpec {
+                price: "price_1".into(),
+                quantity,
+                subscription_item: None,
+                period: (1, 1),
+            })
+            .collect();
+        let inputs: Vec<LineAmount> = specs
+            .iter()
+            .map(|s| LineAmount {
+                amount: line_amount(&price, s.quantity),
+            })
+            .collect();
+        let amounts = compute(&inputs, Some(&discount), Some(&tax));
+        let ids = ["il_0", "il_1"];
+        let lines: Vec<stripe::LineItem> = specs
+            .iter()
+            .zip(&amounts.lines)
+            .zip(ids)
+            .map(|((spec, la), id)| {
+                new_line(&NewLine {
+                    id,
+                    invoice: "in_1",
+                    spec,
+                    price: &price,
+                    product_name: "Widget",
+                    subscription: None,
+                    invoice_item: Some("ii_1"),
+                    amounts: la,
+                    discount: Some("di_1"),
+                    tax: Some(&tax),
+                })
+            })
+            .collect();
+        let customer = new_customer("cus_1", 1, "ABC", &NewCustomer::default());
+        let invoice = new_invoice(&NewInvoice {
+            id: "in_1",
+            customer: &customer,
+            currency: "usd",
+            lines: &lines,
+            reason: BillingReason::Manual,
+            subscription: None,
+            period: (1, 1),
+            created: 1,
+            page_size: 10,
+            amounts: &amounts,
+            discount: Some("di_1"),
+            tax: Some(&tax),
+        });
+        let v = serde_json::to_value(&invoice).unwrap();
+        stripe::check_payload(&v).unwrap();
+        // 2000 less a 200 discount, plus 20% of 1800.
+        assert_eq!(
+            (&v["subtotal"], &v["total_excluding_tax"], &v["total"]),
+            (&2000.into(), &1800.into(), &2160.into())
+        );
+        assert_eq!(v["amount_due"], 2160);
+        assert_eq!(v["discounts"], serde_json::json!(["di_1"]));
+        assert_eq!(
+            v["total_discount_amounts"],
+            serde_json::json!([{"amount": 200, "discount": "di_1"}])
+        );
+        assert_eq!(
+            v["total_taxes"],
+            serde_json::json!([{
+                "amount": 360,
+                "tax_behavior": "exclusive",
+                "tax_rate_details": {"tax_rate": "txr_1"},
+                "taxability_reason": "standard_rated",
+                "taxable_amount": 1800,
+                "type": "tax_rate_details",
+            }])
+        );
+        let first = &v["lines"]["data"][0];
+        stripe::check_payload(first).unwrap();
+        assert_eq!(first["amount"], 500);
+        assert_eq!(
+            first["discount_amounts"],
+            serde_json::json!([{"amount": 50, "discount": "di_1"}])
+        );
+        assert_eq!(first["discounts"], serde_json::json!(["di_1"]));
+        assert_eq!(first["taxes"][0]["amount"], 90);
+        assert_eq!(first["taxes"][0]["taxable_amount"], 450);
+    }
 
     #[test]
     fn new_lines_and_invoices_conform() {
@@ -413,6 +643,13 @@ mod tests {
             product_name: "Widget",
             subscription: None,
             invoice_item: Some("ii_1"),
+            amounts: &LineAmounts {
+                discount: 0,
+                tax: 0,
+                taxable: 1000,
+            },
+            discount: None,
+            tax: None,
         });
         assert_eq!((line.amount, line.subtotal), (1000, 1000));
         let customer = new_customer(
@@ -436,6 +673,9 @@ mod tests {
             period: (1, 1),
             created: 1,
             page_size: 10,
+            amounts: &compute(&[LineAmount { amount: 1000 }], None, None),
+            discount: None,
+            tax: None,
         });
         let v = serde_json::to_value(&invoice).unwrap();
         stripe::check_payload(&v).unwrap();

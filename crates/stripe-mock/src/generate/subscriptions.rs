@@ -644,9 +644,9 @@ pub(crate) fn cancel_subscription(
     Ok(Some(cause))
 }
 
-/// Deletes a customer after canceling its live subscriptions (incomplete ones
-/// expire), deleting its drafts and voiding its open invoices, deleting its pending invoice
-/// items and detaching its payment methods, all under `cause`.
+/// Deletes a customer after removing its discount, canceling its live subscriptions
+/// (incomplete ones expire), deleting its drafts and voiding its open invoices, deleting its
+/// pending invoice items and detaching its payment methods, all under `cause`.
 pub(crate) fn delete_customer_cascade(
     engine: &mut Engine,
     id: &str,
@@ -667,6 +667,8 @@ pub(crate) fn delete_customer_cascade(
         }
         Some(_) => {}
     }
+    // Its discount goes first (phase 9 ruling Q2); its subscriptions' discounts stay.
+    super::discounts::remove_customer_discount(engine, id, cause);
     let subs: Vec<String> = engine
         .store()
         .children(ObjectType::Subscription, "customer", id)

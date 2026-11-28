@@ -431,6 +431,9 @@ pub struct ActionsConfig {
     /// A pending invoice item for a random customer, which joins that customer's next
     /// invoice (phase 9 ruling Q4).
     pub invoice_item: f64,
+    /// A discount added to a random customer or subscription, or a random one removed
+    /// (phase 9 ruling Q7).
+    pub discount_change: f64,
     pub renew_subscription_cycle: RenewMode,
     /// Gap between consecutive steps of one action.
     pub step_delay: Distribution,
@@ -465,6 +468,7 @@ impl ActionsConfig {
                 self.billing_catalog_change,
             ),
             ("actions.invoice_item", self.invoice_item),
+            ("actions.discount_change", self.discount_change),
         ] {
             check_rate(name, rate)?;
         }
@@ -1282,6 +1286,25 @@ mod tests {
             (c.actions.invoice_item, c.churn.invoiceitem.delete),
             (0.5, 0.1)
         );
+        assert_eq!(c.actions.discount_change, 0.3);
+    }
+
+    #[test]
+    fn config_accepts_a_discount_change_rate() {
+        let c = Config::from_toml_str(
+            "[actions]
+discount_change = 0.5",
+        )
+        .unwrap();
+        assert_eq!(c.actions.discount_change, 0.5);
+        assert_eq!(Config::default().actions.discount_change, 0.0);
+        let msg = Config::from_toml_str(
+            "[actions]
+discount_change = -1.0",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("actions.discount_change"), "{msg}");
     }
 
     #[test]

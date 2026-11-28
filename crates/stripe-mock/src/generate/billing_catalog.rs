@@ -32,7 +32,6 @@ fn coupon_of(state: &serde_json::Value) -> Option<&str> {
 }
 
 /// IDs of the active promotion codes whose coupon is valid and live.
-#[expect(dead_code, reason = "the discount action of phase 9 Task 5 uses it")]
 pub(crate) fn active_promotion_codes(engine: &Engine) -> Vec<String> {
     let valid = valid_coupons(engine);
     engine

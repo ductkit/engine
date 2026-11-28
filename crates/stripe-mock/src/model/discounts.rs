@@ -205,10 +205,67 @@ pub(crate) fn tax_rate(t: &TaxRateSpec, created: i64) -> stripe::TaxRate {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "invoice amounts of phase 9 Task 5 use it")
-)]
+/// Inputs for a discount (phase 9 ruling Q2).
+pub(crate) struct NewDiscount<'a> {
+    pub id: &'a str,
+    pub coupon: &'a str,
+    /// The promotion code redeemed, if any.
+    pub promotion_code: Option<&'a str>,
+    /// Always set: a subscription's discount names its customer too.
+    pub customer: &'a str,
+    /// Set when the subscription is the parent.
+    pub subscription: Option<&'a str>,
+    pub start: i64,
+    /// A `repeating` coupon's end; `None` for `once` and `forever`.
+    pub end: Option<i64>,
+}
+
+/// A discount. Presence follows ruling R1: every field is present, `null` when unset. A
+/// discount always names its customer, so its thin events have a parent to point at.
+pub(crate) fn discount(d: &NewDiscount) -> stripe::Discount {
+    stripe::Discount {
+        checkout_session: Some(None),
+        customer: Some(Some(Expandable::Id(d.customer.to_string()))),
+        customer_account: Some(None),
+        end: Some(d.end),
+        id: d.id.to_string(),
+        invoice: Some(None),
+        invoice_item: Some(None),
+        object: stripe::DiscountObject::Discount,
+        promotion_code: Some(d.promotion_code.map(|p| Expandable::Id(p.to_string()))),
+        source: stripe::DiscountSource {
+            coupon: Some(Some(Expandable::Id(d.coupon.to_string()))),
+            type_: stripe::DiscountSourceType::Coupon,
+        },
+        start: d.start,
+        subscription: Some(d.subscription.map(str::to_string)),
+        subscription_item: Some(None),
+    }
+}
+
+/// What a removed discount becomes (ruling Q2): the full discount plus `deleted: true`,
+/// less `end`, which the pinned `deleted_discount` schema does not have.
+pub(crate) fn deleted_discount(d: &stripe::Discount) -> stripe::DeletedDiscount {
+    stripe::DeletedDiscount {
+        checkout_session: d.checkout_session.clone(),
+        customer: d
+            .customer
+            .clone()
+            .map(|c| c.map(|c| Expandable::Id(c.id().to_string()))),
+        customer_account: d.customer_account.clone(),
+        deleted: true,
+        id: d.id.clone(),
+        invoice: d.invoice.clone(),
+        invoice_item: d.invoice_item.clone(),
+        object: stripe::DeletedDiscountObject::Discount,
+        promotion_code: d.promotion_code.clone(),
+        source: d.source.clone(),
+        start: d.start,
+        subscription: d.subscription.clone(),
+        subscription_item: d.subscription_item.clone(),
+    }
+}
+
 /// The rate's percentage in basis points (ruling Q3): `8.875` is `888`.
 pub(crate) fn tax_bp(rate: &stripe::TaxRate) -> i64 {
     (rate.percentage * 100.0).round() as i64
@@ -263,6 +320,38 @@ mod tests {
         assert_eq!(v["promotion"]["coupon"], "AbCd1234");
         assert_eq!(v["customer"], serde_json::Value::Null);
         assert_eq!(v["restrictions"]["first_time_transaction"], false);
+    }
+
+    #[test]
+    fn discounts_and_their_tombstones_conform() {
+        for (sub, promo, end) in [
+            (None, None, None),
+            (Some("sub_1"), Some("promo_1"), Some(1_702_592_000)),
+        ] {
+            let d = discount(&NewDiscount {
+                id: "di_1",
+                coupon: "AbCd1234",
+                promotion_code: promo,
+                customer: "cus_1",
+                subscription: sub,
+                start: 1_700_000_000,
+                end,
+            });
+            let v = to_value(&d).unwrap();
+            crate::stripe::check_payload(&v).unwrap();
+            assert_eq!(v["customer"], "cus_1");
+            assert_eq!(v["subscription"], serde_json::json!(sub));
+            assert_eq!(v["promotion_code"], serde_json::json!(promo));
+            assert_eq!(v["source"]["coupon"], "AbCd1234");
+            assert_eq!(v["end"], serde_json::json!(end));
+            let t = to_value(deleted_discount(&d)).unwrap();
+            crate::stripe::check_payload(&t).unwrap();
+            // The pinned `deleted_discount` has no `end`; everything else is the discount's.
+            let mut expected = v.clone();
+            expected["deleted"] = true.into();
+            expected.as_object_mut().unwrap().remove("end");
+            assert_eq!(t, expected);
+        }
     }
 
     #[test]

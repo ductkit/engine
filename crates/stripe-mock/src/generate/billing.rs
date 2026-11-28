@@ -6,11 +6,15 @@
 
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::generate::catalog::{active_ids, create_product_now, draw_new_product};
+use crate::generate::discounts::{applied_by_id, applied_discount, end_once};
 use crate::generate::{Continuation, Ctx, create_random_customer, payments, pick};
+use crate::model::amounts::{AppliedDiscount, AppliedTax, InvoiceAmounts, LineAmount, compute};
+use crate::model::discounts::tax_bp;
 use crate::model::embedded::embedded_list;
 use crate::model::invoice::{
     BillingReason, LineSpec, NewInvoice, NewInvoiceItem, NewLine, deleted_invoice,
-    deleted_invoice_item, deleted_line, lines_url, new_invoice, new_invoice_item, new_line,
+    deleted_invoice_item, deleted_line, line_amount, lines_url, new_invoice, new_invoice_item,
+    new_line, set_invoice_amounts, set_line_amounts,
 };
 use crate::rng::SimRng;
 use crate::stripe::{Customer, Expandable, Invoice, InvoiceStatus, Invoiceitem, LineItem, Price};
@@ -124,6 +128,20 @@ fn invoice_items(engine: &Engine, invoice: &str) -> Vec<String> {
         .collect()
 }
 
+/// The amounts of an invoice (ruling Q3), and the tax it carries: an invoice whose total
+/// with `tax` would exceed [`payments::MAX_CHARGE_AMOUNT`] is created without it.
+fn invoice_amounts<'t>(
+    lines: &[LineAmount],
+    discount: Option<&AppliedDiscount>,
+    tax: Option<&'t AppliedTax>,
+) -> (InvoiceAmounts, Option<&'t AppliedTax>) {
+    let amounts = compute(lines, discount, tax);
+    if tax.is_some() && amounts.total > payments::MAX_CHARGE_AMOUNT {
+        return (compute(lines, discount, None), None);
+    }
+    (amounts, tax)
+}
+
 /// Creates a draft invoice in one instant (phase 9 ruling Q4): a one-off invoice's own
 /// items (`invoiceitem.created`) and the customer's pending items that join it (oldest
 /// first, after its own lines; a silent update of their `invoice`), then the lines
@@ -132,7 +150,9 @@ fn invoice_items(engine: &Engine, invoice: &str) -> Vec<String> {
 /// otherwise it stays pending. Invoice, line and one-off item IDs come from the
 /// `"generate.billing"` stream, drawn as before items existed; joining draws nothing.
 /// With `take_pending` false (a Checkout subscription's first invoice, whose amount the
-/// session fixed), no pending item joins. Returns the invoice ID.
+/// session fixed), no pending item joins and no discount applies. Otherwise the invoice
+/// applies [`applied_discount`] (ruling Q2), and every amount comes from
+/// [`compute`] (ruling Q3). Returns the invoice ID.
 #[allow(clippy::too_many_arguments)] // each argument is part of the invoice
 pub(crate) fn create_draft_invoice(
     engine: &mut Engine,
@@ -166,7 +186,7 @@ pub(crate) fn create_draft_invoice(
     let currency = planned.first().map(|l| l.price.currency.clone());
     let mut subtotal: i64 = planned
         .iter()
-        .map(|l| l.price.unit_amount.flatten().unwrap_or(0) * l.spec.quantity as i64)
+        .map(|l| line_amount(&l.price, l.spec.quantity))
         .sum();
     let mut joined = Vec::new();
     let candidates = if take_pending {
@@ -230,8 +250,23 @@ pub(crate) fn create_draft_invoice(
             )
             .expect("pending item is live");
     }
+    let currency = currency.unwrap_or_default();
+    // The session of a Checkout subscription fixed its first invoice's amount, so no
+    // discount applies to it either.
+    let discount = take_pending
+        .then(|| applied_discount(engine, customer, subscription, &currency))
+        .flatten();
+    let inputs: Vec<LineAmount> = planned
+        .iter()
+        .map(|l| LineAmount {
+            amount: line_amount(&l.price, l.spec.quantity),
+        })
+        .collect();
+    // Phase 9 Task 6 passes the invoice's tax rate here.
+    let (amounts, tax) = invoice_amounts(&inputs, discount.as_ref(), None);
+    let di = discount.as_ref().map(|d| d.id.as_str());
     let mut lines_out = Vec::new();
-    for l in &planned {
+    for (l, la) in planned.iter().zip(&amounts.lines) {
         let line = new_line(&NewLine {
             id: &l.id,
             invoice: &id,
@@ -240,6 +275,9 @@ pub(crate) fn create_draft_invoice(
             product_name: &l.product_name,
             subscription,
             invoice_item: l.item.as_deref(),
+            amounts: la,
+            discount: di,
+            tax,
         });
         engine.create_obj(
             ObjectType::InvoiceLineItem,
@@ -256,13 +294,16 @@ pub(crate) fn create_draft_invoice(
     let invoice = new_invoice(&NewInvoice {
         id: &id,
         customer: &customer,
-        currency: currency.as_deref().unwrap_or(""),
+        currency: &currency,
         lines: &lines_out,
         reason,
         subscription,
         period,
         created: now,
         page_size: ctx.page_size,
+        amounts: &amounts,
+        discount: di,
+        tax,
     });
     engine.create_obj(
         ObjectType::Invoice,
@@ -293,7 +334,8 @@ fn transition(
 }
 
 /// `draft → open`: numbers the invoice from its customer, then bumps the customer's
-/// `next_invoice_sequence` in an unannounced mutation.
+/// `next_invoice_sequence` in an unannounced mutation. A `once` discount the invoice
+/// carries ends in the same instant (phase 9 ruling Q2).
 pub(crate) fn finalize(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     let now = engine.now().unix_seconds();
     let customer = engine
@@ -337,10 +379,14 @@ pub(crate) fn finalize(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
             )
             .expect("live customer");
     }
+    if done {
+        end_once(engine, id, cause);
+    }
     done
 }
 
-/// `open → paid`.
+/// `open → paid`. `amount_paid` is the `amount_remaining` the payment charged (phase 9
+/// ruling Q3).
 pub(crate) fn pay(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     let now = engine.now().unix_seconds();
     transition(
@@ -349,7 +395,7 @@ pub(crate) fn pay(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
         &["open"],
         |i| {
             i.status = Some(Some(InvoiceStatus::Paid));
-            i.amount_paid = i.total;
+            i.amount_paid = i.amount_remaining;
             i.amount_remaining = 0;
             i.attempted = true;
             i.attempt_count += 1;
@@ -898,8 +944,36 @@ fn remove_from_draft(
             .expect("live line");
     }
     delete_item(engine, item, cause);
+    let draft: Invoice = engine
+        .latest_obj(ObjectType::Invoice, invoice)
+        .expect("live draft");
+    // The draft keeps the discount and tax it was created with, even if the discount has
+    // been removed since; its shares follow the lines left.
+    let discount = draft
+        .discounts
+        .first()
+        .and_then(|d| applied_by_id(engine, d.id(), &draft.currency));
+    let tax = draft_tax(engine, &draft);
     let lines = live_lines(engine, invoice);
-    let total: i64 = lines.iter().map(|l| l.amount).sum();
+    let inputs: Vec<LineAmount> = lines
+        .iter()
+        .map(|l| LineAmount { amount: l.amount })
+        .collect();
+    let (amounts, tax) = invoice_amounts(&inputs, discount.as_ref(), tax.as_ref());
+    let di = discount.as_ref().map(|d| d.id.as_str());
+    for (l, la) in lines.iter().zip(&amounts.lines) {
+        engine
+            .update_obj::<LineItem>(
+                ObjectType::InvoiceLineItem,
+                &l.id,
+                |l| set_line_amounts(l, la, di, tax),
+                cause.clone(),
+                ChangeKind::Updated,
+                &[],
+            )
+            .expect("live line");
+    }
+    let lines = live_lines(engine, invoice);
     let rendered = embedded_list(&lines, page_size, &lines_url(invoice));
     engine
         .update_obj::<Invoice>(
@@ -907,18 +981,31 @@ fn remove_from_draft(
             invoice,
             |i| {
                 i.lines = rendered;
-                i.subtotal = total;
-                i.subtotal_excluding_tax = Some(Some(total));
-                i.total = total;
-                i.total_excluding_tax = Some(Some(total));
-                i.amount_due = total;
-                i.amount_remaining = total;
+                set_invoice_amounts(i, &amounts, di, tax);
             },
             cause.clone(),
             ChangeKind::Updated,
             &["invoice.updated"],
         )
         .expect("live draft");
+}
+
+/// The tax rate a draft's lines carry, as an [`AppliedTax`]: the rate's percentage never
+/// changes, so its current state gives the basis points it was created with.
+fn draft_tax(engine: &Engine, draft: &Invoice) -> Option<AppliedTax> {
+    let rate = draft
+        .total_taxes
+        .as_ref()
+        .and_then(|t| t.as_ref())
+        .and_then(|t| t.first())
+        .and_then(|t| t.tax_rate_details.as_ref())
+        .and_then(|d| d.as_ref())
+        .map(|d| d.tax_rate.id().to_string())?;
+    let rate: crate::stripe::TaxRate = engine.latest_obj(ObjectType::TaxRate, &rate)?;
+    Some(AppliedTax {
+        bp: tax_bp(&rate),
+        rate,
+    })
 }
 
 /// `churn.invoiceitem.delete`: deletes a random pending invoice item.
