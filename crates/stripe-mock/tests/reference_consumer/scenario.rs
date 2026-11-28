@@ -2,15 +2,16 @@
 
 use std::time::Duration;
 
-use ductkit_stripe_mock::{CustomerUpdate, MockStripe, ObjectType, SubscribeFilter};
+use ductkit_stripe_mock::{CustomerUpdate, EventFormat, MockStripe, ObjectType, SubscribeFilter};
 
-use crate::hooks::SECRET;
+use crate::hooks::{SECRET, fails_first};
 
 /// The run every scenario shares: accounts, history and generation rates. Fault
 /// sections are added per test, because TOML forbids a table twice.
 ///
-/// Seed 7 gives the naive consumer stale, missing and resurrected entries (131, 22 and
-/// 3 when chosen) while the correct one converges; a new seed must keep all of that.
+/// No assertion depends on the seed: the resurrection is scripted (`update_then_delete`),
+/// and seeds 7 and 11 both pass. Seed 7 gives the naive consumer 128 stale, 22 missing
+/// and 3 resurrected entries.
 pub const SCENARIO_BASE: &str = r#"
 seed = 7
 [accounts]
@@ -56,6 +57,15 @@ stale_read = { probability = 0.2, max_lag = "10m" }
 pagination_writes = { probability = 0.2 }
 "#;
 
+/// [`FAULTS`] with stale reads off and every other fault on. With nothing stale to
+/// read, refetching each thin event's object must converge on its own, which pins the
+/// consumer's event handling (scope header, deleted stubs) without a reconcile.
+pub fn faults_without_stale_reads() -> String {
+    let on = "stale_read = { probability = 0.2,";
+    assert!(FAULTS.contains(on));
+    FAULTS.replace(on, "stale_read = { probability = 0.0,")
+}
+
 /// A snapshot destination (Connect events included) and a thin one (`@self` and
 /// `@accounts`), both signed with [`SECRET`].
 pub fn destinations(snapshot_url: &str, thin_url: &str) -> String {
@@ -85,9 +95,11 @@ pub async fn run(m: &MockStripe, mut each_tick: impl AsyncFnMut(&MockStripe)) {
     each_tick(m).await;
 }
 
-/// Updates `n` live platform customers, then deletes each a minute later. Generated
-/// churn rarely updates and deletes one customer close together, so this makes sure
-/// some update's failed first attempt is retried after its customer's delete.
+/// Updates `n` live platform customers until each one's latest `customer.updated` has
+/// a failing first attempt, then deletes them a minute later. That failed update is
+/// retried after the delete, which is what resurrects the customer in the naive
+/// consumer. Random churn almost never puts an update and a delete this close, and
+/// choosing the events this way makes the pair independent of the seed.
 async fn update_then_delete(m: &MockStripe, n: usize) {
     let filter = SubscribeFilter {
         object_types: Some(vec![ObjectType::Customer]),
@@ -102,11 +114,39 @@ async fn update_then_delete(m: &MockStripe, n: usize) {
         .collect();
     assert_eq!(ids.len(), n, "not enough live customers");
     for id in &ids {
-        m.update_customer(id, CustomerUpdate::SetName(Some("Before delete".into())))
+        let chosen = (0..30).any(|i| {
+            m.update_customer(
+                id,
+                CustomerUpdate::SetName(Some(format!("Before delete {i}"))),
+            )
             .unwrap();
+            fails_first(&last_snapshot_event(m, id, "customer.updated"))
+        });
+        assert!(chosen, "no failing update event for {id} in 30 tries");
     }
     m.step(Duration::from_secs(60)).await.unwrap();
     for id in &ids {
         m.delete_customer(id).unwrap();
     }
+    // A delete whose own first attempt fails is retried after the update's retry and
+    // removes the customer again, so at least one delete must go through first time.
+    assert!(
+        ids.iter()
+            .any(|id| !fails_first(&last_snapshot_event(m, id, "customer.deleted"))),
+        "every scripted delete fails its first attempt"
+    );
+}
+
+/// The ID of the newest snapshot event of `event_type` about `object_id`.
+fn last_snapshot_event(m: &MockStripe, object_id: &str, event_type: &str) -> String {
+    m.event_timeline()
+        .into_iter()
+        .rev()
+        .find(|e| {
+            e.format == EventFormat::Snapshot
+                && e.object_id == object_id
+                && e.event_type == event_type
+        })
+        .unwrap_or_else(|| panic!("no {event_type} for {object_id}"))
+        .id
 }

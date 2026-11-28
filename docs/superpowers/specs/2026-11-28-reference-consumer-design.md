@@ -69,6 +69,11 @@ It is an acceptance test of the mock. The future `crates/sync` engine gets its o
 - **Subscriptions are backfilled with `status=all`.** The default list hides canceled ones.
 - **History is 1 day, not 2,** to fit the time budget. History events are never delivered, so backfill still sees objects that no event announced.
 - **The fault sections are separate from the base scenario (`SCENARIO_BASE` + `FAULTS`),** because TOML forbids a table twice.
+- **Some changes announce no event.** A customer's `next_invoice_sequence` changes silently when an invoice is created (`src/generate/billing.rs:372`), as on real Stripe. So refetching on events alone never converges, even with stale reads off, and the final reconcile is needed for silent changes as well as stale reads.
+  - Because the reconcile replaces the copy, the main test can't see the consumer's event handling. A second test therefore runs with stale reads off and no reconcile (`thin_refetches_lag_only_behind_silent_changes`).
+  - It asserts that every object is at its last announced state or later, with nothing missing, resurrected or unrecognized.
+  - Dropping `Stripe-Context` makes it fail (208 missing), and so does keeping a deleted stub as an object (`other`).
+- **The scripted update-then-delete is adaptive.** It re-updates each customer until the update event is one whose first attempt fails, and checks that at least one delete gets through first time. So resurrection doesn't depend on the seed.
 - **No normalization was needed.** REST objects equal truth states for all five compared types.
 
 **Left to the builder:**

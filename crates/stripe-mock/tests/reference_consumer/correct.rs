@@ -1,7 +1,9 @@
 //! The correct consumer: backfill, then every thin event is a hint to refetch its
-//! object, then a final reconcile. Stripe objects carry no version, so a refetch that
-//! hits a stale read can't be told from a fresh one; only the reconcile after the
-//! stale-read lag makes the copy exact.
+//! object, then a final reconcile. The reconcile is needed for two reasons:
+//! - Stripe objects carry no version, so a refetch that hits a stale read can't be
+//!   told from a fresh one;
+//! - some changes announce no event at all (a customer's `next_invoice_sequence`
+//!   when an invoice is created), so no hint ever arrives for them.
 
 use ductkit_stripe_mock::ObjectType;
 

@@ -26,6 +26,9 @@ pub struct Truth {
     history: BTreeMap<Key, Vec<Value>>,
     /// Keys whose last entry is a delete.
     deleted: BTreeSet<Key>,
+    /// Per object, the index in `history` of its last change that announced a thin
+    /// event. Later changes were silent (no event), so no event hints at them.
+    last_announced: BTreeMap<Key, usize>,
 }
 
 /// How a consumer's copy compares with the truth, key by key.
@@ -54,6 +57,7 @@ impl Truth {
             latest: Synced::new(),
             history: BTreeMap::new(),
             deleted: BTreeSet::new(),
+            last_announced: BTreeMap::new(),
         };
         for u in log.iter().filter(|u| COMPARED.contains(&u.object_type)) {
             let k: Key = (u.account.clone(), u.object_type, u.object_id.clone());
@@ -63,7 +67,11 @@ impl Truth {
             } else {
                 t.deleted.remove(&k);
                 t.latest.insert(k.clone(), u.state.clone());
-                t.history.entry(k).or_default().push(u.state.clone());
+                let h = t.history.entry(k.clone()).or_default();
+                h.push(u.state.clone());
+                if !u.events.thin.is_empty() {
+                    t.last_announced.insert(k, h.len() - 1);
+                }
             }
         }
         t
@@ -86,5 +94,22 @@ impl Truth {
             .filter(|k| !synced.contains_key(*k))
             .count();
         d
+    }
+
+    /// Keys of live objects the copy holds at a state older than their last announced
+    /// change. A consumer that refetches on events can only lag behind silent changes;
+    /// anything older means it missed or mishandled an event.
+    pub fn unexplained_staleness(&self, synced: &Synced) -> Vec<Key> {
+        synced
+            .iter()
+            .filter(|(k, v)| {
+                self.latest.get(*k).is_some_and(|l| l != *v) && {
+                    let h = &self.history[*k];
+                    let from = self.last_announced.get(*k).copied().unwrap_or(0);
+                    !h[from..].contains(v)
+                }
+            })
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 }

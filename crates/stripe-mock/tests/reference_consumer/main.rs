@@ -226,3 +226,58 @@ correct {d:?}",
         );
     }
 }
+
+#[test]
+fn only_silent_changes_explain_staleness() {
+    let announced = EventRefs {
+        snapshot: vec!["evt_1".into()],
+        thin: vec!["evt_v2_1".into()],
+    };
+    let mut log = vec![
+        entry(1, "cus_a", 1, ChangeKind::Created, json!({"v": 1})),
+        entry(2, "cus_a", 2, ChangeKind::Updated, json!({"v": 2})),
+        entry(3, "cus_a", 3, ChangeKind::Updated, json!({"v": 3})),
+    ];
+    log[0].events = announced.clone();
+    log[1].events = announced; // v3 is a silent change
+    let truth = Truth::from_log(&log);
+    let at = |v: i64| -> Synced { [(key("cus_a"), json!({"v": v}))].into_iter().collect() };
+    assert!(truth.unexplained_staleness(&at(3)).is_empty(), "latest");
+    assert!(
+        truth.unexplained_staleness(&at(2)).is_empty(),
+        "last announced"
+    );
+    assert_eq!(truth.unexplained_staleness(&at(1)), vec![key("cus_a")]);
+}
+
+/// The final reconcile replaces the correct consumer's copy, so the main test never
+/// sees its event handling. Without stale reads, refetching on thin events must leave
+/// every object at its last announced state or later: it can lag behind only silent
+/// changes (such as a customer's `next_invoice_sequence`), never miss or resurrect one.
+#[tokio::test]
+async fn thin_refetches_lag_only_behind_silent_changes() {
+    let snapshot_hooks = HookServer::start();
+    let thin_hooks = HookServer::start();
+    let m = common::mock_with(&format!(
+        "{}{}{}",
+        scenario::SCENARIO_BASE,
+        scenario::faults_without_stale_reads(),
+        scenario::destinations(&snapshot_hooks.url(), &thin_hooks.url())
+    ))
+    .await;
+    let _guard = m.replay_guard(env!("CARGO_TARGET_TMPDIR"));
+    let c = Client::new(&m);
+    let scopes = client::scopes(&m);
+    let mut correct = Correct::new(thin_hooks);
+    correct.backfill(&c, &scopes).await;
+    scenario::run(&m, async |_| correct.tick(&c).await).await;
+
+    let truth = Truth::from_log(&m.truth_log());
+    let d = truth.classify(&correct.synced);
+    let unexplained = truth.unexplained_staleness(&correct.synced);
+    assert!(
+        d.missing == 0 && d.resurrected == 0 && d.other.is_empty() && unexplained.is_empty(),
+        "seed {}: refetches alone: {d:?}, stale past an announced change: {unexplained:?}",
+        m.seed()
+    );
+}
