@@ -171,7 +171,7 @@ pub struct Invoice {
     )]
     pub description: Option<Option<String>>,
     /// The discounts applied to the invoice.
-    pub discounts: Vec<String>,
+    pub discounts: Vec<Expandable<InvoiceDiscounts>>,
     /// The date on which payment for this invoice is due.
     #[serde(
         default,
@@ -811,6 +811,20 @@ impl HasId for InvoiceDefaultSource {
         match self {
             Self::BankAccount(x) => x.id(),
             Self::Card(x) => x.id(),
+        }
+    }
+}
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum InvoiceDiscounts {
+    Discount(Discount),
+    DeletedDiscount(DeletedDiscount),
+}
+impl HasId for InvoiceDiscounts {
+    fn id(&self) -> &str {
+        match self {
+            Self::Discount(x) => x.id(),
+            Self::DeletedDiscount(x) => x.id(),
         }
     }
 }
@@ -1599,7 +1613,21 @@ pub struct DiscountsResourceDiscountAmount {
     /// The amount, in cents (or local equivalent), of the discount.
     pub amount: i64,
     /// The discount that was applied to get this discount amount.
-    pub discount: String,
+    pub discount: Expandable<DiscountsResourceDiscountAmountDiscount>,
+}
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum DiscountsResourceDiscountAmountDiscount {
+    Discount(Discount),
+    DeletedDiscount(DeletedDiscount),
+}
+impl HasId for DiscountsResourceDiscountAmountDiscount {
+    fn id(&self) -> &str {
+        match self {
+            Self::Discount(x) => x.id(),
+            Self::DeletedDiscount(x) => x.id(),
+        }
+    }
 }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1615,10 +1643,24 @@ pub struct InvoicesResourcePretaxCreditAmount {
     pub credit_balance_transaction: Option<Option<String>>,
     /// The discount that was applied to get this pretax credit amount.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub discount: Option<String>,
+    pub discount: Option<Expandable<InvoicesResourcePretaxCreditAmountDiscount>>,
     /// Type of the pretax credit amount referenced.
     #[serde(rename = "type")]
     pub type_: InvoicesResourcePretaxCreditAmountType,
+}
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum InvoicesResourcePretaxCreditAmountDiscount {
+    Discount(Discount),
+    DeletedDiscount(DeletedDiscount),
+}
+impl HasId for InvoicesResourcePretaxCreditAmountDiscount {
+    fn id(&self) -> &str {
+        match self {
+            Self::Discount(x) => x.id(),
+            Self::DeletedDiscount(x) => x.id(),
+        }
+    }
 }
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InvoicesResourcePretaxCreditAmountType {
@@ -1667,7 +1709,7 @@ pub enum BillingBillResourceInvoicingTaxesTaxTaxBehavior {
 #[serde(deny_unknown_fields)]
 pub struct BillingBillResourceInvoicingTaxesTaxRateDetails {
     /// ID of the tax rate
-    pub tax_rate: String,
+    pub tax_rate: Expandable<TaxRate>,
 }
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BillingBillResourceInvoicingTaxesTaxTaxabilityReason {

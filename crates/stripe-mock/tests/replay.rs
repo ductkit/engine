@@ -7,6 +7,7 @@ use common::{get, get_as, mock_with};
 use ductkit_stripe_mock::{
     AccountApi, Action, ControlOp, CustomerUpdate, DestinationConfig, DurationStr, MockError,
     MockStripe, NewCustomer, ObjectType, PayloadFormat, ReplayOptions, RunExport, SimTime,
+    StateUpdate,
 };
 use serde_json::Value;
 
@@ -504,19 +505,50 @@ account_api = { v1 = 1.0, v2 = 0.0 }
 account_types = { standard = 1.0, express = 0.0, custom = 0.0 }
 "#;
 
-/// SHA-256 (hex) of `serde_json::to_string(&m.truth_log())` for [`PHASE_7_FULL`] stepped two
-/// days. Recorded by running this test on the phase 8 base commit 8ad493d, before any phase 8
-/// change, by printing the digest. A phase 8 default config must draw nothing new.
-const PHASE_7_TRUTH_SHA256: &str =
-    "fca4a7cf5616829262ebea30d6f0da27fbc31f3d56e461b460652e7a04509d33";
+/// The phase 9 object types (ruling Q1), by `StateUpdate.object_type` serde name (the
+/// snake_case of the Q1 `ObjectType` variant names, which the variants added in phase 9 derive).
+/// The projection drops their entries.
+const PHASE_9_TYPES: [&str; 8] = [
+    "coupon",
+    "promotion_code",
+    "discount",
+    "invoice_item",
+    "credit_note",
+    "credit_note_line_item",
+    "tax_rate",
+    "subscription_schedule",
+];
+
+/// The truth log as phase 8 produced it (ruling Q12): entries of the phase 9 types removed, and
+/// `seq` and `events` stripped from every remaining entry.
+fn phase_8_projection(log: &[StateUpdate]) -> String {
+    let entries: Vec<serde_json::Value> = log
+        .iter()
+        .map(|u| serde_json::to_value(u).unwrap())
+        .filter(|v| !PHASE_9_TYPES.contains(&v["object_type"].as_str().unwrap()))
+        .map(|mut v| {
+            let o = v.as_object_mut().unwrap();
+            o.remove("seq");
+            o.remove("events");
+            v
+        })
+        .collect();
+    serde_json::to_string(&entries).unwrap()
+}
+
+/// SHA-256 (hex) of [`phase_8_projection`] of the truth log for [`PHASE_7_FULL`] stepped two
+/// days. Recorded on the phase 9 base commit 6676626, before any phase 9 change, by printing
+/// the digest. With every phase 9 key at its default, nothing else may change.
+const PHASE_8_TRUTH_SHA256: &str =
+    "7a7e5ae55fbb25021222415bf10aa85036803b3126c6ad239c0a64e4d4ba4da4";
 
 #[tokio::test]
-async fn default_config_replays_phase_7_run() {
+async fn default_config_replays_phase_8_run() {
     use sha2::{Digest, Sha256};
     let m = mock_with(PHASE_7_FULL).await;
     m.step(Duration::from_secs(2 * 86_400)).await.unwrap();
     let log = m.truth_log();
     assert!(log.len() > 200, "{}", log.len());
-    let digest = hex::encode(Sha256::digest(truth(&m).as_bytes()));
-    assert_eq!(digest, PHASE_7_TRUTH_SHA256, "log len {}", log.len());
+    let digest = hex::encode(Sha256::digest(phase_8_projection(&log).as_bytes()));
+    assert_eq!(digest, PHASE_8_TRUTH_SHA256, "log len {}", log.len());
 }

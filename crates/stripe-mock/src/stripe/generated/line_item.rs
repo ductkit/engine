@@ -29,7 +29,7 @@ pub struct LineItem {
     /// If true, discounts will apply to this line item.
     pub discountable: bool,
     /// The discounts applied to the invoice line item.
-    pub discounts: Vec<String>,
+    pub discounts: Vec<Expandable<Discount>>,
     /// Unique identifier for the object.
     pub id: String,
     /// The ID of the invoice that contains this line item.

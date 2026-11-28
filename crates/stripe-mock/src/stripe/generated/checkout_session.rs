@@ -1287,14 +1287,14 @@ pub struct PaymentPagesCheckoutSessionDiscount {
         skip_serializing_if = "Option::is_none",
         with = "crate::stripe::double_option"
     )]
-    pub coupon: Option<Option<String>>,
+    pub coupon: Option<Option<Expandable<Coupon>>>,
     /// Promotion code attached to the Checkout Session.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         with = "crate::stripe::double_option"
     )]
-    pub promotion_code: Option<Option<String>>,
+    pub promotion_code: Option<Option<Expandable<PromotionCode>>>,
 }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]

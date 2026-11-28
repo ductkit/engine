@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use crate::stripe::HasId;
+use crate::stripe::{Expandable, HasId};
 use super::*;
 /// Subscription items allow you to create customer subscriptions with more than one plan, making it easy to represent complex billing relationships.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -32,7 +32,7 @@ pub struct SubscriptionItem {
     )]
     pub current_trial: Option<Option<SubscriptionsTrialsResourceCurrentTrial>>,
     /// The discounts applied to the subscription item.
-    pub discounts: Vec<String>,
+    pub discounts: Vec<Expandable<Discount>>,
     /// Unique identifier for the object.
     pub id: String,
     /// Set of [key-value pairs](https://docs.stripe.com/api/metadata) that you can attach to an object.

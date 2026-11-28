@@ -118,7 +118,7 @@ pub struct Subscription {
     )]
     pub description: Option<Option<String>>,
     /// The discounts applied to the subscription.
-    pub discounts: Vec<String>,
+    pub discounts: Vec<Expandable<Discount>>,
     /// If the subscription has ended, the date the subscription ended.
     #[serde(
         default,
@@ -210,7 +210,7 @@ pub struct Subscription {
         skip_serializing_if = "Option::is_none",
         with = "crate::stripe::double_option"
     )]
-    pub schedule: Option<Option<String>>,
+    pub schedule: Option<Option<Expandable<SubscriptionSchedule>>>,
     /// Date when the subscription was first created.
     pub start_date: i64,
     /// Possible values are `incomplete`, `incomplete_expired`, `trialing`, `active`, `past_due`, `canceled`, `unpaid`, or `paused`.
@@ -580,197 +580,6 @@ impl HasId for SubscriptionDefaultSource {
             Self::Card(x) => x.id(),
         }
     }
-}
-/// Tax rates can be applied to [invoices](/invoicing/taxes/tax-rates), [subscriptions](/billing/taxes/tax-rates) and [Checkout Sessions](/payments/checkout/use-manual-tax-rates) to collect tax.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct TaxRate {
-    /// Defaults to `true`.
-    pub active: bool,
-    /// Two-letter country code ([ISO 3166-1 alpha-2](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2)).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub country: Option<Option<String>>,
-    /// Time at which the object was created.
-    pub created: i64,
-    /// An arbitrary string attached to the tax rate for your internal use only.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub description: Option<Option<String>>,
-    /// The display name of the tax rates as it will appear to your customer on their receipt email, PDF, and the hosted invoice page.
-    pub display_name: String,
-    /// Actual/effective tax rate percentage out of 100.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub effective_percentage: Option<Option<f64>>,
-    /// The amount of the tax rate when the `rate_type` is `flat_amount`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub flat_amount: Option<Option<TaxRateFlatAmount>>,
-    /// Unique identifier for the object.
-    pub id: String,
-    /// This specifies if the tax rate is inclusive or exclusive.
-    pub inclusive: bool,
-    /// The jurisdiction for the tax rate.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub jurisdiction: Option<Option<String>>,
-    /// The level of the jurisdiction that imposes this tax rate.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub jurisdiction_level: Option<Option<TaxRateJurisdictionLevel>>,
-    /// If the object exists in live mode, the value is `true`.
-    pub livemode: bool,
-    /// Set of [key-value pairs](https://docs.stripe.com/api/metadata) that you can attach to an object.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub metadata: Option<Option<BTreeMap<String, String>>>,
-    /// String representing the object's type.
-    pub object: TaxRateObject,
-    /// Tax rate percentage out of 100.
-    pub percentage: f64,
-    /// Indicates the type of tax rate applied to the taxable amount.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub rate_type: Option<Option<TaxRateRateType>>,
-    /// [ISO 3166-2 subdivision code](https://en.wikipedia.org/wiki/ISO_3166-2), without country prefix.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub state: Option<Option<String>>,
-    /// The high-level tax type, such as `vat` or `sales_tax`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::stripe::double_option"
-    )]
-    pub tax_type: Option<Option<TaxRateTaxType>>,
-}
-impl HasId for TaxRate {
-    fn id(&self) -> &str {
-        &self.id
-    }
-}
-/// The amount of the tax rate when the `rate_type`` is `flat_amount`.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct TaxRateFlatAmount {
-    /// Amount of the tax when the `rate_type` is `flat_amount`.
-    pub amount: i64,
-    /// Three-letter ISO currency code, in lowercase.
-    pub currency: String,
-}
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TaxRateJurisdictionLevel {
-    #[serde(rename = "city")]
-    City,
-    #[serde(rename = "country")]
-    Country,
-    #[serde(rename = "county")]
-    County,
-    #[serde(rename = "district")]
-    District,
-    #[serde(rename = "multiple")]
-    Multiple,
-    #[serde(rename = "state")]
-    State,
-}
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TaxRateObject {
-    #[serde(rename = "tax_rate")]
-    TaxRate,
-}
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TaxRateRateType {
-    #[serde(rename = "flat_amount")]
-    FlatAmount,
-    #[serde(rename = "percentage")]
-    Percentage,
-}
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TaxRateTaxType {
-    #[serde(rename = "admissions_tax")]
-    AdmissionsTax,
-    #[serde(rename = "amusement_tax")]
-    AmusementTax,
-    #[serde(rename = "attendance_tax")]
-    AttendanceTax,
-    #[serde(rename = "communications_tax")]
-    CommunicationsTax,
-    #[serde(rename = "digital_excise_tax")]
-    DigitalExciseTax,
-    #[serde(rename = "entertainment_tax")]
-    EntertainmentTax,
-    #[serde(rename = "get_fund")]
-    GetFund,
-    #[serde(rename = "gross_receipts_tax")]
-    GrossReceiptsTax,
-    #[serde(rename = "gst")]
-    Gst,
-    #[serde(rename = "hospitality_tax")]
-    HospitalityTax,
-    #[serde(rename = "hst")]
-    Hst,
-    #[serde(rename = "igst")]
-    Igst,
-    #[serde(rename = "jct")]
-    Jct,
-    #[serde(rename = "lease_tax")]
-    LeaseTax,
-    #[serde(rename = "luxury_tax")]
-    LuxuryTax,
-    #[serde(rename = "mass_transit_parking_tax")]
-    MassTransitParkingTax,
-    #[serde(rename = "nhil")]
-    Nhil,
-    #[serde(rename = "parking_tax")]
-    ParkingTax,
-    #[serde(rename = "pst")]
-    Pst,
-    #[serde(rename = "qst")]
-    Qst,
-    #[serde(rename = "resort_tax")]
-    ResortTax,
-    #[serde(rename = "retail_delivery_fee")]
-    RetailDeliveryFee,
-    #[serde(rename = "rst")]
-    Rst,
-    #[serde(rename = "sales_tax")]
-    SalesTax,
-    #[serde(rename = "service_tax")]
-    ServiceTax,
-    #[serde(rename = "tourism_tax")]
-    TourismTax,
-    #[serde(rename = "utility_users_tax")]
-    UtilityUsersTax,
-    #[serde(rename = "vat")]
-    Vat,
 }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1723,7 +1532,7 @@ pub struct SubscriptionsResourcePendingUpdate {
         skip_serializing_if = "Option::is_none",
         with = "crate::stripe::double_option"
     )]
-    pub discounts: Option<Option<Vec<String>>>,
+    pub discounts: Option<Option<Vec<Expandable<Discount>>>>,
     /// The point after which the changes reflected by this update will be discarded and no longer applied.
     pub expires_at: i64,
     /// Set of [key-value pairs](https://docs.stripe.com/api/metadata) that you can attach to an object.

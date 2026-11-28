@@ -53,6 +53,17 @@ mod card;
 mod deleted_card;
 mod person;
 mod deleted_person;
+mod coupon;
+mod deleted_coupon;
+mod promotion_code;
+mod discount;
+mod deleted_discount;
+mod invoiceitem;
+mod deleted_invoiceitem;
+mod credit_note;
+mod credit_note_line_item;
+mod tax_rate;
+mod subscription_schedule;
 pub use customer::*;
 pub use deleted_customer::*;
 pub use product::*;
@@ -95,6 +106,17 @@ pub use card::*;
 pub use deleted_card::*;
 pub use person::*;
 pub use deleted_person::*;
+pub use coupon::*;
+pub use deleted_coupon::*;
+pub use promotion_code::*;
+pub use discount::*;
+pub use deleted_discount::*;
+pub use invoiceitem::*;
+pub use deleted_invoiceitem::*;
+pub use credit_note::*;
+pub use credit_note_line_item::*;
+pub use tax_rate::*;
+pub use subscription_schedule::*;
 /// `(object value, schema)` for every generated component schema with a one-value
 /// `object` field. Several schemas can share a value (`customer`, `deleted_customer`).
 pub const SCHEMA_OBJECTS: &[(&str, &str)] = &[
@@ -110,8 +132,13 @@ pub const SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("cash_balance", "cash_balance"),
     ("charge", "charge"),
     ("checkout.session", "checkout.session"),
+    ("coupon", "coupon"),
+    ("coupon", "deleted_coupon"),
+    ("credit_note", "credit_note"),
+    ("credit_note_line_item", "credit_note_line_item"),
     ("customer", "customer"),
     ("customer", "deleted_customer"),
+    ("discount", "deleted_discount"),
     ("discount", "discount"),
     ("dispute", "dispute"),
     ("event", "event"),
@@ -119,6 +146,8 @@ pub const SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("invoice", "deleted_invoice"),
     ("invoice", "invoice"),
     ("invoice_payment", "invoice_payment"),
+    ("invoiceitem", "deleted_invoiceitem"),
+    ("invoiceitem", "invoiceitem"),
     ("item", "item"),
     ("line_item", "line_item"),
     ("payment_intent", "payment_intent"),
@@ -134,12 +163,14 @@ pub const SCHEMA_OBJECTS: &[(&str, &str)] = &[
     ("price", "price"),
     ("product", "deleted_product"),
     ("product", "product"),
+    ("promotion_code", "promotion_code"),
     ("refund", "refund"),
     ("setup_intent", "setup_intent"),
     ("source", "source"),
     ("subscription", "subscription"),
     ("subscription_item", "deleted_subscription_item"),
     ("subscription_item", "subscription_item"),
+    ("subscription_schedule", "subscription_schedule"),
     ("tax_id", "tax_id"),
     ("tax_rate", "tax_rate"),
     ("transfer", "transfer"),
@@ -464,6 +495,12 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
                     "routing_number",
                     "status",
                 ]
+            }
+            "billing_bill_resource_invoice_item_parents_invoice_item_parent" => {
+                &["subscription_details", "type"]
+            }
+            "billing_bill_resource_invoice_item_parents_invoice_item_subscription_parent" => {
+                &["subscription", "subscription_item"]
             }
             "billing_bill_resource_invoicing_lines_common_credited_items" => {
                 &["invoice", "invoice_line_items"]
@@ -917,6 +954,95 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
                 &["app_id", "client", "setup_future_usage"]
             }
             "connect_account_reference" => &["account", "type"],
+            "coupon" => {
+                &[
+                    "amount_off",
+                    "applies_to",
+                    "created",
+                    "currency",
+                    "currency_options",
+                    "duration",
+                    "duration_in_months",
+                    "id",
+                    "livemode",
+                    "max_redemptions",
+                    "metadata",
+                    "name",
+                    "object",
+                    "percent_off",
+                    "redeem_by",
+                    "times_redeemed",
+                    "valid",
+                ]
+            }
+            "coupon_applies_to" => &["products"],
+            "coupon_currency_option" => &["amount_off"],
+            "credit_note" => {
+                &[
+                    "amount",
+                    "amount_shipping",
+                    "created",
+                    "currency",
+                    "customer",
+                    "customer_account",
+                    "customer_balance_transaction",
+                    "discount_amount",
+                    "discount_amounts",
+                    "effective_at",
+                    "id",
+                    "invoice",
+                    "lines",
+                    "livemode",
+                    "memo",
+                    "metadata",
+                    "number",
+                    "object",
+                    "out_of_band_amount",
+                    "pdf",
+                    "post_payment_amount",
+                    "pre_payment_amount",
+                    "pretax_credit_amounts",
+                    "reason",
+                    "refunds",
+                    "shipping_cost",
+                    "status",
+                    "subtotal",
+                    "subtotal_excluding_tax",
+                    "total",
+                    "total_excluding_tax",
+                    "total_taxes",
+                    "type",
+                    "voided_at",
+                ]
+            }
+            "credit_note_line_item" => {
+                &[
+                    "amount",
+                    "description",
+                    "discount_amount",
+                    "discount_amounts",
+                    "id",
+                    "invoice_line_item",
+                    "livemode",
+                    "metadata",
+                    "object",
+                    "pretax_credit_amounts",
+                    "quantity",
+                    "tax_rates",
+                    "taxes",
+                    "type",
+                    "unit_amount",
+                    "unit_amount_decimal",
+                ]
+            }
+            "credit_note_refund" => {
+                &["amount_refunded", "payment_record_refund", "refund", "type"]
+            }
+            "credit_notes_payment_record_refund" => &["payment_record", "refund_group"],
+            "credit_notes_pretax_credit_amount" => {
+                &["amount", "credit_balance_transaction", "discount", "type"]
+            }
+            "credited_items_invoice_line_items" => &["invoice", "invoice_line_items"],
             "currency_option" => {
                 &[
                     "custom_unit_amount",
@@ -971,8 +1097,27 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
             "deleted_account" => &["deleted", "id", "object"],
             "deleted_bank_account" => &["currency", "deleted", "id", "object"],
             "deleted_card" => &["currency", "deleted", "id", "object"],
+            "deleted_coupon" => &["deleted", "id", "object"],
             "deleted_customer" => &["deleted", "id", "object"],
+            "deleted_discount" => {
+                &[
+                    "checkout_session",
+                    "customer",
+                    "customer_account",
+                    "deleted",
+                    "id",
+                    "invoice",
+                    "invoice_item",
+                    "object",
+                    "promotion_code",
+                    "source",
+                    "start",
+                    "subscription",
+                    "subscription_item",
+                ]
+            }
             "deleted_invoice" => &["deleted", "id", "object"],
+            "deleted_invoiceitem" => &["deleted", "id", "object"],
             "deleted_person" => &["deleted", "id", "object"],
             "deleted_price" => &["deleted", "id", "object"],
             "deleted_product" => &["deleted", "id", "object"],
@@ -997,6 +1142,9 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
             }
             "discount_source" => &["coupon", "type"],
             "discounts_resource_discount_amount" => &["amount", "discount"],
+            "discounts_resource_stackable_discount_with_discount_end" => {
+                &["coupon", "discount", "promotion_code"]
+            }
             "dispute" => {
                 &[
                     "amount",
@@ -1320,6 +1468,9 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
                 ]
             }
             "invoice_installments_card" => &["enabled"],
+            "invoice_item_proration_credited_items" => {
+                &["invoice_item", "invoice_line_item_details", "type"]
+            }
             "invoice_item_threshold_reason" => &["line_item_ids", "usage_gte"],
             "invoice_line_item_period" => &["end", "start"],
             "invoice_mandate_options_card" => &["amount", "amount_type", "description"],
@@ -1408,7 +1559,56 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
                     "rendering_options",
                 ]
             }
+            "invoice_setting_subscription_schedule_phase_setting" => {
+                &[
+                    "account_tax_ids",
+                    "custom_fields",
+                    "days_until_due",
+                    "description",
+                    "footer",
+                    "issuer",
+                ]
+            }
+            "invoice_setting_subscription_schedule_setting" => {
+                &[
+                    "account_tax_ids",
+                    "custom_fields",
+                    "days_until_due",
+                    "description",
+                    "footer",
+                    "issuer",
+                ]
+            }
             "invoice_threshold_reason" => &["amount_gte", "item_reasons"],
+            "invoiceitem" => {
+                &[
+                    "amount",
+                    "currency",
+                    "customer",
+                    "customer_account",
+                    "date",
+                    "description",
+                    "discountable",
+                    "discounts",
+                    "frozen_fields",
+                    "id",
+                    "invoice",
+                    "invoicing_rules",
+                    "livemode",
+                    "metadata",
+                    "net_amount",
+                    "object",
+                    "parent",
+                    "period",
+                    "pricing",
+                    "proration",
+                    "proration_details",
+                    "quantity",
+                    "quantity_decimal",
+                    "tax_rates",
+                    "test_clock",
+                ]
+            }
             "invoices_payment_method_options" => {
                 &[
                     "acss_debit",
@@ -1457,6 +1657,7 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
                 &["finalized_at", "marked_uncollectible_at", "paid_at", "voided_at"]
             }
             "invoices_resource_uncollectible_status_details" => &["reason"],
+            "invoicing_rule" => &["type"],
             "item" => {
                 &[
                     "adjustable_quantity",
@@ -3325,6 +3526,35 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
                 ]
             }
             "product_marketing_feature" => &["loss_message", "name"],
+            "promotion_code" => {
+                &[
+                    "active",
+                    "code",
+                    "created",
+                    "customer",
+                    "customer_account",
+                    "expires_at",
+                    "id",
+                    "livemode",
+                    "max_redemptions",
+                    "metadata",
+                    "object",
+                    "promotion",
+                    "restrictions",
+                    "times_redeemed",
+                ]
+            }
+            "promotion_code_currency_option" => &["minimum_amount"],
+            "promotion_codes_resource_promotion" => &["coupon", "type"],
+            "promotion_codes_resource_restrictions" => {
+                &[
+                    "currency_options",
+                    "first_time_transaction",
+                    "minimum_amount",
+                    "minimum_amount_currency",
+                ]
+            }
+            "proration_details" => &["credited_items", "discount_amounts"],
             "radar_radar_options" => &["session"],
             "recurring" => &["interval", "interval_count", "meter", "usage_type"],
             "refund" => {
@@ -3446,6 +3676,9 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
             "refund_next_action" => &["display_details", "type"],
             "refund_next_action_display_details" => &["email_sent", "expires_at"],
             "revolut_pay_underlying_payment_method_funding_details" => &["card", "type"],
+            "schedules_phase_automatic_tax" => {
+                &["disabled_reason", "enabled", "liability"]
+            }
             "sepa_debit_generated_from" => &["charge", "setup_attempt"],
             "setup_intent" => {
                 &[
@@ -3859,6 +4092,12 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
                 ]
             }
             "source_type_wechat" => &["prepay_id", "qr_code_url", "statement_descriptor"],
+            "stackable_discount_with_discount_settings" => {
+                &["coupon", "discount", "promotion_code"]
+            }
+            "stackable_discount_with_discount_settings_and_discount_end" => {
+                &["coupon", "discount", "promotion_code"]
+            }
             "subscription" => {
                 &[
                     "application",
@@ -3963,6 +4202,135 @@ pub fn schema_fields(schema: &str) -> Option<&'static [&'static str]> {
             "subscription_payment_method_options_upi" => &["mandate_options"],
             "subscription_pending_invoice_item_interval" => {
                 &["interval", "interval_count"]
+            }
+            "subscription_schedule" => {
+                &[
+                    "application",
+                    "billing_mode",
+                    "canceled_at",
+                    "completed_at",
+                    "created",
+                    "current_phase",
+                    "customer",
+                    "customer_account",
+                    "default_settings",
+                    "end_behavior",
+                    "id",
+                    "livemode",
+                    "metadata",
+                    "object",
+                    "pause_schedules",
+                    "phases",
+                    "released_at",
+                    "released_subscription",
+                    "status",
+                    "subscription",
+                    "test_clock",
+                ]
+            }
+            "subscription_schedule_add_invoice_item" => {
+                &[
+                    "discountable",
+                    "discounts",
+                    "metadata",
+                    "period",
+                    "price",
+                    "quantity",
+                    "tax_rates",
+                ]
+            }
+            "subscription_schedule_add_invoice_item_period" => &["end", "start"],
+            "subscription_schedule_configuration_item" => {
+                &[
+                    "billing_thresholds",
+                    "discounts",
+                    "metadata",
+                    "price",
+                    "quantity",
+                    "tax_rates",
+                ]
+            }
+            "subscription_schedule_current_phase" => &["end_date", "start_date"],
+            "subscription_schedule_phase_configuration" => {
+                &[
+                    "add_invoice_items",
+                    "application_fee_percent",
+                    "automatic_tax",
+                    "billing_cycle_anchor",
+                    "billing_thresholds",
+                    "collection_method",
+                    "currency",
+                    "default_payment_method",
+                    "default_tax_rates",
+                    "description",
+                    "discounts",
+                    "end_date",
+                    "invoice_settings",
+                    "items",
+                    "metadata",
+                    "on_behalf_of",
+                    "proration_behavior",
+                    "start_date",
+                    "transfer_data",
+                    "trial",
+                    "trial_end",
+                ]
+            }
+            "subscription_schedules_resource_default_settings" => {
+                &[
+                    "application_fee_percent",
+                    "automatic_tax",
+                    "billing_cycle_anchor",
+                    "billing_thresholds",
+                    "collection_method",
+                    "default_payment_method",
+                    "description",
+                    "invoice_settings",
+                    "on_behalf_of",
+                    "transfer_data",
+                ]
+            }
+            "subscription_schedules_resource_default_settings_automatic_tax" => {
+                &["disabled_reason", "enabled", "liability"]
+            }
+            "subscription_schedules_resource_invoice_item_period_resource_period_end" => {
+                &["timestamp", "type"]
+            }
+            "subscription_schedules_resource_invoice_item_period_resource_period_start" => {
+                &["timestamp", "type"]
+            }
+            "subscription_schedules_resource_pause_schedule" => {
+                &["key", "pause", "resume"]
+            }
+            "subscription_schedules_resource_pause_schedule_bill_for" => {
+                &["outstanding_usage_through", "unused_time_from"]
+            }
+            "subscription_schedules_resource_pause_schedule_outstanding_usage_through" => {
+                &["type"]
+            }
+            "subscription_schedules_resource_pause_schedule_pause" => {
+                &["pause_at", "settings", "status"]
+            }
+            "subscription_schedules_resource_pause_schedule_pause_settings" => {
+                &["bill_for", "invoicing_behavior", "type"]
+            }
+            "subscription_schedules_resource_pause_schedule_pause_status" => {
+                &["error", "type"]
+            }
+            "subscription_schedules_resource_pause_schedule_resume" => {
+                &["resume_at", "settings", "status"]
+            }
+            "subscription_schedules_resource_pause_schedule_resume_settings" => {
+                &["billing_cycle_anchor", "payment_behavior", "proration_behavior"]
+            }
+            "subscription_schedules_resource_pause_schedule_resume_status" => {
+                &["error", "type"]
+            }
+            "subscription_schedules_resource_pause_schedule_status_error" => {
+                &["code", "message"]
+            }
+            "subscription_schedules_resource_pause_schedule_unused_time_from" => {
+                &["type"]
             }
             "subscription_transfer_data" => &["amount_percent", "destination"],
             "subscriptions_resource_billing_cycle_anchor_config" => {
@@ -4242,6 +4610,7 @@ pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
             &["subscription"]
         }
         "billing_bill_resource_invoicing_pricing_pricing_price_details" => &["price"],
+        "billing_bill_resource_invoicing_taxes_tax_rate_details" => &["tax_rate"],
         "card" => &["account", "customer"],
         "charge" => {
             &[
@@ -4261,8 +4630,17 @@ pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
             &["customer", "invoice", "payment_intent", "setup_intent", "subscription"]
         }
         "connect_account_reference" => &["account"],
+        "credit_note" => &["customer", "invoice"],
+        "credit_note_refund" => &["refund"],
+        "credit_notes_pretax_credit_amount" => &["discount"],
         "customer" => &["default_source"],
-        "discount" => &["customer"],
+        "deleted_discount" => &["customer", "promotion_code"],
+        "discount" => &["customer", "promotion_code"],
+        "discount_source" => &["coupon"],
+        "discounts_resource_discount_amount" => &["discount"],
+        "discounts_resource_stackable_discount_with_discount_end" => {
+            &["coupon", "discount", "promotion_code"]
+        }
         "dispute" => &["charge", "payment_intent"],
         "fee_refund" => &["balance_transaction", "fee"],
         "invoice" => {
@@ -4271,17 +4649,20 @@ pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
                 "customer",
                 "default_payment_method",
                 "default_source",
+                "discounts",
                 "latest_revision",
                 "on_behalf_of",
             ]
         }
         "invoice_payment" => &["invoice"],
         "invoice_setting_customer_setting" => &["default_payment_method"],
+        "invoiceitem" => &["customer", "discounts", "invoice"],
         "invoices_payments_invoice_payment_associated_payment" => {
             &["charge", "payment_intent"]
         }
         "invoices_resource_from_invoice" => &["invoice"],
-        "line_item" => &["subscription"],
+        "invoices_resource_pretax_credit_amount" => &["discount"],
+        "line_item" => &["discounts", "subscription"],
         "payment_intent" => {
             &[
                 "application",
@@ -4295,6 +4676,7 @@ pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
         "payment_method_details_bancontact" => &["generated_sepa_debit"],
         "payment_method_details_ideal" => &["generated_sepa_debit"],
         "payment_method_details_sofort" => &["generated_sepa_debit"],
+        "payment_pages_checkout_session_discount" => &["coupon", "promotion_code"],
         "payout" => {
             &[
                 "application_fee",
@@ -4307,6 +4689,8 @@ pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
         }
         "price" => &["product"],
         "product" => &["default_price"],
+        "promotion_code" => &["customer"],
+        "promotion_codes_resource_promotion" => &["coupon"],
         "refund" => {
             &[
                 "application",
@@ -4322,19 +4706,38 @@ pub fn expandable_fields(schema: &str) -> &'static [&'static str] {
         }
         "sepa_debit_generated_from" => &["charge"],
         "setup_intent" => &["application", "customer", "on_behalf_of", "payment_method"],
+        "stackable_discount_with_discount_settings" => {
+            &["coupon", "discount", "promotion_code"]
+        }
+        "stackable_discount_with_discount_settings_and_discount_end" => {
+            &["coupon", "discount", "promotion_code"]
+        }
         "subscription" => {
             &[
                 "application",
                 "customer",
                 "default_payment_method",
                 "default_source",
+                "discounts",
                 "latest_invoice",
                 "on_behalf_of",
                 "pending_setup_intent",
+                "schedule",
             ]
+        }
+        "subscription_item" => &["discounts"],
+        "subscription_schedule" => &["application", "customer", "subscription"],
+        "subscription_schedule_add_invoice_item" => &["price"],
+        "subscription_schedule_configuration_item" => &["price"],
+        "subscription_schedule_phase_configuration" => {
+            &["default_payment_method", "on_behalf_of"]
+        }
+        "subscription_schedules_resource_default_settings" => {
+            &["default_payment_method", "on_behalf_of"]
         }
         "subscription_transfer_data" => &["destination"],
         "subscriptions_resource_billing_schedules_applies_to" => &["price"],
+        "subscriptions_resource_pending_update" => &["discounts"],
         "tax_i_ds_owner" => &["account", "application", "customer"],
         "tax_id" => &["customer"],
         "transfer" => {
@@ -4423,6 +4826,27 @@ pub(crate) fn check_by_object(
                     &[("checkout.session", super::check::<CheckoutSession>)],
                 )
             }
+            "coupon" => {
+                super::check_candidates(
+                    v,
+                    &[
+                        ("coupon", super::check::<Coupon>),
+                        ("deleted_coupon", super::check::<DeletedCoupon>),
+                    ],
+                )
+            }
+            "credit_note" => {
+                super::check_candidates(
+                    v,
+                    &[("credit_note", super::check::<CreditNote>)],
+                )
+            }
+            "credit_note_line_item" => {
+                super::check_candidates(
+                    v,
+                    &[("credit_note_line_item", super::check::<CreditNoteLineItem>)],
+                )
+            }
             "customer" => {
                 super::check_candidates(
                     v,
@@ -4433,7 +4857,13 @@ pub(crate) fn check_by_object(
                 )
             }
             "discount" => {
-                super::check_candidates(v, &[("discount", super::check::<Discount>)])
+                super::check_candidates(
+                    v,
+                    &[
+                        ("deleted_discount", super::check::<DeletedDiscount>),
+                        ("discount", super::check::<Discount>),
+                    ],
+                )
             }
             "dispute" => {
                 super::check_candidates(v, &[("dispute", super::check::<Dispute>)])
@@ -4455,6 +4885,15 @@ pub(crate) fn check_by_object(
                 super::check_candidates(
                     v,
                     &[("invoice_payment", super::check::<InvoicePayment>)],
+                )
+            }
+            "invoiceitem" => {
+                super::check_candidates(
+                    v,
+                    &[
+                        ("deleted_invoiceitem", super::check::<DeletedInvoiceitem>),
+                        ("invoiceitem", super::check::<Invoiceitem>),
+                    ],
                 )
             }
             "item" => super::check_candidates(v, &[("item", super::check::<Item>)]),
@@ -4512,6 +4951,12 @@ pub(crate) fn check_by_object(
                     ],
                 )
             }
+            "promotion_code" => {
+                super::check_candidates(
+                    v,
+                    &[("promotion_code", super::check::<PromotionCode>)],
+                )
+            }
             "refund" => super::check_candidates(v, &[("refund", super::check::<Refund>)]),
             "setup_intent" => {
                 super::check_candidates(
@@ -4536,6 +4981,12 @@ pub(crate) fn check_by_object(
                         ),
                         ("subscription_item", super::check::<SubscriptionItem>),
                     ],
+                )
+            }
+            "subscription_schedule" => {
+                super::check_candidates(
+                    v,
+                    &[("subscription_schedule", super::check::<SubscriptionSchedule>)],
                 )
             }
             "tax_id" => super::check_candidates(v, &[("tax_id", super::check::<TaxId>)]),
