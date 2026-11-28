@@ -146,8 +146,21 @@ fn assert_amounts(invoice: &Value, di: Option<&str>) {
         assert_eq!(line_discounts, d);
     }
     assert_eq!(invoice["total_excluding_tax"], subtotal - d);
-    assert_eq!(invoice["total"], subtotal - d);
-    assert_eq!(invoice["amount_due"], subtotal - d);
+    // Coupons come from `BillingCatalogChange`, which also creates tax rates, so the
+    // invoice may be taxed (phase 9 ruling Q5).
+    let tax = tax_of(invoice);
+    assert_eq!(invoice["total"], subtotal - d + tax);
+    assert_eq!(invoice["amount_due"], subtotal - d + tax);
+}
+
+/// The sum of an invoice's `total_taxes`.
+fn tax_of(invoice: &Value) -> i64 {
+    invoice["total_taxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["amount"].as_i64().unwrap())
+        .sum()
 }
 
 #[tokio::test]
@@ -437,7 +450,10 @@ async fn foreign_currency_amount_off_applies_nothing() {
     let invoice = state(&m, ObjectType::Invoice, &invoice);
     assert_ne!(invoice["currency"], currency.as_str());
     assert_amounts(&invoice, None);
-    assert_eq!(invoice["total"], invoice["subtotal"]);
+    assert_eq!(
+        invoice["total"],
+        invoice["subtotal"].as_i64().unwrap() + tax_of(&invoice)
+    );
     // The discount stays for a later invoice in its currency.
     assert_eq!(
         state(&m, ObjectType::Customer, &cust)["discount"]["id"],

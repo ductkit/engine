@@ -4,8 +4,8 @@
 use crate::engine::store::StoredObject;
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::generate::billing::{
-    attempt_payment, create_draft_invoice, delete_draft, finalize, mark_uncollectible,
-    resolve_customer, void,
+    attempt_payment, create_draft_invoice, delete_draft, draw_tax_rate, finalize,
+    mark_uncollectible, resolve_customer, subscription_tax_rate, void,
 };
 use crate::generate::catalog::{active_ids, create_product_now, draw_new_product};
 use crate::generate::{Continuation, Ctx, payments, pick};
@@ -206,16 +206,18 @@ pub(crate) fn draw_subscription(
 }
 
 /// Creates the items (unannounced) and the `incomplete` subscription
-/// (`customer.subscription.created`) of `draw` for `customer`, starting now.
+/// (`customer.subscription.created`) of `draw` for `customer`, starting now. The
+/// subscription takes a tax rate as [`draw_tax_rate`] draws it (phase 9 ruling Q5).
 pub(crate) fn create_subscription(
     engine: &mut Engine,
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     customer: &str,
     draw: &SubscriptionDraw,
     cause: &Cause,
 ) {
     let sub_id = &draw.id;
     let now = engine.now().unix_seconds();
+    let tax_rate = draw_tax_rate(engine, ctx);
     let mut item_states = Vec::new();
     let mut currency = String::new();
     for (price_id, id, quantity) in &draw.items {
@@ -246,6 +248,7 @@ pub(crate) fn create_subscription(
         items: &item_states,
         created: now,
         page_size: ctx.page_size,
+        tax_rate: tax_rate.as_ref(),
     });
     engine.create_obj(
         ObjectType::Subscription,
@@ -329,7 +332,9 @@ pub(crate) fn item_lines(engine: &Engine, sub: &str) -> (Vec<LineSpec>, (i64, i6
 }
 
 /// Creates a subscription invoice and points `latest_invoice` at it. `take_pending`: whether
-/// the customer's pending invoice items join it (see [`create_draft_invoice`]).
+/// the customer's pending invoice items join it (see [`create_draft_invoice`]); only then
+/// does it apply the subscription's discount and tax rate, since otherwise (a Checkout
+/// subscription's first invoice) the session fixed its amount.
 pub(crate) fn invoice_subscription(
     engine: &mut Engine,
     ctx: &mut Ctx,
@@ -340,6 +345,9 @@ pub(crate) fn invoice_subscription(
 ) -> String {
     let customer = latest_sub(engine, sub).customer.id().to_string();
     let (lines, period) = item_lines(engine, sub);
+    let tax_rate = take_pending
+        .then(|| subscription_tax_rate(engine, sub))
+        .flatten();
     let invoice = create_draft_invoice(
         engine,
         ctx,
@@ -349,6 +357,7 @@ pub(crate) fn invoice_subscription(
         Some(sub),
         period,
         take_pending,
+        tax_rate.as_ref(),
         cause,
     );
     let id = invoice.clone();

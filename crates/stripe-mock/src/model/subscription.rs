@@ -66,6 +66,9 @@ pub(crate) struct NewSubscription<'a> {
     pub items: &'a [stripe::SubscriptionItem],
     pub created: i64,
     pub page_size: usize,
+    /// The tax rate its invoices apply (phase 9 ruling Q5): a snapshot taken now, kept in
+    /// `default_tax_rates` whatever happens to the rate later.
+    pub tax_rate: Option<&'a stripe::TaxRate>,
 }
 
 /// A new `incomplete` subscription. Presence follows ruling R1: every field is present,
@@ -111,7 +114,7 @@ pub(crate) fn new_subscription(s: &NewSubscription) -> stripe::Subscription {
         days_until_due: Some(None),
         default_payment_method: Some(None),
         default_source: Some(None),
-        default_tax_rates: Some(Some(Vec::new())),
+        default_tax_rates: Some(Some(s.tax_rate.into_iter().cloned().collect())),
         description: Some(None),
         discounts: Vec::new(),
         ended_at: Some(None),
@@ -217,6 +220,7 @@ mod tests {
             items: &[item],
             created: 1,
             page_size: 10,
+            tax_rate: None,
         });
         let v = serde_json::to_value(&sub).unwrap();
         crate::stripe::check_payload(&v).unwrap();

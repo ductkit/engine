@@ -17,7 +17,10 @@ use crate::model::invoice::{
     new_line, set_invoice_amounts, set_line_amounts,
 };
 use crate::rng::SimRng;
-use crate::stripe::{Customer, Expandable, Invoice, InvoiceStatus, Invoiceitem, LineItem, Price};
+use crate::stripe::{
+    Customer, Expandable, Invoice, InvoiceStatus, Invoiceitem, LineItem, Price, Subscription,
+    TaxRate,
+};
 use crate::{MockError, ObjectType};
 
 /// How a one-off invoice ends.
@@ -142,6 +145,33 @@ fn invoice_amounts<'t>(
     (amounts, tax)
 }
 
+/// Draws the tax rate a new subscription or one-off invoice takes (phase 9 ruling Q5):
+/// while at least one active tax rate exists, one with probability 0.5, uniformly over the
+/// active ones, from `ctx.tax_rng` (stream `"generate.tax"`). With no active rate nothing is
+/// drawn, so runs without tax rates draw as before. The rate is returned as it is now: the
+/// snapshot the subscription or invoice embeds.
+pub(crate) fn draw_tax_rate(engine: &Engine, ctx: &mut Ctx) -> Option<TaxRate> {
+    let active = active_ids(engine, ObjectType::TaxRate);
+    if active.is_empty() || !ctx.tax_rng.chance(0.5) {
+        return None;
+    }
+    let id = pick(&mut ctx.tax_rng, &active);
+    engine.latest_obj(ObjectType::TaxRate, id)
+}
+
+fn applied_tax(rate: &TaxRate) -> AppliedTax {
+    AppliedTax {
+        rate: rate.clone(),
+        bp: tax_bp(rate),
+    }
+}
+
+/// The tax rate a subscription's invoices apply: the snapshot in its `default_tax_rates`.
+pub(crate) fn subscription_tax_rate(engine: &Engine, sub: &str) -> Option<TaxRate> {
+    let sub: Subscription = engine.latest_obj(ObjectType::Subscription, sub)?;
+    sub.default_tax_rates.flatten()?.into_iter().next()
+}
+
 /// Creates a draft invoice in one instant (phase 9 ruling Q4): a one-off invoice's own
 /// items (`invoiceitem.created`) and the customer's pending items that join it (oldest
 /// first, after its own lines; a silent update of their `invoice`), then the lines
@@ -152,7 +182,10 @@ fn invoice_amounts<'t>(
 /// With `take_pending` false (a Checkout subscription's first invoice, whose amount the
 /// session fixed), no pending item joins and no discount applies. Otherwise the invoice
 /// applies [`applied_discount`] (ruling Q2), and every amount comes from
-/// [`compute`] (ruling Q3). Returns the invoice ID.
+/// [`compute`] (ruling Q3). Every line is taxed with `tax_rate` (ruling Q5), unless the
+/// total with tax would exceed the maximum charge; a one-off invoice (no `subscription`)
+/// also stores the rate in its own `default_tax_rates`, even when its tax was dropped.
+/// Returns the invoice ID.
 #[allow(clippy::too_many_arguments)] // each argument is part of the invoice
 pub(crate) fn create_draft_invoice(
     engine: &mut Engine,
@@ -163,6 +196,7 @@ pub(crate) fn create_draft_invoice(
     subscription: Option<&str>,
     period: (i64, i64),
     take_pending: bool,
+    tax_rate: Option<&TaxRate>,
     cause: &Cause,
 ) -> String {
     let id = ctx.billing.id(ObjectType::Invoice.id_prefix());
@@ -262,8 +296,8 @@ pub(crate) fn create_draft_invoice(
             amount: line_amount(&l.price, l.spec.quantity),
         })
         .collect();
-    // Phase 9 Task 6 passes the invoice's tax rate here.
-    let (amounts, tax) = invoice_amounts(&inputs, discount.as_ref(), None);
+    let applied = tax_rate.map(applied_tax);
+    let (amounts, tax) = invoice_amounts(&inputs, discount.as_ref(), applied.as_ref());
     let di = discount.as_ref().map(|d| d.id.as_str());
     let mut lines_out = Vec::new();
     for (l, la) in planned.iter().zip(&amounts.lines) {
@@ -304,6 +338,7 @@ pub(crate) fn create_draft_invoice(
         amounts: &amounts,
         discount: di,
         tax,
+        default_tax_rate: subscription.is_none().then_some(tax_rate).flatten(),
     });
     engine.create_obj(
         ObjectType::Invoice,
@@ -618,6 +653,7 @@ pub(crate) fn one_off_invoice(
     for (l, q) in lines.iter_mut().zip(quantities) {
         l.quantity = q;
     }
+    let tax_rate = draw_tax_rate(engine, ctx);
     let id = create_draft_invoice(
         engine,
         ctx,
@@ -627,6 +663,7 @@ pub(crate) fn one_off_invoice(
         None,
         (now, now),
         true,
+        tax_rate.as_ref(),
         &cause,
     );
     let next = if outcome == InvoiceOutcome::DeleteDraft {
@@ -947,13 +984,13 @@ fn remove_from_draft(
     let draft: Invoice = engine
         .latest_obj(ObjectType::Invoice, invoice)
         .expect("live draft");
-    // The draft keeps the discount and tax it was created with, even if the discount has
-    // been removed since; its shares follow the lines left.
+    // The draft keeps the discount and tax rate it was created with, even if the discount
+    // has been removed or the rate archived since; its shares follow the lines left.
     let discount = draft
         .discounts
         .first()
         .and_then(|d| applied_by_id(engine, d.id(), &draft.currency));
-    let tax = draft_tax(engine, &draft);
+    let tax = draft_tax_rate(engine, &draft).map(|r| applied_tax(&r));
     let lines = live_lines(engine, invoice);
     let inputs: Vec<LineAmount> = lines
         .iter()
@@ -990,22 +1027,23 @@ fn remove_from_draft(
         .expect("live draft");
 }
 
-/// The tax rate a draft's lines carry, as an [`AppliedTax`]: the rate's percentage never
-/// changes, so its current state gives the basis points it was created with.
-fn draft_tax(engine: &Engine, draft: &Invoice) -> Option<AppliedTax> {
-    let rate = draft
-        .total_taxes
+/// The tax rate a draft was built with (ruling Q5): the snapshot in a one-off invoice's
+/// own `default_tax_rates`, or in its subscription's. Never the rate's live state. Only a
+/// draft that took pending items can lose one, and such a draft applies its subscription's
+/// rate (only a Checkout subscription's first invoice, which takes no pending item, skips
+/// it). The over-the-limit rule of [`invoice_amounts`] applies again to the lines left.
+fn draft_tax_rate(engine: &Engine, draft: &Invoice) -> Option<TaxRate> {
+    if let Some(rate) = draft.default_tax_rates.first() {
+        return Some(rate.clone());
+    }
+    let sub = draft
+        .parent
         .as_ref()
-        .and_then(|t| t.as_ref())
-        .and_then(|t| t.first())
-        .and_then(|t| t.tax_rate_details.as_ref())
+        .and_then(|p| p.as_ref())
+        .and_then(|p| p.subscription_details.as_ref())
         .and_then(|d| d.as_ref())
-        .map(|d| d.tax_rate.id().to_string())?;
-    let rate: crate::stripe::TaxRate = engine.latest_obj(ObjectType::TaxRate, &rate)?;
-    Some(AppliedTax {
-        bp: tax_bp(&rate),
-        rate,
-    })
+        .map(|d| d.subscription.id().to_string())?;
+    subscription_tax_rate(engine, &sub)
 }
 
 /// `churn.invoiceitem.delete`: deletes a random pending invoice item.

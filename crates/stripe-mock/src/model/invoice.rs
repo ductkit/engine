@@ -343,6 +343,10 @@ pub(crate) struct NewInvoice<'a> {
     pub discount: Option<&'a str>,
     /// The tax rate the invoice applies, if any.
     pub tax: Option<&'a AppliedTax>,
+    /// A one-off invoice's own tax rate (ruling Q5), stored in `default_tax_rates` even when
+    /// its tax was dropped over the maximum charge. A subscription invoice's rate stays on
+    /// its subscription.
+    pub default_tax_rate: Option<&'a stripe::TaxRate>,
 }
 
 pub(crate) fn lines_url(invoice: &str) -> String {
@@ -427,7 +431,7 @@ fn invoice_before_amounts(i: &NewInvoice) -> stripe::Invoice {
         customer_tax_ids: Some(Some(Vec::new())),
         default_payment_method: Some(None),
         default_source: Some(None),
-        default_tax_rates: Vec::new(),
+        default_tax_rates: i.default_tax_rate.into_iter().cloned().collect(),
         description: Some(None),
         discounts: Vec::new(),
         due_date: Some(None),
@@ -579,6 +583,7 @@ mod tests {
             amounts: &amounts,
             discount: Some("di_1"),
             tax: Some(&tax),
+            default_tax_rate: Some(&tax.rate),
         });
         let v = serde_json::to_value(&invoice).unwrap();
         stripe::check_payload(&v).unwrap();
@@ -588,6 +593,7 @@ mod tests {
             (&2000.into(), &1800.into(), &2160.into())
         );
         assert_eq!(v["amount_due"], 2160);
+        assert_eq!(v["default_tax_rates"][0]["id"], "txr_1");
         assert_eq!(v["discounts"], serde_json::json!(["di_1"]));
         assert_eq!(
             v["total_discount_amounts"],
@@ -676,6 +682,7 @@ mod tests {
             amounts: &compute(&[LineAmount { amount: 1000 }], None, None),
             discount: None,
             tax: None,
+            default_tax_rate: None,
         });
         let v = serde_json::to_value(&invoice).unwrap();
         stripe::check_payload(&v).unwrap();

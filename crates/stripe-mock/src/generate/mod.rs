@@ -401,6 +401,9 @@ pub(crate) struct Ctx {
     /// The `ba_` ID the scope's payouts go to when it is not a controlled account, drawn at
     /// its first payout (P4).
     pub payout_destination: Option<String>,
+    /// Whether a new subscription or one-off invoice takes a tax rate, and which one
+    /// (stream `"generate.tax"`, phase 9 ruling Q5). Draws only while an active rate exists.
+    pub tax_rng: SimRng,
 }
 
 impl Ctx {
@@ -661,6 +664,7 @@ impl Generator {
                 separate_recipients: BTreeMap::new(),
                 payout_rng: stream("generate.payout"),
                 payout_destination: None,
+                tax_rng: stream("generate.tax"),
             },
             setup: stream("generate.account_setup"),
             control: stream("control.actions"),
