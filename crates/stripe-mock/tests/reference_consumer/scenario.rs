@@ -138,7 +138,7 @@ async fn update_then_delete(m: &MockStripe, n: usize) {
 }
 
 /// The ID of the newest snapshot event of `event_type` about `object_id`.
-fn last_snapshot_event(m: &MockStripe, object_id: &str, event_type: &str) -> String {
+pub fn last_snapshot_event(m: &MockStripe, object_id: &str, event_type: &str) -> String {
     m.event_timeline()
         .into_iter()
         .rev()

@@ -5,6 +5,7 @@ mod client;
 #[path = "../common/mod.rs"]
 mod common;
 mod correct;
+mod hazards;
 mod hooks;
 mod naive;
 mod scenario;
