@@ -7,12 +7,13 @@
 use crate::engine::{Cause, ChangeKind, Engine};
 use crate::generate::catalog::{active_ids, create_product_now, draw_new_product};
 use crate::generate::{Continuation, Ctx, create_random_customer, payments, pick};
+use crate::model::embedded::embedded_list;
 use crate::model::invoice::{
-    BillingReason, LineSpec, NewInvoice, NewLine, deleted_invoice, deleted_line, new_invoice,
-    new_line,
+    BillingReason, LineSpec, NewInvoice, NewInvoiceItem, NewLine, deleted_invoice,
+    deleted_invoice_item, deleted_line, lines_url, new_invoice, new_invoice_item, new_line,
 };
 use crate::rng::SimRng;
-use crate::stripe::{Customer, Invoice, InvoiceStatus, Price};
+use crate::stripe::{Customer, Expandable, Invoice, InvoiceStatus, Invoiceitem, LineItem, Price};
 use crate::{MockError, ObjectType};
 
 /// How a one-off invoice ends.
@@ -33,8 +34,104 @@ fn status(engine: &Engine, id: &str) -> Option<String> {
     u.state["status"].as_str().map(str::to_string)
 }
 
-/// Creates the lines (unannounced), then the draft invoice (`invoice.created`).
-/// IDs come from the `"generate.billing"` stream. Returns the invoice ID.
+/// One line of a draft, before it is created.
+struct PlannedLine {
+    id: String,
+    spec: LineSpec,
+    price: Price,
+    product_name: String,
+    /// The item it bills: a one-off line's own item, or a joining pending item.
+    item: Option<String>,
+}
+
+fn product_name(engine: &Engine, price: &Price) -> String {
+    engine
+        .latest(ObjectType::Product, price.product.id())
+        .and_then(|p| p.state["name"].as_str())
+        .unwrap_or("Item")
+        .to_string()
+}
+
+fn billed_price(engine: &Engine, id: &str) -> Price {
+    engine
+        .latest_obj(ObjectType::Price, id)
+        .expect("billed price exists")
+}
+
+/// The line ID of a pending item joining an invoice: `il_` and the item's own suffix, so
+/// joining draws nothing.
+fn joined_line_id(item: &str) -> String {
+    let suffix = item.strip_prefix("ii_").unwrap_or(item);
+    format!("{}_{suffix}", ObjectType::InvoiceLineItem.id_prefix())
+}
+
+/// The live invoice items of `customer` in creation order, with their current state.
+fn customer_items(engine: &Engine, customer: &str) -> Vec<Invoiceitem> {
+    engine
+        .store()
+        .children(ObjectType::InvoiceItem, "customer", customer)
+        .into_iter()
+        .filter(|o| !o.deleted)
+        .map(|o| {
+            engine
+                .latest_obj(ObjectType::InvoiceItem, &o.latest.object_id)
+                .expect("listed item exists")
+        })
+        .collect()
+}
+
+fn item_invoice(item: &Invoiceitem) -> Option<&str> {
+    item.invoice
+        .as_ref()
+        .and_then(|i| i.as_ref())
+        .map(|i| i.id())
+}
+
+/// The price an item bills.
+fn item_price(item: &Invoiceitem) -> String {
+    item.pricing
+        .as_ref()
+        .and_then(|p| p.as_ref())
+        .and_then(|p| p.price_details.as_ref())
+        .expect("generated items bill a price")
+        .price
+        .id()
+        .to_string()
+}
+
+/// The pending invoice items of `customer` (on no invoice yet), oldest first.
+pub(crate) fn pending_items(engine: &Engine, customer: &str) -> Vec<String> {
+    customer_items(engine, customer)
+        .into_iter()
+        .filter(|i| item_invoice(i).is_none())
+        .map(|i| i.id)
+        .collect()
+}
+
+/// The live items on `invoice`, by their current `invoice` (the store's index holds only
+/// the invoice an item was created on).
+fn invoice_items(engine: &Engine, invoice: &str) -> Vec<String> {
+    let Some(customer) = engine
+        .latest(ObjectType::Invoice, invoice)
+        .and_then(|u| u.state["customer"].as_str().map(str::to_string))
+    else {
+        return Vec::new();
+    };
+    customer_items(engine, &customer)
+        .into_iter()
+        .filter(|i| item_invoice(i) == Some(invoice))
+        .map(|i| i.id)
+        .collect()
+}
+
+/// Creates a draft invoice in one instant (phase 9 ruling Q4): a one-off invoice's own
+/// items (`invoiceitem.created`) and the customer's pending items that join it (oldest
+/// first, after its own lines; a silent update of their `invoice`), then the lines
+/// (unannounced), then the draft (`invoice.created`). A pending item joins when it is in
+/// the invoice's currency and keeps the subtotal within [`payments::MAX_CHARGE_AMOUNT`];
+/// otherwise it stays pending. Invoice, line and one-off item IDs come from the
+/// `"generate.billing"` stream, drawn as before items existed; joining draws nothing.
+/// Returns the invoice ID.
 #[allow(clippy::too_many_arguments)] // each argument is part of the invoice
 pub(crate) fn create_draft_invoice(
     engine: &mut Engine,
@@ -48,30 +145,98 @@ pub(crate) fn create_draft_invoice(
 ) -> String {
     let id = ctx.billing.id(ObjectType::Invoice.id_prefix());
     let now = engine.now().unix_seconds();
-    let mut lines_out = Vec::new();
+    let mut planned = Vec::new();
     for spec in lines {
         let line_id = ctx.billing.id(ObjectType::InvoiceLineItem.id_prefix());
-        let invoice_item = subscription.is_none().then(|| ctx.billing.id("ii"));
-        let price: Price = engine
-            .latest_obj(ObjectType::Price, &spec.price)
-            .expect("billed price exists");
-        let product_name = engine
-            .latest(ObjectType::Product, price.product.id())
-            .and_then(|p| p.state["name"].as_str())
-            .unwrap_or("Item")
-            .to_string();
+        let item = subscription
+            .is_none()
+            .then(|| ctx.billing.id(ObjectType::InvoiceItem.id_prefix()));
+        let price = billed_price(engine, &spec.price);
+        planned.push(PlannedLine {
+            id: line_id,
+            spec: spec.clone(),
+            product_name: product_name(engine, &price),
+            price,
+            item,
+        });
+    }
+    let own_lines = planned.len();
+    let currency = planned.first().map(|l| l.price.currency.clone());
+    let mut subtotal: i64 = planned
+        .iter()
+        .map(|l| l.price.unit_amount.flatten().unwrap_or(0) * l.spec.quantity as i64)
+        .sum();
+    let mut joined = Vec::new();
+    for item in customer_items(engine, customer) {
+        let fits = subtotal + item.amount <= payments::MAX_CHARGE_AMOUNT;
+        if item_invoice(&item).is_some() || Some(&item.currency) != currency.as_ref() || !fits {
+            continue;
+        }
+        subtotal += item.amount;
+        let price = billed_price(engine, &item_price(&item));
+        planned.push(PlannedLine {
+            id: joined_line_id(&item.id),
+            spec: LineSpec {
+                price: price.id.clone(),
+                quantity: item.quantity as u64,
+                subscription_item: None,
+                period: (item.period.start, item.period.end),
+            },
+            product_name: product_name(engine, &price),
+            price,
+            item: Some(item.id.clone()),
+        });
+        joined.push(item.id);
+    }
+    for l in &planned[..own_lines] {
+        let Some(item_id) = l.item.as_deref() else {
+            continue;
+        };
+        let item = new_invoice_item(&NewInvoiceItem {
+            id: item_id,
+            customer,
+            invoice: Some(&id),
+            price: &l.price,
+            product_name: &l.product_name,
+            quantity: l.spec.quantity,
+            period: l.spec.period,
+            date: now,
+        });
+        engine.create_obj(
+            ObjectType::InvoiceItem,
+            item_id.to_string(),
+            &item,
+            cause.clone(),
+            &["invoiceitem.created"],
+        );
+    }
+    for item in &joined {
+        let invoice = id.clone();
+        engine
+            .update_obj::<Invoiceitem>(
+                ObjectType::InvoiceItem,
+                item,
+                |i| i.invoice = Some(Some(Expandable::Id(invoice))),
+                cause.clone(),
+                ChangeKind::Updated,
+                &[],
+            )
+            .expect("pending item is live");
+    }
+    let mut lines_out = Vec::new();
+    for l in &planned {
         let line = new_line(&NewLine {
-            id: &line_id,
+            id: &l.id,
             invoice: &id,
-            spec,
-            price: &price,
-            product_name: &product_name,
+            spec: &l.spec,
+            price: &l.price,
+            product_name: &l.product_name,
             subscription,
-            invoice_item: invoice_item.as_deref(),
+            invoice_item: l.item.as_deref(),
         });
         engine.create_obj(
             ObjectType::InvoiceLineItem,
-            line_id,
+            l.id.clone(),
             &line,
             cause.clone(),
             &[],
@@ -81,13 +246,10 @@ pub(crate) fn create_draft_invoice(
     let customer: Customer = engine
         .latest_obj(ObjectType::Customer, customer)
         .expect("billed customer exists");
-    let currency = lines_out
-        .first()
-        .map_or(String::new(), |l| l.currency.clone());
     let invoice = new_invoice(&NewInvoice {
         id: &id,
         customer: &customer,
-        currency: &currency,
+        currency: currency.as_deref().unwrap_or(""),
         lines: &lines_out,
         reason,
         subscription,
@@ -255,11 +417,13 @@ pub(crate) fn mark_uncollectible(engine: &mut Engine, id: &str, cause: &Cause) -
     )
 }
 
-/// Deletes a draft: its lines first (unannounced), then the invoice (`invoice.deleted`).
+/// Deletes a draft: its lines first (unannounced), then its items (`invoiceitem.deleted`;
+/// phase 9 ruling Q4: joined pending items too), then the invoice (`invoice.deleted`).
 pub(crate) fn delete_draft(engine: &mut Engine, id: &str, cause: &Cause) -> bool {
     if status(engine, id).as_deref() != Some("draft") {
         return false;
     }
+    let items = invoice_items(engine, id);
     let line_ids: Vec<String> = engine
         .store()
         .children(ObjectType::InvoiceLineItem, "invoice", id)
@@ -277,6 +441,9 @@ pub(crate) fn delete_draft(engine: &mut Engine, id: &str, cause: &Cause) -> bool
                 &[],
             )
             .expect("live line");
+    }
+    for item in items {
+        delete_item(engine, &item, cause);
     }
     engine
         .delete(
@@ -473,4 +640,265 @@ pub(crate) fn churn_update(rng: &mut SimRng, engine: &mut Engine) {
             &["invoice.updated"],
         )
         .expect("live invoice");
+}
+
+fn delete_item(engine: &mut Engine, id: &str, cause: &Cause) {
+    engine
+        .delete(
+            ObjectType::InvoiceItem,
+            id,
+            &deleted_invoice_item(id),
+            cause.clone(),
+            &["invoiceitem.deleted"],
+        )
+        .expect("live item");
+}
+
+/// Deletes the pending items of `customer`, oldest first (`invoiceitem.deleted` each).
+pub(crate) fn delete_pending_items(engine: &mut Engine, customer: &str, cause: &Cause) {
+    for item in pending_items(engine, customer) {
+        delete_item(engine, &item, cause);
+    }
+}
+
+/// Every pending invoice item, in creation order.
+fn all_pending(engine: &Engine) -> Vec<String> {
+    engine
+        .store()
+        .live_ids(ObjectType::InvoiceItem)
+        .iter()
+        .filter(|id| {
+            engine
+                .latest(ObjectType::InvoiceItem, id)
+                .is_some_and(|u| u.state["invoice"].is_null())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Active one-time prices, or every active price when there is none.
+fn item_prices(engine: &Engine) -> Vec<String> {
+    let active = active_ids(engine, ObjectType::Price);
+    let one_time: Vec<String> = active
+        .iter()
+        .filter(|p| engine.latest(ObjectType::Price, p).expect("price").state["type"] == "one_time")
+        .cloned()
+        .collect();
+    if one_time.is_empty() {
+        active
+    } else {
+        one_time
+    }
+}
+
+/// `invoice_item` (phase 9 ruling Q4): a pending invoice item (`invoice: null`) for the
+/// named or a random customer, which joins that customer's next invoice. It bills the named
+/// price, or a random active one-time price (any active price when there is none; a new
+/// product when there is no active price), `quantity` times (drawn in 1-3 when `None`).
+/// A named customer that is missing or deleted, a named price that is not an active
+/// one-time price, and a quantity of 0 are errors naming them.
+pub(crate) fn create_invoice_item(
+    rng: &mut SimRng,
+    engine: &mut Engine,
+    customer: Option<String>,
+    price: Option<String>,
+    quantity: Option<u64>,
+) -> Result<Cause, MockError> {
+    if let Some(c) = &customer {
+        let live = engine
+            .latest(ObjectType::Customer, c)
+            .is_some_and(|u| u.kind != ChangeKind::Deleted);
+        if !live {
+            return Err(MockError::InvalidAction(format!(
+                "customer {c} does not exist or is deleted"
+            )));
+        }
+    }
+    if let Some(p) = &price {
+        let usable = engine.latest(ObjectType::Price, p).is_some_and(|u| {
+            u.kind != ChangeKind::Deleted
+                && u.state["active"] == true
+                && u.state["type"] == "one_time"
+        });
+        if !usable {
+            return Err(MockError::InvalidAction(format!(
+                "price {p} is not an active one-time price"
+            )));
+        }
+    }
+    if quantity == Some(0) {
+        return Err(MockError::InvalidAction(
+            "an invoice item needs a quantity of at least 1".to_string(),
+        ));
+    }
+    let cause = engine.begin_action("invoice_item");
+    let customer = match customer {
+        Some(c) => c,
+        None => resolve_customer(rng, engine, None, &cause)?,
+    };
+    let id = rng.id(ObjectType::InvoiceItem.id_prefix());
+    let price = match price {
+        Some(p) => p,
+        None => {
+            let mut pool = item_prices(engine);
+            if pool.is_empty() {
+                let np = draw_new_product(rng);
+                create_product_now(engine, &np, &cause);
+                pool = item_prices(engine);
+            }
+            pick(rng, &pool).clone()
+        }
+    };
+    let quantity = quantity.unwrap_or_else(|| 1 + rng.below(3));
+    let price = billed_price(engine, &price);
+    let now = engine.now().unix_seconds();
+    let item = new_invoice_item(&NewInvoiceItem {
+        id: &id,
+        customer: &customer,
+        invoice: None,
+        price: &price,
+        product_name: &product_name(engine, &price),
+        quantity,
+        period: (now, now),
+        date: now,
+    });
+    engine.create_obj(
+        ObjectType::InvoiceItem,
+        id,
+        &item,
+        cause.clone(),
+        &["invoiceitem.created"],
+    );
+    Ok(cause)
+}
+
+/// The `DeleteInvoiceItem` control hook: deletes the named item, or a random pending one.
+/// Only a pending item or one on a draft can be deleted (ruling Q4); an item on a draft
+/// takes its line with it, and the draft's totals follow (`invoice.updated`). A missing or
+/// deleted item, an item on an invoice that is not a draft, or no pending item to pick is
+/// an error naming it.
+pub(crate) fn delete_invoice_item(
+    rng: &mut SimRng,
+    engine: &mut Engine,
+    page_size: usize,
+    id: Option<String>,
+) -> Result<Cause, MockError> {
+    let id = match id {
+        Some(id) => {
+            let live = engine
+                .latest(ObjectType::InvoiceItem, &id)
+                .is_some_and(|u| u.kind != ChangeKind::Deleted);
+            if !live {
+                return Err(MockError::InvalidAction(format!(
+                    "invoice item {id} does not exist or is already deleted"
+                )));
+            }
+            id
+        }
+        None => {
+            let pending = all_pending(engine);
+            if pending.is_empty() {
+                return Err(MockError::InvalidAction(
+                    "no pending invoice item to delete".to_string(),
+                ));
+            }
+            pick(rng, &pending).clone()
+        }
+    };
+    let item: Invoiceitem = engine
+        .latest_obj(ObjectType::InvoiceItem, &id)
+        .expect("live item");
+    let invoice = item_invoice(&item).map(str::to_string);
+    if let Some(inv) = &invoice
+        && status(engine, inv).as_deref() != Some("draft")
+    {
+        return Err(MockError::InvalidAction(format!(
+            "invoice item {id} is on invoice {inv}, which is not a draft"
+        )));
+    }
+    let cause = engine.begin_action("delete_invoice_item");
+    match invoice {
+        None => delete_item(engine, &id, &cause),
+        Some(inv) => remove_from_draft(engine, &inv, &id, page_size, &cause),
+    }
+    Ok(cause)
+}
+
+/// The live lines of an invoice, in creation order.
+fn live_lines(engine: &Engine, invoice: &str) -> Vec<LineItem> {
+    engine
+        .store()
+        .children(ObjectType::InvoiceLineItem, "invoice", invoice)
+        .into_iter()
+        .filter(|o| !o.deleted)
+        .map(|o| {
+            engine
+                .latest_obj(ObjectType::InvoiceLineItem, &o.latest.object_id)
+                .expect("listed line exists")
+        })
+        .collect()
+}
+
+/// Deletes `item` from the draft `invoice`: its line (unannounced), the item
+/// (`invoiceitem.deleted`), then the draft's lines and totals from the lines left
+/// (`invoice.updated`).
+fn remove_from_draft(
+    engine: &mut Engine,
+    invoice: &str,
+    item: &str,
+    page_size: usize,
+    cause: &Cause,
+) {
+    let line = live_lines(engine, invoice).into_iter().find(|l| {
+        l.parent
+            .as_ref()
+            .and_then(|p| p.as_ref())
+            .and_then(|p| p.invoice_item_details.as_ref())
+            .and_then(|d| d.as_ref())
+            .is_some_and(|d| d.invoice_item == item)
+    });
+    if let Some(line) = line {
+        engine
+            .delete(
+                ObjectType::InvoiceLineItem,
+                &line.id,
+                &deleted_line(&line.id),
+                cause.clone(),
+                &[],
+            )
+            .expect("live line");
+    }
+    delete_item(engine, item, cause);
+    let lines = live_lines(engine, invoice);
+    let total: i64 = lines.iter().map(|l| l.amount).sum();
+    let rendered = embedded_list(&lines, page_size, &lines_url(invoice));
+    engine
+        .update_obj::<Invoice>(
+            ObjectType::Invoice,
+            invoice,
+            |i| {
+                i.lines = rendered;
+                i.subtotal = total;
+                i.subtotal_excluding_tax = Some(Some(total));
+                i.total = total;
+                i.total_excluding_tax = Some(Some(total));
+                i.amount_due = total;
+                i.amount_remaining = total;
+            },
+            cause.clone(),
+            ChangeKind::Updated,
+            &["invoice.updated"],
+        )
+        .expect("live draft");
+}
+
+/// `churn.invoiceitem.delete`: deletes a random pending invoice item.
+pub(crate) fn churn_delete_item(rng: &mut SimRng, engine: &mut Engine) {
+    let pending = all_pending(engine);
+    if pending.is_empty() {
+        return;
+    }
+    let id = pick(rng, &pending).clone();
+    let cause = engine.begin_action("invoice_item_delete");
+    delete_item(engine, &id, &cause);
 }

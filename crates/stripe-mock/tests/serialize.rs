@@ -164,6 +164,14 @@ fn actions_round_trip() {
         Action::DeleteCoupon {
             id: "AbCd1234".into(),
         },
+        Action::CreateInvoiceItem {
+            customer: Some("cus_1".into()),
+            price: Some("price_1".into()),
+            quantity: Some(2),
+        },
+        Action::DeleteInvoiceItem {
+            id: Some("ii_1".into()),
+        },
     ];
     for a in actions {
         let v = serde_json::to_value(&a).unwrap();
@@ -180,6 +188,20 @@ fn actions_round_trip() {
     assert_eq!(
         serde_json::to_value(Action::DeleteCoupon { id: "c".into() }).unwrap(),
         json!({"type": "delete_coupon", "id": "c"})
+    );
+    // `price` and `quantity` may be left out.
+    assert_eq!(
+        serde_json::from_value::<Action>(json!({"type": "create_invoice_item", "customer": null}))
+            .unwrap(),
+        Action::CreateInvoiceItem {
+            customer: None,
+            price: None,
+            quantity: None,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(Action::DeleteInvoiceItem { id: None }).unwrap(),
+        json!({"type": "delete_invoice_item", "id": null})
     );
     for o in [
         InvoiceOutcome::DeleteDraft,

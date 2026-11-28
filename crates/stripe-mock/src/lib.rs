@@ -21,10 +21,10 @@ mod time;
 pub use config::{
     AccountApiMix, AccountTypeMix, AccountsConfig, ActionsConfig, ApiConfig, ApiErrors,
     ApplicationFeeConfig, CatalogChurn, ChargePattern, ChurnConfig, ClockConfig, ClockMode,
-    ClockSkew, Config, ConnectedAccounts, CustomerChurn, DestinationConfig, DisableAfter,
-    Distribution, DurationStr, EventRetentionConfig, EventsConfig, ExternalAccountChurn,
-    HistoryConfig, LateTail, MAX_DURATION_MS, MAX_SPEED, PINNED_API_VERSION, PaginationWrites,
-    PayloadFormat, PayloadsConfig, PaymentMethodChurn, PayoutMode, PersonChurn,
+    ClockSkew, Config, ConnectedAccounts, CustomerChurn, DeleteChurn, DestinationConfig,
+    DisableAfter, Distribution, DurationStr, EventRetentionConfig, EventsConfig,
+    ExternalAccountChurn, HistoryConfig, LateTail, MAX_DURATION_MS, MAX_SPEED, PINNED_API_VERSION,
+    PaginationWrites, PayloadFormat, PayloadsConfig, PaymentMethodChurn, PayoutMode, PersonChurn,
     PlatformPaymentsMix, RateLimit, RenewMode, RetrySchedule, StaleRead, UpdateChurn,
     WebhooksConfig,
 };

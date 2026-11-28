@@ -428,6 +428,9 @@ pub struct ActionsConfig {
     /// A new coupon, promotion code or tax rate, or a deactivation, archive or coupon
     /// delete (phase 9 ruling Q6).
     pub billing_catalog_change: f64,
+    /// A pending invoice item for a random customer, which joins that customer's next
+    /// invoice (phase 9 ruling Q4).
+    pub invoice_item: f64,
     pub renew_subscription_cycle: RenewMode,
     /// Gap between consecutive steps of one action.
     pub step_delay: Distribution,
@@ -461,6 +464,7 @@ impl ActionsConfig {
                 "actions.billing_catalog_change",
                 self.billing_catalog_change,
             ),
+            ("actions.invoice_item", self.invoice_item),
         ] {
             check_rate(name, rate)?;
         }
@@ -515,6 +519,8 @@ pub struct ChurnConfig {
     pub external_account: ExternalAccountChurn,
     /// Coupons: updating a random live coupon's `metadata.note`.
     pub coupon: UpdateChurn,
+    /// Invoice items: deleting a random pending one.
+    pub invoiceitem: DeleteChurn,
 }
 
 /// Person churn on controlled accounts: updating a person's contact details, and
@@ -548,6 +554,13 @@ pub struct PaymentMethodChurn {
 pub struct CatalogChurn {
     pub update: f64,
     pub archive: f64,
+}
+
+/// Churn that only deletes.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeleteChurn {
+    pub delete: f64,
 }
 
 /// Churn that only updates (metadata).
@@ -676,6 +689,7 @@ impl Config {
             ("churn.external_account.create", ch.external_account.create),
             ("churn.external_account.delete", ch.external_account.delete),
             ("churn.coupon.update", ch.coupon.update),
+            ("churn.invoiceitem.delete", ch.invoiceitem.delete),
         ] {
             check_rate(name, rate)?;
         }
@@ -1264,6 +1278,10 @@ mod tests {
             ),
             (1.0, 2.0, 0.1)
         );
+        assert_eq!(
+            (c.actions.invoice_item, c.churn.invoiceitem.delete),
+            (0.5, 0.1)
+        );
     }
 
     #[test]
@@ -1560,6 +1578,41 @@ checkout = -1.0",
                 "[churn.payment_method]
 detach = -1.0",
                 "churn.payment_method.detach",
+            ),
+        ] {
+            let msg = Config::from_toml_str(toml).unwrap_err().to_string();
+            assert!(msg.contains(key), "{msg}");
+        }
+    }
+
+    #[test]
+    fn config_accepts_invoice_item_rates() {
+        let c = Config::from_toml_str(
+            "[actions]
+invoice_item = 0.5
+[churn.invoiceitem]
+delete = 0.1",
+        )
+        .unwrap();
+        assert_eq!(
+            (c.actions.invoice_item, c.churn.invoiceitem.delete),
+            (0.5, 0.1)
+        );
+        let d = Config::default();
+        assert_eq!(
+            (d.actions.invoice_item, d.churn.invoiceitem.delete),
+            (0.0, 0.0)
+        );
+        for (toml, key) in [
+            (
+                "[actions]
+invoice_item = -1.0",
+                "actions.invoice_item",
+            ),
+            (
+                "[churn.invoiceitem]
+delete = -1.0",
+                "churn.invoiceitem.delete",
             ),
         ] {
             let msg = Config::from_toml_str(toml).unwrap_err().to_string();

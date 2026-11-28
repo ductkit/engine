@@ -149,6 +149,22 @@ pub enum Action {
     /// Delete the coupon `id`, deactivating its active promotion codes first. A missing or
     /// already deleted coupon is an error naming it. Control-only.
     DeleteCoupon { id: String },
+    /// A pending invoice item for the named or a random customer (phase 9 ruling Q4), which
+    /// joins that customer's next invoice. It bills `price` (an active one-time price; drawn
+    /// when `None`) `quantity` times (drawn in 1-3 when `None`). A missing or deleted
+    /// customer, a price that is not active and one-time, or a quantity of 0 is an error
+    /// naming it. `price` and `quantity` are control-only hooks.
+    CreateInvoiceItem {
+        customer: Option<String>,
+        #[serde(default)]
+        price: Option<String>,
+        #[serde(default)]
+        quantity: Option<u64>,
+    },
+    /// Delete the named or a random pending invoice item. A named item that is missing,
+    /// already deleted, or on an invoice that is not a draft is an error naming it; so is
+    /// no ID when nothing is pending. Deleting an item on a draft takes its line with it.
+    DeleteInvoiceItem { id: Option<String> },
 }
 
 /// The kind of an external account.
@@ -190,6 +206,8 @@ enum ActionKind {
     TransferReversal,
     BillingCatalogChange,
     CouponUpdate,
+    InvoiceItem,
+    InvoiceItemDelete,
 }
 
 /// A follow-up step of an action.
@@ -569,6 +587,16 @@ impl Generator {
                 c.coupon.update,
                 "generate.coupon.update",
             ),
+            (
+                ActionKind::InvoiceItem,
+                a.invoice_item,
+                "generate.invoice_item",
+            ),
+            (
+                ActionKind::InvoiceItemDelete,
+                c.invoiceitem.delete,
+                "generate.invoice_item.delete",
+            ),
         ];
         let actions = specs
             .into_iter()
@@ -708,6 +736,7 @@ impl Generator {
                 ActionKind::ApplicationFeeRefund => config.application_fee_refund,
                 ActionKind::TransferReversal => config.transfer_reversal,
                 ActionKind::BillingCatalogChange => config.billing_catalog_change,
+                ActionKind::InvoiceItem => config.invoice_item,
                 _ => continue,
             };
             a.base_rate = rate;
@@ -837,6 +866,16 @@ impl Generator {
             Action::Archive { id } => catalog::archive_by_id(engine, &id)?,
             Action::BillingCatalogChange => billing_catalog::change(&mut self.control, engine),
             Action::DeleteCoupon { id } => billing_catalog::delete_coupon_by_id(engine, &id)?,
+            Action::CreateInvoiceItem {
+                customer,
+                price,
+                quantity,
+            } => {
+                billing::create_invoice_item(&mut self.control, engine, customer, price, quantity)?
+            }
+            Action::DeleteInvoiceItem { id } => {
+                billing::delete_invoice_item(&mut self.control, engine, self.ctx.page_size, id)?
+            }
             Action::OneOffInvoice { customer, outcome } => billing::one_off_invoice(
                 &mut self.control,
                 engine,
@@ -1055,10 +1094,15 @@ impl Generator {
                 self.run_due_now(engine);
                 return;
             }
+            // Phase 9 ruling Q10: a new pending item, drawn from the pagination stream.
+            ObjectType::InvoiceItem => {
+                billing::create_invoice_item(&mut self.pagination_rng, engine, None, None, None)
+                    .expect("random targets are valid");
+                self.run_due_now(engine);
+                return;
+            }
             // Phase 9 ruling Q10: stubs that draw nothing until the task building the type
             // fills them in.
-            // Task 4: a new pending invoice item.
-            ObjectType::InvoiceItem => return,
             // Task 7: a credit note `metadata.note` update.
             ObjectType::CreditNote => return,
             // Task 8: a schedule `metadata.note` update.
@@ -1276,6 +1320,11 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
             billing_catalog::change(rng, engine);
         }
         ActionKind::CouponUpdate => billing_catalog::coupon_update(rng, engine),
+        ActionKind::InvoiceItem => {
+            billing::create_invoice_item(rng, engine, None, None, None)
+                .expect("random targets are valid");
+        }
+        ActionKind::InvoiceItemDelete => billing::churn_delete_item(rng, engine),
     }
 }
 

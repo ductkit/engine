@@ -745,8 +745,6 @@ async fn busy_connect_run_conforms() {
         (ObjectType::Invoice, "discounts"),
         (ObjectType::PromotionCode, "customer"),
         (ObjectType::PromotionCode, "promotion.coupon"),
-        (ObjectType::InvoiceItem, "customer"),
-        (ObjectType::InvoiceItem, "invoice"),
         (ObjectType::InvoiceItem, "discounts"),
         (ObjectType::CreditNote, "customer"),
         (ObjectType::CreditNote, "invoice"),
@@ -914,10 +912,12 @@ fn excluded(t: ObjectType, o: &Value) -> Vec<&'static str> {
         | ObjectType::Person => vec![],
         // Phase 9: nothing generates these yet; the task building each type records its
         // exclusions here.
+        // Not nullable, and documented as `null` for `discountable: true` items, which every
+        // generated item is.
+        ObjectType::InvoiceItem => vec!["net_amount"],
         ObjectType::Coupon
         | ObjectType::PromotionCode
         | ObjectType::Discount
-        | ObjectType::InvoiceItem
         | ObjectType::CreditNote
         | ObjectType::CreditNoteLineItem
         | ObjectType::TaxRate

@@ -46,7 +46,8 @@ pub(crate) struct NewLine<'a> {
     pub price: &'a stripe::Price,
     pub product_name: &'a str,
     pub subscription: Option<&'a str>,
-    /// `ii_…` for one-off lines.
+    /// The `ii_…` billed: every line of a one-off invoice, and the line of a pending item
+    /// that joined an invoice of either kind.
     pub invoice_item: Option<&'a str>,
 }
 
@@ -58,6 +59,20 @@ fn no_proration() -> Option<Option<ProrationDetails>> {
     Some(Some(ProrationDetails {
         credited_items: Some(None),
     }))
+}
+
+/// The `pricing` of a line or invoice item billing `price`.
+fn price_pricing(price: &stripe::Price) -> stripe::BillingBillResourceInvoicingPricingPricing {
+    stripe::BillingBillResourceInvoicingPricingPricing {
+        price_details: Some(
+            stripe::BillingBillResourceInvoicingPricingPricingPriceDetails {
+                price: stripe::Expandable::Id(price.id.clone()),
+                product: price.product.id().to_string(),
+            },
+        ),
+        type_: stripe::BillingBillResourceInvoicingPricingPricingType::PriceDetails,
+        unit_amount_decimal: Some(price.unit_amount_decimal.clone().flatten()),
+    }
 }
 
 /// An invoice line item. Presence follows ruling R1: every field is present, `null` or empty
@@ -88,7 +103,7 @@ pub(crate) fn new_line(l: &NewLine) -> stripe::LineItem {
                         .to_string(),
                     proration: false,
                     proration_details: no_proration(),
-                    subscription: Some(None),
+                    subscription: Some(l.subscription.map(str::to_string)),
                 },
             )),
             subscription_item_details: Some(None),
@@ -113,16 +128,7 @@ pub(crate) fn new_line(l: &NewLine) -> stripe::LineItem {
             start: l.spec.period.0,
         },
         pretax_credit_amounts: Some(Some(Vec::new())),
-        pricing: Some(Some(stripe::BillingBillResourceInvoicingPricingPricing {
-            price_details: Some(
-                stripe::BillingBillResourceInvoicingPricingPricingPriceDetails {
-                    price: stripe::Expandable::Id(l.price.id.clone()),
-                    product: l.price.product.id().to_string(),
-                },
-            ),
-            type_: stripe::BillingBillResourceInvoicingPricingPricingType::PriceDetails,
-            unit_amount_decimal: Some(l.price.unit_amount_decimal.clone().flatten()),
-        })),
+        pricing: Some(Some(price_pricing(l.price))),
         quantity: Some(Some(l.spec.quantity as i64)),
         quantity_decimal: Some(Some(l.spec.quantity.to_string())),
         subscription: Some(
@@ -131,6 +137,71 @@ pub(crate) fn new_line(l: &NewLine) -> stripe::LineItem {
         ),
         subtotal: amount,
         taxes: Some(Some(Vec::new())),
+    }
+}
+
+/// Inputs for an invoice item.
+pub(crate) struct NewInvoiceItem<'a> {
+    pub id: &'a str,
+    pub customer: &'a str,
+    /// The invoice it is on; `None` while pending.
+    pub invoice: Option<&'a str>,
+    /// The price's state when billed.
+    pub price: &'a stripe::Price,
+    pub product_name: &'a str,
+    pub quantity: u64,
+    pub period: (i64, i64),
+    pub date: i64,
+}
+
+/// An invoice item (phase 9 ruling Q4). Presence follows ruling R1: every field is present,
+/// `null` or empty when unset, except `net_amount` (see below).
+pub(crate) fn new_invoice_item(i: &NewInvoiceItem) -> stripe::Invoiceitem {
+    let unit_amount = i.price.unit_amount.flatten().unwrap_or(0);
+    stripe::Invoiceitem {
+        amount: unit_amount * i.quantity as i64,
+        currency: i.price.currency.clone(),
+        customer: stripe::Expandable::Id(i.customer.to_string()),
+        customer_account: Some(None),
+        date: i.date,
+        description: Some(Some(i.product_name.to_string())),
+        discountable: true,
+        discounts: Some(Some(Vec::new())),
+        frozen_fields: Some(Vec::new()),
+        id: i.id.to_string(),
+        invoice: Some(i.invoice.map(|inv| stripe::Expandable::Id(inv.to_string()))),
+        invoicing_rules: Some(Vec::new()),
+        livemode: false,
+        metadata: Some(Some(BTreeMap::new())),
+        // Not nullable, and documented as `null` for `discountable: true` items, which every
+        // generated item is: so absent.
+        net_amount: None,
+        object: stripe::InvoiceitemObject::Invoiceitem,
+        // No subscription or proration generates an item: the `invoice_item` action and
+        // one-off invoices do.
+        parent: Some(None),
+        period: stripe::InvoiceLineItemPeriod {
+            end: i.period.1,
+            start: i.period.0,
+        },
+        pricing: Some(Some(price_pricing(i.price))),
+        proration: false,
+        proration_details: Some(stripe::ProrationDetails {
+            credited_items: Some(None),
+            discount_amounts: Vec::new(),
+        }),
+        quantity: i.quantity as i64,
+        quantity_decimal: i.quantity.to_string(),
+        tax_rates: Some(Some(Vec::new())),
+        test_clock: Some(None),
+    }
+}
+
+pub(crate) fn deleted_invoice_item(id: &str) -> stripe::DeletedInvoiceitem {
+    stripe::DeletedInvoiceitem {
+        deleted: true,
+        id: id.to_string(),
+        object: stripe::DeletedInvoiceitemObject::Invoiceitem,
     }
 }
 
@@ -373,6 +444,48 @@ mod tests {
         // Includable: absent unless expanded.
         assert!(v.get("payments").is_none());
         assert!(v.get("confirmation_secret").is_none());
+    }
+
+    #[test]
+    fn new_invoice_items_conform() {
+        let price = new_price(
+            &PriceSpec {
+                id: "price_1".into(),
+                currency: "eur",
+                unit_amount: 500,
+                interval: None,
+                nickname: None,
+            },
+            "prod_1",
+            1,
+        );
+        for invoice in [None, Some("in_1")] {
+            let item = new_invoice_item(&NewInvoiceItem {
+                id: "ii_1",
+                customer: "cus_1",
+                invoice,
+                price: &price,
+                product_name: "Widget",
+                quantity: 3,
+                period: (5, 5),
+                date: 5,
+            });
+            let v = serde_json::to_value(&item).unwrap();
+            stripe::check_payload(&v).unwrap();
+            assert_eq!(
+                (v["amount"].clone(), v["currency"].clone()),
+                (1500.into(), "eur".into())
+            );
+            assert_eq!(
+                v["invoice"],
+                invoice.map_or(serde_json::Value::Null, Into::into)
+            );
+            assert!(v.get("net_amount").is_none());
+        }
+        assert_eq!(
+            serde_json::to_value(deleted_invoice_item("ii_1")).unwrap(),
+            serde_json::json!({"id": "ii_1", "object": "invoiceitem", "deleted": true})
+        );
     }
 
     #[test]
