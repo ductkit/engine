@@ -129,13 +129,20 @@ pub(crate) fn schedule_subscription(
     let sub: Subscription = engine
         .latest_obj(ObjectType::Subscription, &draw.id)
         .expect("just created");
+    // Phase boundaries are counted from the billing cycle anchor, as the items' periods are,
+    // so each phase ends exactly at the `current_period_end` of the renewal that swaps it
+    // (no drift at month ends): a phase ends `Σ iterations` intervals after the anchor, and
+    // the next starts there.
     let interval = price_interval(&price(engine, &phases[0].0[0])).expect("recurring");
-    let mut start = sub.start_date;
+    let anchor = sub.billing_cycle_anchor;
+    let mut start = anchor;
+    let mut elapsed = 0;
     let new_phases: Vec<NewPhase> = phases
         .iter()
         .zip(&phase_items)
         .map(|((_, iterations), items)| {
-            let end = add_intervals(start, interval, *iterations);
+            elapsed += *iterations;
+            let end = add_intervals(anchor, interval, elapsed);
             let p = NewPhase {
                 items: items.iter().map(|(pr, _, q)| (pr.clone(), *q)).collect(),
                 start,
@@ -241,7 +248,11 @@ fn cancel_schedule(engine: &mut Engine, id: &str, event: &str, cause: &Cause) {
 ///   then the schedule is `completed` (`subscription_schedule.completed`). No renewal.
 ///
 /// The caller runs it only for an `active` or `past_due` subscription with natural renewals,
-/// so an ended subscription, or one whose renewals are off, never moves a phase.
+/// so an ended subscription, or one whose renewals are off, never moves a phase. A `past_due`
+/// subscription still moves: with on-time continuations the 3-day dunning retry settles
+/// before the next monthly or yearly renewal, but after generation was paused the overdue
+/// renewal runs before the overdue retry (queue order), while the subscription is
+/// `past_due`.
 pub(crate) fn on_renew(engine: &mut Engine, ctx: &mut Ctx, sub: &str, cause: &Cause) -> RenewStep {
     let Some(schedule) = active_schedule(engine, sub) else {
         return RenewStep::Continue;
@@ -256,6 +267,8 @@ pub(crate) fn on_renew(engine: &mut Engine, ctx: &mut Ctx, sub: &str, cause: &Ca
     else {
         return RenewStep::Continue;
     };
+    // Phase ends are period ends (both counted from the anchor), so this fires at the
+    // renewal closing the phase's last period.
     if period.1 < current.end_date {
         return RenewStep::Continue;
     }

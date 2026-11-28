@@ -486,7 +486,8 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
                 return;
             }
             // A schedule moves to its next phase (or ends) before the renewal invoice is
-            // built, so the invoice bills the new phase's items (phase 9 ruling Q9).
+            // built, so the invoice bills the new phase's items (phase 9 ruling Q9). This
+            // runs for a `past_due` subscription too (see `schedules::on_renew`).
             if schedules::on_renew(engine, ctx, &sub, &cause) == RenewStep::Stop {
                 return;
             }

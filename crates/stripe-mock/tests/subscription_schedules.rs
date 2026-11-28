@@ -10,7 +10,7 @@ use common::{get, mock_with, recurring_prices};
 use ductkit_stripe_mock::stripe::check_payload;
 use ductkit_stripe_mock::{
     Action, Cause, ChangeKind, MockError, MockStripe, ObjectType, RenewMode, ScheduleEndBehavior,
-    StateUpdate,
+    SimTime, StateUpdate,
 };
 use serde_json::Value;
 
@@ -322,10 +322,12 @@ async fn cancel_completes_and_cancels() {
 
 #[tokio::test]
 async fn phase_dates_follow_the_interval() {
-    let m = mock_with("seed = 83").await;
+    // A start on the 31st: periods clamp at shorter months, and the phases follow them.
+    let m = mock_with("seed = 83\n[clock]\nstart = \"2026-01-31T00:00:00Z\"").await;
     recurring_prices(&m, 2, "month");
     recurring_prices(&m, 1, "year");
     let mut behaviors = Vec::new();
+    let mut monthly = Vec::new();
     for _ in 0..12 {
         let cause = m.run_action(schedule(None, None)).unwrap();
         let sub = created_by(&m, &cause, ObjectType::Subscription);
@@ -337,19 +339,27 @@ async fn phase_dates_follow_the_interval() {
         assert_eq!(s["customer"], subscription["customer"]);
         let phases = s["phases"].as_array().unwrap();
         assert!((2..=3).contains(&phases.len()), "{s}");
-        assert_eq!(phases[0]["start_date"], subscription["start_date"]);
+        let anchor = subscription["billing_cycle_anchor"].as_i64().unwrap();
+        assert_eq!(phases[0]["start_date"], anchor);
         let first = &subscription["items"]["data"][0]["price"];
         let interval = first["recurring"]["interval"].as_str().unwrap();
+        if interval == "month" {
+            monthly.push((cause.clone(), sched.clone()));
+        }
+        // Each phase ends `n` intervals after the anchor, `n` growing by 1-3 per phase, and
+        // the next phase starts there.
+        let mut elapsed = 0;
         for (k, p) in phases.iter().enumerate() {
-            let start = p["start_date"].as_i64().unwrap();
             if k > 0 {
                 assert_eq!(p["start_date"], phases[k - 1]["end_date"]);
             }
             let end = p["end_date"].as_i64().unwrap();
-            assert!(
-                (1..=3).any(|n| add_intervals(start, interval, n) == end),
-                "phase {k} of {sched}: {start}..{end} is not 1-3 {interval}s"
-            );
+            let step = (1..=3)
+                .find(|n| add_intervals(anchor, interval, elapsed + n) == end)
+                .unwrap_or_else(|| {
+                    panic!("phase {k} of {sched} ends at {end}, not 1-3 {interval}s on")
+                });
+            elapsed += step;
             assert_eq!(p["currency"], first["currency"]);
             let items = p["items"].as_array().unwrap();
             assert!((1..=2).contains(&items.len()), "{p}");
@@ -365,6 +375,171 @@ async fn phase_dates_follow_the_interval() {
     }
     assert!(behaviors.iter().any(|b| b == "release"), "{behaviors:?}");
     assert!(behaviors.iter().any(|b| b == "cancel"), "{behaviors:?}");
+    assert!(!monthly.is_empty());
+
+    // Each boundary is the `current_period_end` of the renewal that swaps the phase: the
+    // schedule steps at the boundary, and the new items' period starts there.
+    let latest_end = monthly
+        .iter()
+        .map(|(_, sched)| last_end(&state(&m, ObjectType::SubscriptionSchedule, sched)))
+        .max()
+        .unwrap();
+    step_past(&m, latest_end, 5).await;
+    let mut swaps = 0;
+    for (cause, sched) in &monthly {
+        let s = state(&m, ObjectType::SubscriptionSchedule, sched);
+        let phases = s["phases"].as_array().unwrap();
+        let log = entries(&m, cause);
+        for (i, u) in log.iter().enumerate() {
+            if u.object_type != ObjectType::SubscriptionSchedule || u.kind == ChangeKind::Created {
+                continue;
+            }
+            let k = if u.kind == ChangeKind::Updated {
+                let start = &u.state["current_phase"]["start_date"];
+                phases
+                    .iter()
+                    .position(|p| &p["start_date"] == start)
+                    .unwrap()
+            } else {
+                phases.len()
+            };
+            let boundary = phases[k - 1]["end_date"].as_i64().unwrap();
+            assert_eq!(u.at.0 / 1000, boundary, "{sched} phase {k}");
+            if k < phases.len() {
+                let next_sub = log[i..]
+                    .iter()
+                    .find(|e| e.object_type == ObjectType::Subscription)
+                    .unwrap();
+                for item in next_sub.state["items"]["data"].as_array().unwrap() {
+                    assert_eq!(item["current_period_start"], boundary, "{sched}");
+                }
+                swaps += 1;
+            }
+        }
+    }
+    assert!(swaps > 0);
+}
+
+/// Archives every active recurring price that is yearly or bills nothing, after making sure
+/// a paying monthly one exists, so a schedule's invoices are charged.
+fn paying_monthly_catalog(m: &MockStripe) {
+    for _ in 0..400 {
+        let paying = latest(m, ObjectType::Price).into_iter().any(|p| {
+            p["active"] == true
+                && p["recurring"]["interval"] == "month"
+                && p["unit_amount"].as_i64().is_some_and(|a| a > 0)
+        });
+        if paying {
+            break;
+        }
+        m.run_action(Action::CatalogChange).unwrap();
+    }
+    for p in latest(m, ObjectType::Price) {
+        let recurring = p["recurring"].is_object();
+        let unpaid = p["unit_amount"].as_i64().is_none_or(|a| a == 0);
+        if p["active"] == true && recurring && (p["recurring"]["interval"] == "year" || unpaid) {
+            m.run_action(Action::Archive {
+                id: p["id"].as_str().unwrap().to_string(),
+            })
+            .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn incomplete_expiry_cancels_the_schedule() {
+    let m = mock_with("seed = 90\n[actions]\npayment_failure_probability = 1.0").await;
+    paying_monthly_catalog(&m);
+    let cause = m.run_action(schedule(None, None)).unwrap();
+    let sub = created_by(&m, &cause, ObjectType::Subscription);
+    let sched = created_by(&m, &cause, ObjectType::SubscriptionSchedule);
+    m.step(DAY / 2).await.unwrap();
+    assert_eq!(
+        state(&m, ObjectType::Subscription, &sub)["status"],
+        "incomplete"
+    );
+    m.step(DAY).await.unwrap();
+    assert_eq!(
+        state(&m, ObjectType::Subscription, &sub)["status"],
+        "incomplete_expired"
+    );
+    let events = events_of(&m, &cause);
+    let deleted = events
+        .iter()
+        .position(|e| e == "customer.subscription.deleted")
+        .unwrap();
+    assert_eq!(events[deleted + 1], "subscription_schedule.canceled");
+    assert_eq!(schedule_events(&m, &cause), ["created", "canceled"]);
+    let s = state(&m, ObjectType::SubscriptionSchedule, &sched);
+    check_payload(&s).unwrap();
+    assert_eq!(s["status"], "canceled");
+    assert!(s["canceled_at"].is_i64(), "{s}");
+    assert!(s["current_phase"].is_null(), "{s}");
+}
+
+/// A renewal while `past_due`: with on-time continuations the 3-day dunning retry settles
+/// before the next monthly renewal, but after generation was paused the overdue renewal runs
+/// first (queue order), while the subscription is `past_due`. The phase check still runs.
+#[tokio::test]
+async fn past_due_renewal_still_advances_the_phase() {
+    let m = mock_with("seed = 91").await;
+    paying_monthly_catalog(&m);
+    let (cause, sub, sched) = active_schedule(&m, None, Some(ScheduleEndBehavior::Release)).await;
+    let s = state(&m, ObjectType::SubscriptionSchedule, &sched);
+    let phases = s["phases"].as_array().unwrap().clone();
+    // The second phase ends at least two periods in, so a renewal opens the period before it.
+    let boundary = phases[1]["end_date"].as_i64().unwrap();
+    let anchor = phases[0]["start_date"].as_i64().unwrap();
+    let n = (1..=6)
+        .find(|n| add_intervals(anchor, "month", *n) == boundary)
+        .unwrap();
+    assert!(n >= 2);
+    let before = add_intervals(anchor, "month", n - 1);
+    m.advance_to(SimTime((before - 3_600) * 1000))
+        .await
+        .unwrap();
+    m.update_actions_config(|a| a.payment_failure_probability = 1.0)
+        .unwrap();
+    m.step(DAY).await.unwrap();
+    assert_eq!(
+        state(&m, ObjectType::Subscription, &sub)["status"],
+        "past_due"
+    );
+    // Pause past the boundary, then let the overdue steps run.
+    m.quiesce().await.unwrap();
+    m.advance_to(SimTime((boundary + 86_400) * 1000))
+        .await
+        .unwrap();
+    m.update_actions_config(|a| a.payment_failure_probability = 0.0)
+        .unwrap();
+    m.resume_generation();
+    m.step(DAY).await.unwrap();
+    let log = entries(&m, &cause);
+    let i = log
+        .iter()
+        .position(|u| {
+            u.object_type == ObjectType::SubscriptionSchedule
+                && u.kind != ChangeKind::Created
+                && u.at.0 / 1000 > before
+        })
+        .expect("the schedule stepped at the boundary");
+    let sub_then = log[..i]
+        .iter()
+        .rev()
+        .find(|u| u.object_type == ObjectType::Subscription)
+        .unwrap();
+    assert_eq!(sub_then.state["status"], "past_due");
+    if phases.len() == 2 {
+        assert_eq!(log[i].state["status"], "released");
+    } else {
+        assert_eq!(log[i].state["status"], "active");
+        assert_eq!(log[i].state["current_phase"]["start_date"], boundary);
+        let next_sub = log[i..]
+            .iter()
+            .find(|e| e.object_type == ObjectType::Subscription)
+            .unwrap();
+        assert_eq!(item_prices(&next_sub.state), phase_prices(&s)[2]);
+    }
 }
 
 #[tokio::test]
