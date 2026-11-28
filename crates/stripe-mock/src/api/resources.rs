@@ -270,11 +270,12 @@ impl<'a> View<'a> {
         self.state(o).filter(|u| u.kind != ChangeKind::Deleted)
     }
 
-    /// The state retrieve shows: a deleted customer is its stub, other deleted
+    /// The state retrieve shows: a deleted customer or coupon is its stub, other deleted
     /// objects (and objects not yet created in this view) are missing.
     pub(crate) fn visible(&self, t: ObjectType, id: &str) -> Option<Value> {
         let u = self.state(self.store().get(t, id)?)?;
-        if u.kind == ChangeKind::Deleted && t != ObjectType::Customer {
+        if u.kind == ChangeKind::Deleted && !matches!(t, ObjectType::Customer | ObjectType::Coupon)
+        {
             return None;
         }
         Some(u.state.clone())

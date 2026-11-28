@@ -425,6 +425,9 @@ pub struct ActionsConfig {
     /// A full or partial reversal of a random transfer with something left whose
     /// destination is still connected (the platform scope only).
     pub transfer_reversal: f64,
+    /// A new coupon, promotion code or tax rate, or a deactivation, archive or coupon
+    /// delete (phase 9 ruling Q6).
+    pub billing_catalog_change: f64,
     pub renew_subscription_cycle: RenewMode,
     /// Gap between consecutive steps of one action.
     pub step_delay: Distribution,
@@ -454,6 +457,10 @@ impl ActionsConfig {
                 self.application_fee_refund,
             ),
             ("actions.transfer_reversal", self.transfer_reversal),
+            (
+                "actions.billing_catalog_change",
+                self.billing_catalog_change,
+            ),
         ] {
             check_rate(name, rate)?;
         }
@@ -506,6 +513,8 @@ pub struct ChurnConfig {
     pub person: PersonChurn,
     /// External accounts of controlled connected accounts (needs `accounts.connect`).
     pub external_account: ExternalAccountChurn,
+    /// Coupons: updating a random live coupon's `metadata.note`.
+    pub coupon: UpdateChurn,
 }
 
 /// Person churn on controlled accounts: updating a person's contact details, and
@@ -666,6 +675,7 @@ impl Config {
             ("churn.person.delete", ch.person.delete),
             ("churn.external_account.create", ch.external_account.create),
             ("churn.external_account.delete", ch.external_account.delete),
+            ("churn.coupon.update", ch.coupon.update),
         ] {
             check_rate(name, rate)?;
         }

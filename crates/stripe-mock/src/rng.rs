@@ -134,10 +134,6 @@ impl SimRng {
     }
 
     /// `len` characters from `[0-9A-Za-z]`, as in a coupon ID.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "coupons arrive in phase 9 Task 3")
-    )]
     pub(crate) fn code(&mut self, len: usize) -> String {
         (0..len)
             .map(|_| ALNUM[self.below(62) as usize] as char)

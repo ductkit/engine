@@ -11,6 +11,7 @@
 
 mod accounts;
 mod billing;
+mod billing_catalog;
 mod catalog;
 mod checkout;
 mod connect;
@@ -48,8 +49,15 @@ pub enum Action {
     NewCustomer,
     /// A random catalog change: new product, new price or an archive.
     CatalogChange,
-    /// Archive a product (`prod_…`) or price (`price_…`) now. Control-only.
+    /// Archive a product (`prod_…`), price (`price_…`), promotion code (`promo_…`, set
+    /// inactive) or tax rate (`txr_…`) now. Control-only.
     Archive { id: String },
+    /// A random coupon, promotion code or tax rate change (phase 9 ruling Q6): create one,
+    /// deactivate or archive one, or delete a coupon.
+    BillingCatalogChange,
+    /// Delete the coupon `id`, deactivating its active promotion codes first. A missing or
+    /// already deleted coupon is an error naming it. Control-only.
+    DeleteCoupon { id: String },
     /// A manual invoice for the named or a random customer, walked to `outcome`
     /// (drawn when `None`). A fixed outcome is a control-only hook.
     OneOffInvoice {
@@ -180,6 +188,8 @@ enum ActionKind {
     PersonDelete,
     ApplicationFeeRefund,
     TransferReversal,
+    BillingCatalogChange,
+    CouponUpdate,
 }
 
 /// A follow-up step of an action.
@@ -549,6 +559,16 @@ impl Generator {
                 a.transfer_reversal,
                 "generate.transfer_reversal",
             ),
+            (
+                ActionKind::BillingCatalogChange,
+                a.billing_catalog_change,
+                "generate.billing_catalog.change",
+            ),
+            (
+                ActionKind::CouponUpdate,
+                c.coupon.update,
+                "generate.coupon.update",
+            ),
         ];
         let actions = specs
             .into_iter()
@@ -687,6 +707,7 @@ impl Generator {
                 ActionKind::Checkout => config.checkout,
                 ActionKind::ApplicationFeeRefund => config.application_fee_refund,
                 ActionKind::TransferReversal => config.transfer_reversal,
+                ActionKind::BillingCatalogChange => config.billing_catalog_change,
                 _ => continue,
             };
             a.base_rate = rate;
@@ -814,6 +835,8 @@ impl Generator {
             Action::NewCustomer => new_customer(&mut self.control, engine),
             Action::CatalogChange => catalog::change(&mut self.control, engine, &mut self.ctx),
             Action::Archive { id } => catalog::archive_by_id(engine, &id)?,
+            Action::BillingCatalogChange => billing_catalog::change(&mut self.control, engine),
+            Action::DeleteCoupon { id } => billing_catalog::delete_coupon_by_id(engine, &id)?,
             Action::OneOffInvoice { customer, outcome } => billing::one_off_invoice(
                 &mut self.control,
                 engine,
@@ -1026,9 +1049,14 @@ impl Generator {
             | ObjectType::BankAccount
             | ObjectType::Card
             | ObjectType::Person => return,
+            // Phase 9 ruling Q10: the matching Q6 creation, drawn from the pagination stream.
+            ObjectType::Coupon | ObjectType::PromotionCode | ObjectType::TaxRate => {
+                billing_catalog::pagination_create(&mut self.pagination_rng, engine, t);
+                self.run_due_now(engine);
+                return;
+            }
             // Phase 9 ruling Q10: stubs that draw nothing until the task building the type
-            // fills them in. Task 3: coupons, promotion codes and tax rates.
-            ObjectType::Coupon | ObjectType::PromotionCode | ObjectType::TaxRate => return,
+            // fills them in.
             // Task 4: a new pending invoice item.
             ObjectType::InvoiceItem => return,
             // Task 7: a credit note `metadata.note` update.
@@ -1244,6 +1272,10 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
                     .expect("random targets are valid");
             }
         }
+        ActionKind::BillingCatalogChange => {
+            billing_catalog::change(rng, engine);
+        }
+        ActionKind::CouponUpdate => billing_catalog::coupon_update(rng, engine),
     }
 }
 

@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod checkout;
 pub mod connect;
 pub mod customer;
+pub mod discounts;
 pub mod embedded;
 pub mod invoice;
 pub mod payments;

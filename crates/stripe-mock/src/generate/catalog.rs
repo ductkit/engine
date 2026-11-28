@@ -3,7 +3,7 @@
 use serde_json::json;
 
 use crate::engine::{Cause, ChangeKind, Engine};
-use crate::generate::{Continuation, Ctx, pick};
+use crate::generate::{Continuation, Ctx, billing_catalog, pick};
 use crate::model::catalog::{
     PriceSpec, ProductSpec, new_price, new_product, random_currency, random_price,
     random_price_change, random_product, random_product_change,
@@ -194,9 +194,13 @@ pub(crate) fn archive_by_id(engine: &mut Engine, id: &str) -> Result<Cause, Mock
         ObjectType::Product
     } else if id.starts_with("price_") {
         ObjectType::Price
+    } else if id.starts_with("promo_") {
+        return billing_catalog::archive_by_id(engine, ObjectType::PromotionCode, id);
+    } else if id.starts_with("txr_") {
+        return billing_catalog::archive_by_id(engine, ObjectType::TaxRate, id);
     } else {
         return Err(MockError::InvalidAction(format!(
-            "only products and prices can be archived, not `{id}`"
+            "only products, prices, promotion codes and tax rates can be archived, not `{id}`"
         )));
     };
     let latest = engine
