@@ -4,6 +4,7 @@
 mod client;
 #[path = "../common/mod.rs"]
 mod common;
+mod hooks;
 mod truth;
 
 use std::time::Duration;
@@ -12,6 +13,7 @@ use ductkit_stripe_mock::{ChangeKind, EventRefs, ObjectType, SimTime, StateUpdat
 use serde_json::{Value, json};
 
 use client::Client;
+use hooks::HookServer;
 use truth::{Divergence, Synced, Truth};
 
 fn entry(seq: u64, id: &str, version: u64, kind: ChangeKind, state: Value) -> StateUpdate {
@@ -127,4 +129,73 @@ pagination_writes = {{ probability = 0.3 }}
             "no {t:?} in a connected scope"
         );
     }
+}
+
+#[tokio::test]
+async fn hook_server_fails_first_attempt_of_chosen_events() {
+    use ductkit_stripe_mock::{AttemptOutcome, DeliveryRecordKind, EventFormat};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let hooks = HookServer::start();
+    let m = common::mock_with(&format!(
+        "[actions]
+new_customer = 20.0
+[webhooks]
+retry_schedule = [\"30m\"]
+         [[destinations]]
+name = \"s\"
+url = \"{}\"
+payload = \"snapshot\"
+         enabled_events = [\"*\"]
+secret = \"{}\"
+",
+        hooks.url(),
+        hooks::SECRET
+    ))
+    .await;
+    m.step(Duration::from_secs(3600)).await.unwrap();
+    m.quiesce().await.unwrap();
+
+    let mut cursor = 0;
+    let got = hooks.take_new(&mut cursor);
+    let mut count: BTreeMap<String, usize> = BTreeMap::new();
+    for e in &got {
+        *count
+            .entry(e["id"].as_str().unwrap().to_string())
+            .or_default() += 1;
+    }
+    let events: Vec<String> = m
+        .event_timeline()
+        .into_iter()
+        .filter(|e| e.format == EventFormat::Snapshot)
+        .map(|e| e.id)
+        .collect();
+    assert!(!events.is_empty());
+    for id in &events {
+        assert_eq!(count.get(id), Some(&1), "{id} accepted once");
+    }
+    assert_eq!(count.len(), events.len());
+
+    let failed: BTreeSet<String> = m
+        .delivery_log()
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r.kind,
+                DeliveryRecordKind::Attempt {
+                    outcome: AttemptOutcome::HttpError { status: 500 },
+                    ..
+                }
+            )
+        })
+        .map(|r| r.event_id)
+        .collect();
+    let chosen: BTreeSet<String> = events
+        .iter()
+        .filter(|id| hooks::fails_first(id))
+        .cloned()
+        .collect();
+    assert!(!chosen.is_empty());
+    assert_eq!(failed, chosen);
+    assert!(hooks.take_new(&mut cursor).is_empty());
 }
