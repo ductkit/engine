@@ -4,7 +4,9 @@
 mod client;
 #[path = "../common/mod.rs"]
 mod common;
+mod correct;
 mod hooks;
+mod scenario;
 mod truth;
 
 use std::time::Duration;
@@ -13,6 +15,7 @@ use ductkit_stripe_mock::{ChangeKind, EventRefs, ObjectType, SimTime, StateUpdat
 use serde_json::{Value, json};
 
 use client::Client;
+use correct::Correct;
 use hooks::HookServer;
 use truth::{Divergence, Synced, Truth};
 
@@ -75,40 +78,14 @@ fn classify_counts_each_kind() {
     assert!(truth.classify(&truth.latest).converged());
 }
 
-/// The run every scenario shares: accounts, history and generation rates. Fault
-/// sections are added per test, because TOML forbids a table twice.
-const SCENARIO_BASE: &str = r#"
-seed = 7
-[accounts]
-connect = true
-connected_accounts = { initial = 2 }
-[history]
-duration = "2d"
-[actions]
-new_customer = 6.0
-start_subscription = 3.0
-cancel_subscription = 0.5
-catalog_change = 0.5
-[churn.customer]
-update = 3.0
-delete = 0.5
-[churn.product]
-update = 0.5
-[churn.price]
-update = 0.5
-[churn.subscription]
-update = 0.5
-[churn.invoice]
-update = 0.5
-"#;
-
 #[tokio::test]
 async fn backfill_after_quiesce_matches_truth() {
     let m = common::mock_with(&format!(
-        "{SCENARIO_BASE}[api]
+        "{}[api]
 errors = {{ \"500\" = 0.1, \"503\" = 0.05, reset = 0.05 }}
 pagination_writes = {{ probability = 0.3 }}
-"
+",
+        scenario::SCENARIO_BASE
     ))
     .await;
     for _ in 0..36 {
@@ -198,4 +175,35 @@ secret = \"{}\"
     assert!(!chosen.is_empty());
     assert_eq!(failed, chosen);
     assert!(hooks.take_new(&mut cursor).is_empty());
+}
+
+#[tokio::test]
+async fn naive_diverges_and_correct_converges() {
+    let snapshot_hooks = HookServer::start();
+    let thin_hooks = HookServer::start();
+    let m = common::mock_with(&format!(
+        "{}{}{}",
+        scenario::SCENARIO_BASE,
+        scenario::FAULTS,
+        scenario::destinations(&snapshot_hooks.url(), &thin_hooks.url())
+    ))
+    .await;
+    let _guard = m.replay_guard(env!("CARGO_TARGET_TMPDIR"));
+    let c = Client::new(&m);
+    let scopes = client::scopes(&m);
+
+    let mut correct = Correct::new(thin_hooks);
+    correct.backfill(&c, &scopes).await;
+    scenario::run(&m, async |_| correct.tick(&c).await).await;
+    correct.reconcile(&c, &scopes).await;
+
+    let truth = Truth::from_log(&m.truth_log());
+    let d = truth.classify(&correct.synced);
+    assert!(d.converged(), "seed {}: correct consumer: {d:?}", m.seed());
+    for s in scopes.iter().flatten() {
+        assert!(
+            correct.synced.keys().any(|(k, _, _)| k.as_ref() == Some(s)),
+            "nothing synced in {s}"
+        );
+    }
 }
