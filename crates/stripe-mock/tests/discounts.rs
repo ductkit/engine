@@ -686,7 +686,29 @@ delete = 0.5",
     // At most one live discount per parent.
     for t in [ObjectType::Customer, ObjectType::Subscription] {
         for u in latest(&m, t) {
-            if t == ObjectType::Subscription {
+            let ended = matches!(
+                u.state["status"].as_str(),
+                Some("canceled" | "incomplete_expired")
+            );
+            if t == ObjectType::Subscription && ended {
+                // Nothing touches an ended subscription after it ended (a discount ending
+                // or removed there leaves it as it is).
+                let entries: Vec<StateUpdate> = m
+                    .truth_log()
+                    .into_iter()
+                    .filter(|e| e.object_id == u.object_id)
+                    .collect();
+                let end = entries
+                    .iter()
+                    .position(|e| e.state["status"] == u.state["status"])
+                    .unwrap();
+                assert_eq!(
+                    end,
+                    entries.len() - 1,
+                    "{} changed after it ended",
+                    u.object_id
+                );
+            } else if t == ObjectType::Subscription {
                 assert!(u.state["discounts"].as_array().unwrap().len() <= 1);
                 for d in u.state["discounts"].as_array().unwrap() {
                     assert_eq!(
@@ -705,5 +727,176 @@ delete = 0.5",
                 );
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn ended_subscription_discounts_are_deleted_alone() {
+    let m = mock_with("seed = 17").await;
+    let repeating = coupon_where(&m, |c| {
+        c["percent_off"].is_number() && c["duration"] == "repeating" && c["duration_in_months"] == 1
+    });
+    let forever = percent_coupon(&m, "forever");
+    let cust = m.create_customer(Default::default()).unwrap();
+    let prices = recurring_prices(&m, 1, "month");
+    let mut subs = Vec::new();
+    for _ in 0..2 {
+        let start = m
+            .run_action(Action::StartSubscription {
+                customer: Some(cust.clone()),
+                prices: Some(prices.clone()),
+            })
+            .unwrap();
+        subs.push(created_by(&m, &start, ObjectType::Subscription));
+    }
+    m.step(DAY).await.unwrap();
+    let mut discounts = Vec::new();
+    for (sub, coupon) in subs.iter().zip([&repeating, &forever]) {
+        let cause = m.run_action(add(None, Some(sub), Some(coupon))).unwrap();
+        discounts.push(created_by(&m, &cause, ObjectType::Discount));
+        m.run_action(Action::CancelSubscription {
+            id: Some(sub.clone()),
+            at_period_end: Some(false),
+        })
+        .unwrap();
+        assert_eq!(
+            state(&m, ObjectType::Subscription, sub)["status"],
+            "canceled"
+        );
+    }
+    let versions = |sub: &str| m.get(ObjectType::Subscription, sub).unwrap().version;
+    let before: Vec<u64> = subs.iter().map(|s| versions(s)).collect();
+    // A random removal skips discounts of ended subscriptions.
+    assert!(matches!(
+        m.run_action(Action::RemoveDiscount { id: None }),
+        Err(MockError::InvalidAction(_))
+    ));
+    // A named removal deletes the discount and leaves the subscription alone.
+    let removal = m
+        .run_action(Action::RemoveDiscount {
+            id: Some(discounts[1].clone()),
+        })
+        .unwrap();
+    assert_eq!(events_of(&m, &removal), ["customer.discount.deleted"]);
+    // The repeating discount ends on time, and its subscription is left alone too.
+    let end = state(&m, ObjectType::Discount, &discounts[0])["end"]
+        .as_i64()
+        .unwrap();
+    m.step(32 * DAY).await.unwrap();
+    let e = m
+        .event_timeline()
+        .into_iter()
+        .find(|e| e.event_type == "customer.discount.deleted" && e.object_id == discounts[0])
+        .expect("the discount ended");
+    assert_eq!(e.created.0, end * 1000);
+    for di in &discounts {
+        assert_eq!(
+            m.get(ObjectType::Discount, di).unwrap().kind,
+            ChangeKind::Deleted
+        );
+    }
+    let after: Vec<u64> = subs.iter().map(|s| versions(s)).collect();
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn deleting_an_item_from_a_discounted_draft_recomputes_the_discount() {
+    // Drafts wait a minute before they are finalized.
+    let m =
+        mock_with("seed = 18\n[actions]\nstep_delay = { distribution = \"fixed\", ms = 60000 }")
+            .await;
+    // A currency with a free monthly price and a paid one-time price.
+    let mut found = None;
+    for _ in 0..300 {
+        let prices = latest(&m, ObjectType::Price);
+        let live: Vec<&StateUpdate> = prices
+            .iter()
+            .filter(|u| u.state["active"] == true)
+            .collect();
+        found = live.iter().find_map(|free| {
+            let s = &free.state;
+            if s["recurring"]["interval"] != "month" || s["unit_amount"] != 0 {
+                return None;
+            }
+            live.iter()
+                .find(|p| {
+                    p.state["type"] == "one_time"
+                        && p.state["currency"] == s["currency"]
+                        && p.state["unit_amount"]
+                            .as_i64()
+                            .is_some_and(|a| (1..=1999).contains(&a))
+                })
+                .map(|p| (free.object_id.clone(), p.object_id.clone(), p.state.clone()))
+        });
+        if found.is_some() {
+            break;
+        }
+        m.run_action(Action::CatalogChange).unwrap();
+    }
+    let (free, paid, paid_state) = found.expect("a free monthly and a paid one-time price");
+    let currency = paid_state["currency"].as_str().unwrap().to_string();
+    let unit = paid_state["unit_amount"].as_i64().unwrap();
+    let coupon = coupon_where(&m, |c| {
+        c["currency"] == currency.as_str() && c["amount_off"].as_i64().is_some_and(|a| a > unit)
+    });
+    let off = state(&m, ObjectType::Coupon, &coupon)["amount_off"]
+        .as_i64()
+        .unwrap();
+    let (cust, di) = discounted_customer(&m, &coupon);
+    // Two pending items join the subscription's first invoice: together above the
+    // `amount_off`, the second alone below it.
+    let big = (off / unit + 1) as u64;
+    let mut items = Vec::new();
+    for quantity in [big, 1] {
+        let cause = m
+            .run_action(Action::CreateInvoiceItem {
+                customer: Some(cust.clone()),
+                price: Some(paid.clone()),
+                quantity: Some(quantity),
+            })
+            .unwrap();
+        items.push(created_by(&m, &cause, ObjectType::InvoiceItem));
+    }
+    let start = m
+        .run_action(Action::StartSubscription {
+            customer: Some(cust.clone()),
+            prices: Some(vec![free]),
+        })
+        .unwrap();
+    m.step(Duration::from_secs(61)).await.unwrap();
+    let invoice = created_by(&m, &start, ObjectType::Invoice);
+    let before = state(&m, ObjectType::Invoice, &invoice);
+    assert_eq!(before["status"], "draft");
+    assert_eq!(before["lines"]["data"].as_array().unwrap().len(), 3);
+    assert_amounts(&before, Some(&di));
+    // Before: the subtotal is above the `amount_off`, so all of it applies.
+    assert!(before["subtotal"].as_i64().unwrap() > off);
+    assert_eq!(before["total_discount_amounts"][0]["amount"], off);
+
+    let deletion = m
+        .run_action(Action::DeleteInvoiceItem {
+            id: Some(items[0].clone()),
+        })
+        .unwrap();
+    assert_eq!(
+        events_of(&m, &deletion),
+        ["invoiceitem.deleted", "invoice.updated"]
+    );
+    let after = state(&m, ObjectType::Invoice, &invoice);
+    check_payload(&after).unwrap();
+    assert_eq!(after["lines"]["data"].as_array().unwrap().len(), 2);
+    // After: the subtotal is below it, so the discount is capped at the subtotal.
+    assert_eq!(after["subtotal"], unit);
+    assert_eq!(after["total_discount_amounts"][0]["amount"], unit);
+    assert_amounts(&after, Some(&di));
+    assert_eq!(after["total"], 0);
+    // The stored lines carry the new shares too.
+    for line in after["lines"]["data"].as_array().unwrap() {
+        let stored = state(
+            &m,
+            ObjectType::InvoiceLineItem,
+            line["id"].as_str().unwrap(),
+        );
+        assert_eq!(stored["discount_amounts"], line["discount_amounts"]);
     }
 }

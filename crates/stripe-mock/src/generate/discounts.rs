@@ -114,16 +114,52 @@ pub(crate) fn applied_discount(
     applied_by_id(engine, &di, currency)
 }
 
+/// Whether a subscription has ended (`canceled` or `incomplete_expired`).
+fn ended(engine: &Engine, sub: &str) -> bool {
+    matches!(
+        sub_status(engine, sub),
+        Some(Status::Canceled | Status::IncompleteExpired)
+    )
+}
+
+/// Whether a live discount's parent is live: its subscription has not ended, or its
+/// customer is not deleted.
+fn parent_live(engine: &Engine, di: &str) -> bool {
+    let Some(u) = engine.latest(ObjectType::Discount, di) else {
+        return false;
+    };
+    match (
+        u.state["subscription"].as_str(),
+        u.state["customer"].as_str(),
+    ) {
+        (Some(sub), _) => !ended(engine, sub),
+        (None, Some(c)) => is_live(engine, ObjectType::Customer, c),
+        (None, None) => false,
+    }
+}
+
+/// Live discounts whose parent is live, in creation order: the ones a random removal picks.
+fn removable(engine: &Engine) -> Vec<String> {
+    engine
+        .store()
+        .live_ids(ObjectType::Discount)
+        .iter()
+        .filter(|di| parent_live(engine, di))
+        .cloned()
+        .collect()
+}
+
 /// Removes the live discount `di` (ruling Q2): the parent first (silent for a customer;
 /// `customer.subscription.updated` for a subscription), then the discount
-/// (`customer.discount.deleted`, tombstone `deleted_discount`).
+/// (`customer.discount.deleted`, tombstone `deleted_discount`). A subscription that has
+/// ended is left as it is: only the discount is deleted.
 fn remove(engine: &mut Engine, di: &str, cause: &Cause) {
     let d: Discount = engine
         .latest_obj(ObjectType::Discount, di)
         .expect("removing a live discount");
     match d.subscription.clone().flatten() {
         Some(sub) => {
-            if subscription_discount(engine, &sub).as_deref() == Some(di) {
+            if !ended(engine, &sub) && subscription_discount(engine, &sub).as_deref() == Some(di) {
                 update_sub(
                     engine,
                     &sub,
@@ -398,11 +434,11 @@ fn draw_redeem(rng: &mut SimRng, engine: &mut Engine, cause: &Cause) -> Redeem {
     Redeem::Coupon(pick(rng, &coupons).clone())
 }
 
-/// `discount_change` (ruling Q7): removes a random live discount with probability 0.3;
-/// otherwise, and whenever none exists, adds one to a drawn target. With no target,
-/// nothing happens.
+/// `discount_change` (ruling Q7): removes a random live discount whose parent is live with
+/// probability 0.3; otherwise, and whenever none exists, adds one to a drawn target. With
+/// no target, nothing happens.
 pub(crate) fn discount_change(rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ctx) {
-    let live = engine.store().live_ids(ObjectType::Discount).to_vec();
+    let live = removable(engine);
     if !live.is_empty() && rng.chance(0.3) {
         let di = pick(rng, &live).clone();
         let cause = engine.begin_action("discount_change");
@@ -531,8 +567,10 @@ pub(crate) fn add_discount(
     Ok(cause)
 }
 
-/// The `RemoveDiscount` control hook: removes the named or a random live discount. A named
-/// one that is missing or already removed, or none to pick, is a 409 naming it.
+/// The `RemoveDiscount` control hook: removes the named discount, or a random live one
+/// whose parent is live. A named one that is missing or already removed, or none to pick,
+/// is a 409 naming it. A named discount of an ended subscription is deleted with the
+/// subscription left as it is.
 pub(crate) fn remove_discount(
     rng: &mut SimRng,
     engine: &mut Engine,
@@ -548,11 +586,11 @@ pub(crate) fn remove_discount(
             di
         }
         None => {
-            let live = engine.store().live_ids(ObjectType::Discount);
+            let live = removable(engine);
             if live.is_empty() {
                 return Err(invalid("no discount to remove".to_string()));
             }
-            pick(rng, live).clone()
+            pick(rng, &live).clone()
         }
     };
     let cause = engine.begin_action("remove_discount");
