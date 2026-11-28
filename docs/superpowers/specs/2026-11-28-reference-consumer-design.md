@@ -60,6 +60,17 @@ It is an acceptance test of the mock. The future `crates/sync` engine gets its o
 - Naive consumer: differs from the truth. The test counts the divergences by kind (stale version, missing, resurrected after delete, present but deleted in truth) and asserts at least one stale entry and at least one missing entry, so the failure is the expected one, not an accident. A failure message prints these counts and the seed.
 - Hold a `ReplayGuard` so a failing run leaves a replayable export.
 
+**Decisions taken while planning and building:**
+- **Location.** The harness lives in its own test target, `tests/reference_consumer/` (`main.rs` plus modules), not in `tests/common/consumer.rs`. Putting it in `common` would compile it into all 52 test targets.
+- **The naive consumer's asserted failures are *stale* and *resurrected*.** A failed first attempt is always retried, so the naive consumer eventually receives every event.
+  - Its *missing* entries come only from treating `customer.subscription.deleted` (a cancel) as a delete.
+  - Random churn almost never updates a customer just before deleting it, so the run scripts this halfway through: 6 platform customers are updated and deleted a minute later. That makes resurrection deterministic for the seed.
+- **The `timeout` API fault stays off.** It holds a response for 80 s of real time.
+- **Subscriptions are backfilled with `status=all`.** The default list hides canceled ones.
+- **History is 1 day, not 2,** to fit the time budget. History events are never delivered, so backfill still sees objects that no event announced.
+- **The fault sections are separate from the base scenario (`SCENARIO_BASE` + `FAULTS`),** because TOML forbids a table twice.
+- **No normalization was needed.** REST objects equal truth states for all five compared types.
+
 **Left to the builder:**
 - The exact rates and seed. Pick a seed that triggers each asserted divergence kind, and keep the test under about 20 s.
 - Whether REST objects and truth states compare equal for every compared type. They do for customers (`history.rs:166`). If a type differs, for example in embedded list truncation, normalize both sides the same way and document why.

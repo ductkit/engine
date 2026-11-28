@@ -6,6 +6,7 @@ mod client;
 mod common;
 mod correct;
 mod hooks;
+mod naive;
 mod scenario;
 mod truth;
 
@@ -17,6 +18,7 @@ use serde_json::{Value, json};
 use client::Client;
 use correct::Correct;
 use hooks::HookServer;
+use naive::Naive;
 use truth::{Divergence, Synced, Truth};
 
 fn entry(seq: u64, id: &str, version: u64, kind: ChangeKind, state: Value) -> StateUpdate {
@@ -192,13 +194,30 @@ async fn naive_diverges_and_correct_converges() {
     let c = Client::new(&m);
     let scopes = client::scopes(&m);
 
+    let mut naive = Naive::new(snapshot_hooks);
     let mut correct = Correct::new(thin_hooks);
+    naive.backfill(&c, &scopes).await;
     correct.backfill(&c, &scopes).await;
-    scenario::run(&m, async |_| correct.tick(&c).await).await;
+    scenario::run(&m, async |_| {
+        naive.tick(&c, &scopes).await;
+        correct.tick(&c).await;
+    })
+    .await;
     correct.reconcile(&c, &scopes).await;
 
     let truth = Truth::from_log(&m.truth_log());
+    let n = truth.classify(&naive.synced);
     let d = truth.classify(&correct.synced);
+    eprintln!(
+        "seed {}: naive {n:?}
+correct {d:?}",
+        m.seed()
+    );
+    assert!(
+        n.stale >= 1 && n.resurrected >= 1 && n.other.is_empty(),
+        "seed {}: naive consumer: {n:?}",
+        m.seed()
+    );
     assert!(d.converged(), "seed {}: correct consumer: {d:?}", m.seed());
     for s in scopes.iter().flatten() {
         assert!(

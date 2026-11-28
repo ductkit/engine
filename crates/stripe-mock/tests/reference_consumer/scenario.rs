@@ -2,19 +2,22 @@
 
 use std::time::Duration;
 
-use ductkit_stripe_mock::MockStripe;
+use ductkit_stripe_mock::{CustomerUpdate, MockStripe, ObjectType, SubscribeFilter};
 
 use crate::hooks::SECRET;
 
 /// The run every scenario shares: accounts, history and generation rates. Fault
 /// sections are added per test, because TOML forbids a table twice.
+///
+/// Seed 7 gives the naive consumer stale, missing and resurrected entries (131, 22 and
+/// 3 when chosen) while the correct one converges; a new seed must keep all of that.
 pub const SCENARIO_BASE: &str = r#"
 seed = 7
 [accounts]
 connect = true
 connected_accounts = { initial = 2 }
 [history]
-duration = "2d"
+duration = "1d"
 [actions]
 new_customer = 6.0
 start_subscription = 3.0
@@ -68,8 +71,11 @@ pub fn destinations(snapshot_url: &str, thin_url: &str) -> String {
 /// quiesce, and step past the stale-read lag (generation is off, so nothing changes
 /// and reads turn fresh), and tick once more for what quiesce flushed.
 pub async fn run(m: &MockStripe, mut each_tick: impl AsyncFnMut(&MockStripe)) {
-    for _ in 0..36 {
+    for tick in 0..36 {
         m.step(Duration::from_secs(600)).await.unwrap();
+        if tick == 18 {
+            update_then_delete(m, 6).await;
+        }
         each_tick(m).await;
     }
     m.quiesce().await.unwrap();
@@ -77,4 +83,30 @@ pub async fn run(m: &MockStripe, mut each_tick: impl AsyncFnMut(&MockStripe)) {
         .await
         .unwrap();
     each_tick(m).await;
+}
+
+/// Updates `n` live platform customers, then deletes each a minute later. Generated
+/// churn rarely updates and deletes one customer close together, so this makes sure
+/// some update's failed first attempt is retried after its customer's delete.
+async fn update_then_delete(m: &MockStripe, n: usize) {
+    let filter = SubscribeFilter {
+        object_types: Some(vec![ObjectType::Customer]),
+        accounts: Some(vec![None]),
+    };
+    let ids: Vec<String> = m.dump_state(&filter)["scopes"][0]["objects"]["customer"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(n)
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), n, "not enough live customers");
+    for id in &ids {
+        m.update_customer(id, CustomerUpdate::SetName(Some("Before delete".into())))
+            .unwrap();
+    }
+    m.step(Duration::from_secs(60)).await.unwrap();
+    for id in &ids {
+        m.delete_customer(id).unwrap();
+    }
 }
