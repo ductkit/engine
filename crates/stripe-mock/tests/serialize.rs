@@ -6,7 +6,7 @@ use common::mock_with;
 use ductkit_stripe_mock::{
     AccountApi, AccountInfo, AccountKind, Action, Config, Configuration, CustomerUpdate,
     DestinationConfig, DurationStr, InvoiceOutcome, MockError, NewCustomer, ObjectType,
-    PayloadFormat, SubscribeFilter,
+    PayloadFormat, ScheduleEndBehavior, SubscribeFilter,
 };
 use serde_json::json;
 
@@ -188,6 +188,13 @@ fn actions_round_trip() {
         Action::VoidCreditNote {
             id: Some("cn_1".into()),
         },
+        Action::ScheduleSubscription {
+            customer: Some("cus_1".into()),
+            end_behavior: Some(ScheduleEndBehavior::Cancel),
+        },
+        Action::CancelSubscriptionSchedule {
+            id: Some("sub_sched_1".into()),
+        },
     ];
     for a in actions {
         let v = serde_json::to_value(&a).unwrap();
@@ -244,6 +251,20 @@ fn actions_round_trip() {
     assert_eq!(
         serde_json::to_value(Action::VoidCreditNote { id: None }).unwrap(),
         json!({"type": "void_credit_note", "id": null})
+    );
+    assert_eq!(
+        serde_json::from_value::<Action>(
+            json!({"type": "schedule_subscription", "end_behavior": "release"})
+        )
+        .unwrap(),
+        Action::ScheduleSubscription {
+            customer: None,
+            end_behavior: Some(ScheduleEndBehavior::Release),
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(Action::CancelSubscriptionSchedule { id: None }).unwrap(),
+        json!({"type": "cancel_subscription_schedule", "id": null})
     );
     for o in [
         InvoiceOutcome::DeleteDraft,

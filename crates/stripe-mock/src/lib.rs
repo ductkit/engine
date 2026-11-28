@@ -45,6 +45,7 @@ pub use handle::{AccountHandle, AccountInfo, MockStripe, StartOptions};
 pub use model::ObjectType;
 pub use model::account::{AccountApi, AccountKind, Configuration};
 pub use model::customer::{CustomerUpdate, NewCustomer};
+pub use model::schedule::ScheduleEndBehavior;
 pub use stream::{SubscribeFilter, SubscribeOptions, Subscription, SubscriptionItem};
 pub use time::SimTime;
 

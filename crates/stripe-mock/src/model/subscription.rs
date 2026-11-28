@@ -69,6 +69,8 @@ pub(crate) struct NewSubscription<'a> {
     /// The tax rate its invoices apply (phase 9 ruling Q5): a snapshot taken now, kept in
     /// `default_tax_rates` whatever happens to the rate later.
     pub tax_rate: Option<&'a stripe::TaxRate>,
+    /// The schedule that manages it (phase 9 ruling Q9), if any.
+    pub schedule: Option<&'a str>,
 }
 
 /// A new `incomplete` subscription. Presence follows ruling R1: every field is present,
@@ -146,7 +148,7 @@ pub(crate) fn new_subscription(s: &NewSubscription) -> stripe::Subscription {
         pending_setup_intent: Some(None),
         pending_update: Some(None),
         presentment_details: None,
-        schedule: Some(None),
+        schedule: Some(s.schedule.map(|id| stripe::Expandable::Id(id.to_string()))),
         start_date: s.created,
         status: stripe::SubscriptionStatus::Incomplete,
         status_details: None,
@@ -221,6 +223,7 @@ mod tests {
             created: 1,
             page_size: 10,
             tax_rate: None,
+            schedule: None,
         });
         let v = serde_json::to_value(&sub).unwrap();
         crate::stripe::check_payload(&v).unwrap();

@@ -19,6 +19,7 @@ mod credit_notes;
 mod discounts;
 mod mux;
 mod payments;
+mod schedules;
 mod subscriptions;
 
 pub(crate) use accounts::{AccountChange, AccountsGenerator};
@@ -35,6 +36,7 @@ use std::collections::BTreeMap;
 use crate::engine::{Cause, ChangeKind, Engine, Scope};
 use crate::model::catalog::PriceSpec;
 use crate::model::customer::{self, apply_update, random_new_customer, random_update};
+use crate::model::schedule::ScheduleEndBehavior;
 use crate::rng::{RngStreams, SimRng};
 use crate::stripe;
 use crate::{
@@ -199,6 +201,17 @@ pub enum Action {
     /// open, giving the credit back. A named note that is missing, void, post-payment or
     /// on an invoice that is no longer open, or none to void, is an error naming it.
     VoidCreditNote { id: Option<String> },
+    /// A subscription for the named or a random customer managed by a new subscription
+    /// schedule (phase 9 ruling Q9) of 2-3 phases, ending in `end_behavior` (drawn when
+    /// `None`). A named customer that does not exist or is deleted is an error naming it.
+    ScheduleSubscription {
+        customer: Option<String>,
+        end_behavior: Option<ScheduleEndBehavior>,
+    },
+    /// Cancel the named or a random `active` subscription schedule, then its subscription,
+    /// now. A named schedule that does not exist or is not active, or none active, is an
+    /// error naming it.
+    CancelSubscriptionSchedule { id: Option<String> },
 }
 
 /// The kind of an external account.
@@ -244,6 +257,7 @@ enum ActionKind {
     InvoiceItemDelete,
     DiscountChange,
     CreditNote,
+    ScheduleSubscription,
 }
 
 /// A follow-up step of an action.
@@ -420,6 +434,9 @@ pub(crate) struct Ctx {
     /// Whether a new subscription or one-off invoice takes a tax rate, and which one
     /// (stream `"generate.tax"`, phase 9 ruling Q5). Draws only while an active rate exists.
     pub tax_rng: SimRng,
+    /// The subscription item IDs of each phase of each schedule (ruling Q9), drawn when the
+    /// schedule is created and used when a phase begins; dropped when the schedule ends.
+    pub schedule_items: BTreeMap<String, Vec<Vec<String>>>,
 }
 
 impl Ctx {
@@ -651,6 +668,11 @@ impl Generator {
                 a.credit_note,
                 "generate.credit_note",
             ),
+            (
+                ActionKind::ScheduleSubscription,
+                a.schedule_subscription,
+                "generate.subscription.schedule",
+            ),
         ];
         let actions = specs
             .into_iter()
@@ -686,6 +708,7 @@ impl Generator {
                 payout_rng: stream("generate.payout"),
                 payout_destination: None,
                 tax_rng: stream("generate.tax"),
+                schedule_items: BTreeMap::new(),
             },
             setup: stream("generate.account_setup"),
             control: stream("control.actions"),
@@ -794,6 +817,7 @@ impl Generator {
                 ActionKind::InvoiceItem => config.invoice_item,
                 ActionKind::DiscountChange => config.discount_change,
                 ActionKind::CreditNote => config.credit_note,
+                ActionKind::ScheduleSubscription => config.schedule_subscription,
                 _ => continue,
             };
             a.base_rate = rate;
@@ -959,6 +983,19 @@ impl Generator {
             )?,
             Action::VoidCreditNote { id } => {
                 credit_notes::void_credit_note(&mut self.control, engine, id)?
+            }
+            Action::ScheduleSubscription {
+                customer,
+                end_behavior,
+            } => schedules::schedule_subscription(
+                &mut self.control,
+                engine,
+                &mut self.ctx,
+                customer,
+                end_behavior,
+            )?,
+            Action::CancelSubscriptionSchedule { id } => {
+                schedules::cancel_subscription_schedule(&mut self.control, engine, id)?
             }
             Action::OneOffInvoice { customer, outcome } => billing::one_off_invoice(
                 &mut self.control,
@@ -1191,9 +1228,12 @@ impl Generator {
                 self.run_due_now(engine);
                 return;
             }
-            // Phase 9 ruling Q10: a stub that draws nothing until Task 8 fills it in with a
-            // schedule `metadata.note` update.
-            ObjectType::SubscriptionSchedule => return,
+            // Phase 9 ruling Q10: a `metadata.note` update, drawn from the pagination stream.
+            ObjectType::SubscriptionSchedule => {
+                schedules::pagination_update(&mut self.pagination_rng, engine);
+                self.run_due_now(engine);
+                return;
+            }
             // Not listable on their own.
             ObjectType::Discount | ObjectType::CreditNoteLineItem => return,
         };
@@ -1415,6 +1455,10 @@ fn perform(kind: ActionKind, rng: &mut SimRng, engine: &mut Engine, ctx: &mut Ct
         ActionKind::InvoiceItemDelete => billing::churn_delete_item(rng, engine),
         ActionKind::DiscountChange => discounts::discount_change(rng, engine, ctx),
         ActionKind::CreditNote => credit_notes::credit_note_action(rng, engine, ctx),
+        ActionKind::ScheduleSubscription => {
+            schedules::schedule_subscription(rng, engine, ctx, None, None)
+                .expect("random targets are valid");
+        }
     }
 }
 

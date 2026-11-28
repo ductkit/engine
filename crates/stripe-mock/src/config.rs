@@ -437,6 +437,9 @@ pub struct ActionsConfig {
     /// A credit note on a random open or paid invoice, or a random pre-payment note voided
     /// (phase 9 ruling Q8).
     pub credit_note: f64,
+    /// A subscription managed by a schedule of 2-3 phases, for a random customer (phase 9
+    /// ruling Q9).
+    pub schedule_subscription: f64,
     pub renew_subscription_cycle: RenewMode,
     /// Gap between consecutive steps of one action.
     pub step_delay: Distribution,
@@ -473,6 +476,7 @@ impl ActionsConfig {
             ("actions.invoice_item", self.invoice_item),
             ("actions.discount_change", self.discount_change),
             ("actions.credit_note", self.credit_note),
+            ("actions.schedule_subscription", self.schedule_subscription),
         ] {
             check_rate(name, rate)?;
         }
@@ -1292,6 +1296,25 @@ mod tests {
         );
         assert_eq!(c.actions.discount_change, 0.3);
         assert_eq!(c.actions.credit_note, 0.2);
+        assert_eq!(c.actions.schedule_subscription, 0.2);
+    }
+
+    #[test]
+    fn config_accepts_a_schedule_subscription_rate() {
+        let c = Config::from_toml_str(
+            "[actions]
+schedule_subscription = 0.5",
+        )
+        .unwrap();
+        assert_eq!(c.actions.schedule_subscription, 0.5);
+        assert_eq!(Config::default().actions.schedule_subscription, 0.0);
+        let msg = Config::from_toml_str(
+            "[actions]
+schedule_subscription = -1.0",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("actions.schedule_subscription"), "{msg}");
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod discounts;
 pub mod embedded;
 pub mod invoice;
 pub mod payments;
+pub mod schedule;
 pub mod subscription;
 
 /// A simulated Stripe object type.

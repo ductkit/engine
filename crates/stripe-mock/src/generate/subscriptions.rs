@@ -8,6 +8,7 @@ use crate::generate::billing::{
     mark_uncollectible, resolve_customer, subscription_tax_rate, void,
 };
 use crate::generate::catalog::{active_ids, create_product_now, draw_new_product};
+use crate::generate::schedules::{self, RenewStep};
 use crate::generate::{Continuation, Ctx, payments, pick};
 use crate::model::customer::{deleted_stub, random_metadata_value};
 use crate::model::embedded::embedded_list;
@@ -123,8 +124,15 @@ pub(crate) fn active_recurring_prices(engine: &Engine) -> Vec<String> {
 /// 1-3 prices (or 11-15 with probability 0.05) sharing one currency and interval,
 /// distinct while the pool lasts.
 fn choose_prices(rng: &mut SimRng, engine: &mut Engine, cause: &Cause) -> Vec<String> {
+    let recurring = recurring_pool(rng, engine, cause);
+    pick_prices(rng, engine, recurring)
+}
+
+/// The active recurring prices, in creation order; with none, a new product's (drawn from
+/// `rng` and created now under `cause`), so the pool is never empty.
+pub(crate) fn recurring_pool(rng: &mut SimRng, engine: &mut Engine, cause: &Cause) -> Vec<String> {
     let recurring = active_recurring_prices(engine);
-    let recurring = if recurring.is_empty() {
+    if recurring.is_empty() {
         let np = draw_new_product(rng);
         create_product_now(engine, &np, cause)
             .into_iter()
@@ -132,8 +140,7 @@ fn choose_prices(rng: &mut SimRng, engine: &mut Engine, cause: &Cause) -> Vec<St
             .collect()
     } else {
         recurring
-    };
-    pick_prices(rng, engine, recurring)
+    }
 }
 
 /// Draws the prices of a subscription from `recurring` (active recurring prices, not
@@ -185,6 +192,17 @@ pub(crate) fn draw_subscription(
     prices: Vec<String>,
 ) -> SubscriptionDraw {
     let id = rng.id(ObjectType::Subscription.id_prefix());
+    let items = draw_items(rng, engine, prices);
+    SubscriptionDraw { id, items }
+}
+
+/// Draws an item ID and a quantity (1-5) for each of `prices`, then caps the quantities as
+/// [`draw_subscription`] does: `(price, item, quantity)` per price.
+pub(crate) fn draw_items(
+    rng: &mut SimRng,
+    engine: &Engine,
+    prices: Vec<String>,
+) -> Vec<(String, String, u64)> {
     let mut items: Vec<(String, String, u64)> = prices
         .into_iter()
         .map(|price| {
@@ -202,17 +220,19 @@ pub(crate) fn draw_subscription(
     for (item, q) in items.iter_mut().zip(quantities) {
         item.2 = q;
     }
-    SubscriptionDraw { id, items }
+    items
 }
 
 /// Creates the items (unannounced) and the `incomplete` subscription
-/// (`customer.subscription.created`) of `draw` for `customer`, starting now. The
-/// subscription takes a tax rate as [`draw_tax_rate`] draws it (phase 9 ruling Q5).
+/// (`customer.subscription.created`) of `draw` for `customer`, starting now, managed by
+/// `schedule` when given (phase 9 ruling Q9). The subscription takes a tax rate as
+/// [`draw_tax_rate`] draws it (phase 9 ruling Q5).
 pub(crate) fn create_subscription(
     engine: &mut Engine,
     ctx: &mut Ctx,
     customer: &str,
     draw: &SubscriptionDraw,
+    schedule: Option<&str>,
     cause: &Cause,
 ) {
     let sub_id = &draw.id;
@@ -249,6 +269,7 @@ pub(crate) fn create_subscription(
         created: now,
         page_size: ctx.page_size,
         tax_rate: tax_rate.as_ref(),
+        schedule,
     });
     engine.create_obj(
         ObjectType::Subscription,
@@ -269,7 +290,7 @@ pub(crate) fn start_paid_now(
     draw: &SubscriptionDraw,
     cause: &Cause,
 ) -> String {
-    create_subscription(engine, ctx, customer, draw, cause);
+    create_subscription(engine, ctx, customer, draw, None, cause);
     let sub = &draw.id;
     // The session fixed the amount, so no pending item joins this invoice.
     let invoice = invoice_subscription(
@@ -306,7 +327,7 @@ pub(crate) fn start_subscription(
         None => choose_prices(rng, engine, &cause),
     };
     let draw = draw_subscription(rng, engine, prices);
-    create_subscription(engine, ctx, &customer, &draw, &cause);
+    create_subscription(engine, ctx, &customer, &draw, None, &cause);
     ctx.then(
         engine,
         Continuation::SubscriptionInvoice { sub: draw.id },
@@ -451,6 +472,7 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
             }
             void(engine, &invoice, &cause);
             set_status(engine, &sub, Status::IncompleteExpired, &cause);
+            schedules::end_early(engine, &sub, false, &cause);
         }
         Continuation::Renew { sub } => {
             if !renewable(engine, &sub) || ctx.config.renew_subscription_cycle != RenewMode::Natural
@@ -460,6 +482,12 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
             let cancel = latest_sub(engine, &sub).cancel_at_period_end;
             if cancel {
                 set_status(engine, &sub, Status::Canceled, &cause);
+                schedules::end_early(engine, &sub, false, &cause);
+                return;
+            }
+            // A schedule moves to its next phase (or ends) before the renewal invoice is
+            // built, so the invoice bills the new phase's items (phase 9 ruling Q9).
+            if schedules::on_renew(engine, ctx, &sub, &cause) == RenewStep::Stop {
                 return;
             }
             advance_periods(engine, &sub, &cause);
@@ -532,6 +560,7 @@ pub(crate) fn run(c: Continuation, cause: Cause, engine: &mut Engine, ctx: &mut 
                 mark_uncollectible(engine, &invoice, &cause);
                 if renewable(engine, &sub) {
                     set_status(engine, &sub, Status::Canceled, &cause);
+                    schedules::end_early(engine, &sub, true, &cause);
                 }
             }
         }
@@ -633,6 +662,9 @@ pub(crate) fn cancel_subscription(
         }
     };
     let at_period_end = at_period_end.unwrap_or_else(|| rng.below(2) == 0);
+    // A scheduled subscription is canceled now whatever `at_period_end` says, and its
+    // schedule with it (phase 9 ruling Q9).
+    let at_period_end = at_period_end && schedules::active_schedule(engine, &sub).is_none();
     let cause = engine.begin_action("cancel_subscription");
     if at_period_end {
         let end = items(engine, &sub).first().map(|i| i.current_period_end);
@@ -649,6 +681,7 @@ pub(crate) fn cancel_subscription(
         );
     } else {
         set_status(engine, &sub, Status::Canceled, &cause);
+        schedules::end_early(engine, &sub, false, &cause);
     }
     Ok(Some(cause))
 }
@@ -685,13 +718,14 @@ pub(crate) fn delete_customer_cascade(
         .map(|o| o.latest.object_id.clone())
         .collect();
     for sub in subs {
-        match sub_status(engine, &sub) {
-            Some(Status::Active | Status::PastDue) => {
-                set_status(engine, &sub, Status::Canceled, cause)
-            }
-            Some(Status::Incomplete) => set_status(engine, &sub, Status::IncompleteExpired, cause),
-            _ => {}
-        }
+        let end = match sub_status(engine, &sub) {
+            Some(Status::Active | Status::PastDue) => Status::Canceled,
+            Some(Status::Incomplete) => Status::IncompleteExpired,
+            _ => continue,
+        };
+        set_status(engine, &sub, end, cause);
+        // Its schedule goes with it (phase 9 ruling Q9).
+        schedules::end_early(engine, &sub, false, cause);
     }
     // Pending drafts are deleted and open invoices voided, so no later step
     // finalizes or pays an invoice of the deleted customer.
